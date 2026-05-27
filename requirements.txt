@@ -1,0 +1,7 @@
+Django==5.2.13
+django-tenants==3.10.1
+django-cors-headers==4.9.0
+djangorestframework==3.17.1
+djangorestframework-simplejwt==5.5.1
+psycopg2-binary==2.9.12
+PyJWT==2.9.0

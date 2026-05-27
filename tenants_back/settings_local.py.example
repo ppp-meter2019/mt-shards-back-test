@@ -1,0 +1,69 @@
+"""
+Local production settings — copy this file as `settings_local.py`
+(gitignored) and edit. It is imported at the very end of `settings.py`:
+
+    try:
+        from .settings_local import *
+    except ImportError:
+        print("Can't load local settings!")
+
+Anything you put here overrides the defaults from `settings.py`.
+
+Replace `example.com` with your real apex domain.
+Run `openssl rand -hex 50` to generate a SECRET_KEY.
+"""
+
+# Re-import the names we mutate in-place (DATABASES is a dict).
+from .settings import DATABASES
+
+
+# --------------------------------------------------------------------------
+# Core
+# --------------------------------------------------------------------------
+
+DEBUG = False
+
+SECRET_KEY = "replace-me-with-a-long-random-string"
+
+ALLOWED_HOSTS = [".example.com", "example.com"]
+
+
+# --------------------------------------------------------------------------
+# TLS / proxy — nginx terminates HTTPS, we trust X-Forwarded-Proto.
+# --------------------------------------------------------------------------
+
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
+
+# Required for Django admin POST behind TLS proxy. Django (admin + api) живе
+# тільки на :8000 → достатньо origin'ів із цим портом. Apex (`https://example.com:8000`)
+# для tenant-адміна; wildcard — для company-admin'ів кожного тенанта.
+CSRF_TRUSTED_ORIGINS = [
+    "https://example.com:8000",
+    "https://*.example.com:8000",
+]
+
+# --------------------------------------------------------------------------
+# CORS — frontend at https://<sub>.example.com calls API on
+# https://<sub>.example.com:8000 (different origin → preflight needed).
+# Regex matches apex + every subdomain, with or without port.
+# --------------------------------------------------------------------------
+
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://([a-z0-9-]+\.)?example\.com(:\d+)?$",
+]
+
+
+# --------------------------------------------------------------------------
+# Database — override the connection details from settings.py.
+# --------------------------------------------------------------------------
+
+DATABASES["default"].update({
+    "NAME": "tenants_back",
+    "USER": "tenants_back",
+    "PASSWORD": "replace-me",
+    "HOST": "127.0.0.1",
+    "PORT": "5432",
+})

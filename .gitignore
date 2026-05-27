@@ -1,0 +1,31 @@
+# Production overrides — never commit, always copy from settings_local.py.example
+tenants_back/settings_local.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# venv
+.env/
+venv/
+env/
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+media/
+*.log
+
+# gunicorn / supervisor runtime
+run/
+*.sock
+*.pid
+
+# IDE
+.idea/
+.vscode/
+*.swp

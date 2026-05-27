@@ -1,0 +1,45 @@
+# systemd unit for the tenants_back gunicorn process.
+# Install: copy to /etc/systemd/system/tenants_back.service
+#          then `systemctl daemon-reload && systemctl enable --now tenants_back`.
+
+[Unit]
+Description=tenants_back gunicorn (Django + django-tenants)
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=notify
+User=tenants
+Group=www-data
+
+WorkingDirectory=/srv/tenants_back
+
+# Production overrides live in tenants_back/settings_local.py (copied from
+# settings_local.py.example). The unit only sets runtime-level env vars;
+# anything Django-side is configured by importing settings_local at the
+# bottom of settings.py.
+
+# RuntimeDirectory creates /run/tenants_back automatically with the right
+# owner. We DON'T use it for the socket here because nginx is configured to
+# read /run/tenants_back.sock directly — but you can move the socket under
+# /run/tenants_back/sock and update both files if you prefer.
+RuntimeDirectory=tenants_back
+RuntimeDirectoryMode=0750
+
+ExecStart=/srv/tenants_back/venv/bin/gunicorn \
+  tenants_back.wsgi:application \
+  -c /srv/tenants_back/deploy/gunicorn.conf.py
+
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# Hardening — gunicorn doesn't need to write much.
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
