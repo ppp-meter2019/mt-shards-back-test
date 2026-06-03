@@ -110,43 +110,30 @@ ORIGINAL_BACKEND = "django.contrib.gis.db.backends.postgis"
 
 
 # ---------------------------------------------------------------------------
-# Worker model: this project is currently configured for an ASYNC server
-# (Gunicorn + UvicornWorker / ASGI). To switch to a SYNC server (Gunicorn +
-# gthread/sync / WSGI) three things must change in tandem:
+# Worker model: this project runs a SYNC server — Gunicorn `sync` (prefork)
+# workers over WSGI. This is the simplest, most robust model for our sync code
+# + django-tenants (one request per process; connections are per-process; the
+# tenant schema is set/reset per request). Concurrency = number of worker
+# processes. CPU-heavy work belongs in Celery (phase 2), not the web tier.
 #
-#   1. settings.MIDDLEWARE entry below:
-#        "tenants.middleware.DynamicDatabaseMiddleware"      (async, current)
-#      ->
-#        "tenants.middleware.DynamicDatabaseMiddlewareSync"  (sync)
+# The async path (UvicornWorker / ASGI) is intentionally NOT used: with our
+# required sync tenant/shard middleware it gives no concurrency win and can even
+# regress vs prefork. See README "Architecture trade-offs" before switching.
 #
-#   2. ASGI_APPLICATION / WSGI_APPLICATION further down:
-#        ASGI_APPLICATION = "tenants_back.asgi.application"
-#        WSGI_APPLICATION = None
-#      ->
-#        ASGI_APPLICATION = None
-#        WSGI_APPLICATION = "tenants_back.wsgi.application"
-#
-#   3. bin/gunicorn_start.sh worker class:
-#        --worker-class uvicorn.workers.UvicornWorker
-#      ->
-#        --worker-class gthread --threads <N>
-#
-# The rest of the codebase (views, serializers, router, models, management
-# commands) is sync regardless of which worker model is active.
-#
-# Middleware order matters:
-# 1. DynamicDatabaseMiddleware*    -> sets current_db ContextVar from request Host.
-# 2. DiagnosticsHeadersMiddleware  -> stamps response with host/pid/alias for the
-#                                     MVP demo strip. Must come INSIDE
-#                                     DynamicDatabaseMiddleware so the
-#                                     ContextVar is still live during response
-#                                     processing.
-# 3. TenantMainMiddleware          -> sets PostgreSQL search_path on the connection.
+# Middleware order matters (both are SYNC — the shard schema must be set on the
+# same connection/thread the ORM later uses):
+# 1. ShardAwareTenantMiddleware    -> resolves tenant (+shard) from Host, sets
+#                                     request.tenant and the schema on `default`.
+# 2. TenantShardRoutingMiddleware  -> sets current_db (router -> shard DB) and the
+#                                     tenant schema on the SHARD connection, and
+#                                     resets both on the way out.
+# 3. DiagnosticsHeadersMiddleware  -> stamps response with host/pid/alias (MVP
+#                                     demo). Inside (2) so current_db is still live.
 # ---------------------------------------------------------------------------
 MIDDLEWARE = [
-    "tenants.middleware.DynamicDatabaseMiddleware",
+    "tenants.middleware.ShardAwareTenantMiddleware",
+    "tenants.middleware.TenantShardRoutingMiddleware",
     "tenants.middleware_diagnostics.DiagnosticsHeadersMiddleware",
-    "django_tenants.middleware.main.TenantMainMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -159,7 +146,7 @@ MIDDLEWARE = [
 
 
 # ---------------------------------------------------------------------------
-# Templates / ASGI vs WSGI (see "Worker model" block above for switch steps).
+# Templates / WSGI (sync prefork — see "Worker model" block above).
 # ---------------------------------------------------------------------------
 TEMPLATES = [
     {
@@ -176,8 +163,8 @@ TEMPLATES = [
     },
 ]
 
-ASGI_APPLICATION = "tenants_back.asgi.application"
-WSGI_APPLICATION = None
+WSGI_APPLICATION = "tenants_back.wsgi.application"
+ASGI_APPLICATION = None
 
 
 # ---------------------------------------------------------------------------

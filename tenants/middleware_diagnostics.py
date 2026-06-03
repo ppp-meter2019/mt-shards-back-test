@@ -6,15 +6,14 @@ the top of every page so operators can visually confirm:
   - tenant subdomains are routing to the correct Aurora shard,
   - which gunicorn worker / thread handled the call.
 
-Placement: directly after DynamicDatabaseMiddleware in settings.MIDDLEWARE so
-that the `current_db` ContextVar (set by DynamicDatabaseMiddleware) is still
-live when we read it - that outer middleware resets the ContextVar in a
-finally block after get_response() returns.
+Placement: INSIDE (after) TenantShardRoutingMiddleware in settings.MIDDLEWARE so
+that the `current_db` ContextVar (set there) is still live when we read it -
+that outer middleware resets the ContextVar in a finally block after
+get_response() returns.
 
-Supports both sync and async stacks. Django picks the right __call__ based
-on whether get_response is a coroutine function; this lets the class stay
-unchanged when switching between UvicornWorker (async) and gthread/sync
-(sync) worker models.
+Supports both sync and async stacks. Django picks the right __call__ based on
+whether get_response is a coroutine function; the project runs sync (prefork)
+workers, but the class stays unchanged if the worker model ever changes.
 
 CORS note: in split-origin dev the browser hides custom headers unless they
 are listed in Access-Control-Expose-Headers - we merge them in here. Under

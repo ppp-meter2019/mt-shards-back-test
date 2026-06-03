@@ -27,7 +27,7 @@ RuntimeDirectory=tenants_back
 RuntimeDirectoryMode=0750
 
 ExecStart=/home/ubuntu/tenants_back/venv/bin/gunicorn \
-  tenants_back.asgi:application \
+  tenants_back.wsgi:application \
   -c /home/ubuntu/tenants_back/deploy/gunicorn.conf.py
 
 ExecReload=/bin/kill -s HUP $MAINPID

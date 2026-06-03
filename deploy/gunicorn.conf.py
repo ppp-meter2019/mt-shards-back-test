@@ -2,7 +2,7 @@
 Gunicorn configuration for the tenants_back project.
 
 Loaded with:
-    gunicorn tenants_back.asgi:application -c /home/ubuntu/tenants_back/deploy/gunicorn.conf.py
+    gunicorn tenants_back.wsgi:application -c /home/ubuntu/tenants_back/deploy/gunicorn.conf.py
 
 Tweak `workers` to match your CPU count (rule of thumb: 2 * cores + 1).
 """
@@ -19,9 +19,10 @@ umask = 0o007
 
 # Worker processes. Override via env if you need to.
 workers = int(os.environ.get("GUNICORN_WORKERS", multiprocessing.cpu_count() * 2 + 1))
-# ASGI worker (async) — matches the project default. For a sync server use
-# "gthread" (and add `threads = …`) plus tenants_back.wsgi in the ExecStart.
-worker_class = "uvicorn.workers.UvicornWorker"
+# sync (prefork) — project default: one request per process, concurrency =
+# `workers`. (A `gthread` variant trades memory for in-process I/O concurrency;
+# the async UvicornWorker path needs middleware rework — see settings.py.)
+worker_class = "sync"
 timeout = 60
 graceful_timeout = 30
 keepalive = 5

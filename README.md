@@ -32,9 +32,14 @@ So the only hands-on work is **#1 (check the DBs)** and **#2 (edit
 `settings_local.py`)**; from #3 onward the scripts and management commands do the
 rest.
 
+> **What happens under the hood:** for the mechanics behind each DB step —
+> cluster topology, per-shard roles, the migration order and why it matters, the
+> router/`allow_migrate` guarantees, the atomic status claim, connection
+> sizing — see **[deploy/DATABASE_SETUP.md](deploy/DATABASE_SETUP.md)**.
+
 **Ongoing operations:** code deploys → [Step 7](#step-7---application-deploy-procedure-for-code-updates) · add a shard → [Step 8](#step-8---adding-a-new-shard) · post-deploy checks → [Step 9](#step-9---operational-verification-post-deploy) · disaster recovery → [Step 10](#step-10---disaster-recovery-quick-reference).
 
-**Background / config reference:** [Secrets distribution](#secrets--credential-distribution) · [Redis / ElastiCache policies](#redis--elasticache) · [design decisions](#key-design-decisions) · [status state machine](#status-state-machine) · [management commands](#management-commands).
+**Background / config reference:** [DB initialization internals](deploy/DATABASE_SETUP.md) · [Secrets distribution](#secrets--credential-distribution) · [Redis / ElastiCache policies](#redis--elasticache) · [design decisions](#key-design-decisions) · [status state machine](#status-state-machine) · [management commands](#management-commands).
 
 ## Stack
 
@@ -44,7 +49,7 @@ rest.
 - psycopg 3
 - PostGIS (GIS models on tenants)
 - django-redis (cache + sessions)
-- gunicorn + `uvicorn.workers.UvicornWorker` (ASGI)
+- gunicorn `sync` (prefork) workers over WSGI (one request per process)
 - nginx (static + reverse proxy via unix socket)
 - AWS: ALB + EC2 + Aurora PostgreSQL + ElastiCache Redis
 
@@ -93,7 +98,8 @@ ALB routing:
 | Manual reconcile only (no watchdog, no retry) | Admin decides recovery, no false positives |
 | `tenants` app listed BEFORE `django_tenants` in SHARED_APPS | Our `migrate_schemas` overrides the upstream version |
 | Two AdminSite instances | `public_admin_site` on apex (manage tenants), `admin.site` on subdomains (business data) |
-| Async-only DynamicDatabaseMiddleware | Cache lookups don't block event loop; sync views still work via `sync_to_async` |
+| Two sync middlewares for routing (`ShardAwareTenantMiddleware` + `TenantShardRoutingMiddleware`) | Wires BOTH axes: `current_db` (which shard DB the router uses) AND the tenant schema on that shard connection, with per-request reset. Sync because the schema must be set on the same connection/thread the ORM uses |
+| Sync `sync` (prefork) workers, not ASGI | Simplest correct model for sync code + django-tenants; async gives no win with the required sync middleware (see Architecture trade-offs) |
 | `auto_create_schema = False` | Schema creation is explicit; done as part of `migrate_schemas` for NEW tenants |
 
 ## Status state machine
@@ -281,6 +287,135 @@ CACHES["tenant_alias"]["LOCATION"] = "redis://tenants-alias.xxx.cache.amazonaws.
 > (WAF / nginx rate-limit) or move negative results off the critical cluster
 > (app cache or an in-process bounded LRU). Monitor the cluster's `Evictions`
 > (should stay 0) and memory usage.
+
+## Health checks under load (known consideration)
+
+> **Not implemented for the MVP** — the current `health` view is synchronous.
+> Revisit before production / fan-out load. This section records the issue and
+> the fix so it isn't forgotten.
+
+The ALB target health check hits `/api/health/`, proxied through nginx to
+gunicorn. `tenants/views.py:health` is a **synchronous** Django view, and we run
+**sync (prefork) workers — one request per process**. Under heavy load, if all
+`NUM_WORKERS` processes on a host are busy with slow requests, the health request
+**waits in gunicorn's listen backlog**. If that wait exceeds the health-check
+timeout (the `/api/health/` nginx location also has a tight `proxy_read_timeout
+5s`), the ALB marks the target unhealthy:
+
+```
+busy (not broken) worker → health request queued > timeout → ALB sees a failure
+  → target pulled from rotation → its load shifts to the remaining targets
+  → they saturate and flap too → cascade; if all flap → ALB fails open
+```
+
+A merely *busy* host gets evicted, which makes things worse. This is
+health-check flapping.
+
+**Liveness vs readiness.** The ALB check should be a cheap **liveness** probe
+("is the process up"), not a **readiness** one ("is the DB reachable / is there
+spare capacity"). Keep it **DB-free** so a brief Aurora hiccup doesn't
+cascade-evict every target.
+
+**Recommended hardening (under sync prefork — A + C, optionally B):**
+
+**A. Static liveness from nginx (preferred)** — answer 200 without reaching
+gunicorn at all, so a busy worker pool can't block it:
+```nginx
+location = /healthz { access_log off; return 200 "ok\n"; }
+```
+Point the ALB check at `/healthz`. Immune to app saturation, but shallow — a
+dead gunicorn behind a live nginx still passes (pair with C / a deeper out-of-band
+check). Note: an `async def` health view does **not** help here — sync prefork
+workers have no event loop; that option only applies on the async path.
+
+**B. Worker headroom** — size `NUM_WORKERS` so the health probe almost always
+finds a free process, and keep heavy/slow work out of the web tier (→ Celery),
+so workers don't all sit busy at once.
+
+**C. Loosen ALB health-check thresholds** so transient load ≠ unhealthy:
+require several consecutive failures (`UnhealthyThresholdCount`), reasonable
+`HealthCheckTimeoutSeconds` / `HealthCheckIntervalSeconds`, `Matcher = 200`. If
+keeping the proxied sync view, also raise the `proxy_read_timeout` on the
+`/api/health/` nginx location above its current `5s`.
+
+See the *Worker model* note in `tenants_back/settings.py` and Architecture
+trade-offs below.
+
+## Python runtime (pyenv + Python 3.10)
+
+We pin the interpreter to **Python 3.10 via pyenv** instead of the distro's
+system Python, so the version is reproducible across dev and all backend hosts
+and independent of OS upgrades. Run everything below as the **`ubuntu`** service
+user.
+
+> Note: the runbook's `deploy/user_data_backend.sh` currently `apt`-installs
+> system Python 3.12. Switching to pyenv + 3.10 means replacing that step with
+> the procedure here.
+
+### 1. System build dependencies (to compile CPython)
+
+pyenv builds Python from source, so the host needs the standard build toolchain
+and headers ([pyenv wiki "Suggested build environment"](https://github.com/pyenv/pyenv/wiki#suggested-build-environment)):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+    make build-essential libssl-dev zlib1g-dev libbz2-dev \
+    libreadline-dev libsqlite3-dev wget curl llvm libncursesw5-dev \
+    xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev git
+```
+
+### 2. Project runtime system libraries
+
+Separate from the build toolchain — these are needed at **runtime** by the app
+(GIS / `django.contrib.gis` + PostGIS) and the web tier:
+
+```bash
+sudo apt-get install -y binutils libproj-dev gdal-bin libgeos-dev nginx supervisor
+```
+
+(`psycopg[binary]` in `requirements.txt` ships its own libpq, so `libpq-dev` is
+**not** required. If you ever switch to source `psycopg`, add `libpq-dev`.)
+
+### 3. Install pyenv
+
+```bash
+curl -fsSL https://pyenv.run | bash
+```
+
+Add the init lines to `~/.bashrc` (or `~/.profile`) and reload the shell:
+
+```bash
+export PYENV_ROOT="$HOME/.pyenv"
+[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init -)"
+```
+
+### 4. Install the interpreter
+
+```bash
+pyenv install --list | grep -E '^\s*3\.10\.'   # check the latest 3.10.x patch
+pyenv install 3.10.14                           # use the latest 3.10 patch
+```
+
+### 5. Pin it for the project and create the virtualenv
+
+```bash
+cd /home/ubuntu/tenants_back
+pyenv local 3.10.14            # writes .python-version → `python` now resolves to 3.10
+python -m venv venv            # the venv inherits pyenv's 3.10
+venv/bin/pip install -U pip
+venv/bin/pip install -r requirements.txt
+```
+
+### Why this is runtime-safe for supervisor/systemd
+
+supervisor and systemd launch gunicorn via the venv's **absolute** interpreter
+path (`/home/ubuntu/tenants_back/venv/bin/gunicorn` — see `bin/gunicorn_start.sh`
+and `deploy/gunicorn.service`). That path embeds the pyenv-built 3.10, so the
+running services do **not** depend on pyenv shims or shell init being loaded
+(those non-login service shells wouldn't have `eval "$(pyenv init -)"` anyway).
+pyenv is only needed to **build and create** the venv.
 
 ## Deployment runbook
 
@@ -578,18 +713,74 @@ When you need a fourth Aurora cluster (`tenant_3`):
 | Component | Path | Purpose |
 |---|---|---|
 | Settings | `tenants_back/settings.py` | Multi-DB, Redis, middleware chain |
-| ASGI | `tenants_back/asgi.py` | UvicornWorker entry |
+| WSGI | `tenants_back/wsgi.py` | gunicorn entry (sync prefork) |
 | Public URLs | `tenants_back/urls_public.py` | Apex domain: admin, `/api/tenants/` |
 | Tenant URLs | `tenants_back/urls_tenant.py` | Tenant subdomains: admin, business APIs |
 | Context | `tenants/context.py` | ContextVar `current_db` + `use_alias` |
 | Models | `tenants/models.py` | Shard, Tenant (status FSM), Domain + protections |
 | Admin | `tenants/admin.py` | `public_admin_site` + Shard/Tenant/Domain |
 | Router | `tenants/routers.py` | TenantSyncRouter + multi-DB guard |
-| Middleware | `tenants/middleware.py` | Async host -> alias resolver |
+| Middleware | `tenants/middleware.py` | `ShardAwareTenantMiddleware` + `TenantShardRoutingMiddleware` (sync; tenant + shard routing) |
 | Views | `tenants/views.py` | TenantViewSet + `health` |
 | Commands | `tenants/management/commands/` | `sync_shards`, `create_tenant_schema`, `migrate_schemas`, `reconcile_tenants` |
-| Gunicorn | `bin/gunicorn_start.sh` | UvicornWorker on unix socket |
+| Gunicorn | `bin/gunicorn_start.sh` | sync (prefork) workers on unix socket |
 | Nginx | `deploy/nginx_backend.conf` | static + `/api/`, `/admin/` via unix socket |
 | Supervisor | `deploy/supervisor_gunicorn.conf` | Process management |
 | User-data | `deploy/user_data_backend.sh` | First-boot setup |
 | Bootstrap | `deploy/bootstrap.sh` | One-time platform bootstrap |
+
+## Architecture trade-offs & open questions
+
+Some concerns can't be fixed in one file with one setting — they are emergent
+properties of the **worker model and where work runs**, so resolving them is an
+architectural decision that spans several layers. They are listed here (rather
+than buried in a code comment) precisely because **no single component owns
+them**. Both items below share the same root cause: a **synchronous request
+model on a finite pool of prefork worker processes** (one request per process).
+The async path (UvicornWorker) is intentionally not used — with our required
+sync tenant/shard middleware it gives no concurrency win (see the *Worker model*
+note in `tenants_back/settings.py`).
+
+### Bounding heavy-view request duration
+
+**Status: partially addressed by the sync-prefork move; Celery is the real home.**
+
+Because we run **sync (prefork) workers**, `gunicorn --timeout` now *does* act as
+a **blunt per-request hard limit**: a request exceeding it gets its worker process
+killed and respawned. That is a wall-clock ceiling we did NOT have under
+`UvicornWorker` (where `--timeout` is only a heartbeat and a long request keeps
+the event loop alive). Since prefork is 1 request/process, the kill drops only
+that one request — clean isolation. Caveats:
+
+- It's **blunt**: SIGKILL after `graceful_timeout`, the client sees a 502 /
+  reset, and there's no graceful cleanup.
+- PostgreSQL `statement_timeout` is **per statement** — it never trips on many
+  individually-fast queries and does nothing for CPU time, so it does NOT bound a
+  "hundreds of small queries + CPU math" view. Only `--timeout` (process kill) or
+  moving the work out actually bounds such a request.
+
+For *graceful* bounding of genuinely heavy work the answer remains **Celery**
+(phase 2): the web request enqueues and returns fast; `task_time_limit` bounds
+the task in a separate killable process. A **cooperative deadline** (the hot loop
+checks elapsed time and aborts) is the in-process alternative when the work must
+stay in the request but you want a clean 504 instead of a 502-on-kill.
+
+**Bottom line:** `--timeout` now caps wall-clock (bluntly); the clean path
+(heavy work → Celery) is a deliberate phase-2 step, not a flag.
+
+### Health-check flapping under load
+
+**Status: documented; mitigations not yet wired** — see
+[Health checks under load](#health-checks-under-load-known-consideration).
+
+The sync `health` view occupies a worker process; under saturation, if all
+`NUM_WORKERS` processes are busy, the probe waits in gunicorn's backlog and the
+ALB can evict a *busy-but-healthy* target, cascading load onto the rest (and, if
+all flap, failing open). The remedy isn't one line: it spans nginx routing
+(`/api/health/` vs a static `/healthz`), ALB threshold tuning, worker headroom,
+and the liveness-vs-readiness distinction.
+
+**Why it's not local:** it's a direct consequence of the worker concurrency
+model (finite worker processes, sync requests). Any robust fix must be designed
+together with how the system sheds and queues load — not bolted onto the health
+endpoint alone.

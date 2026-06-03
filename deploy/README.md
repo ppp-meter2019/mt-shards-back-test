@@ -85,7 +85,7 @@ tenants_back/tenants_back/settings_local.py
 
 | Прапор                                          | Що робить                                                       |
 |-------------------------------------------------|-----------------------------------------------------------------|
-| `--worker-class uvicorn.workers.UvicornWorker`  | ASGI-воркер (async) — дефолт проєкту                            |
+| `--worker-class sync`                           | sync (prefork) — один запит на процес; дефолт проєкту           |
 | `--bind=unix:$SOCKFILE`                         | UNIX-сокет, що матчиться з nginx `upstream`                      |
 | `--user=$USER --group=$GROUP`                   | drop privileges → `ubuntu:www-data` (gunicorn стартує від root)  |
 | `--workers=$NUM_WORKERS`                        | к-сть процесів (орієнтир `2*CPU + 1`)                           |

@@ -5,15 +5,17 @@ DJANGODIR=/home/ubuntu/tenants_back                            # Django project 
 SOCKFILE=/home/ubuntu/tenants_back/run/gunicorn.sock           # we will communicate using this unix socket
 USER=ubuntu                                                    # the user to run as
 GROUP=www-data                                                    # the group to run as (nginx user's group → can read the socket)
-NUM_WORKERS=5                                                     # how many worker processes should Gunicorn spawn
-WORKER_CLASS=uvicorn.workers.UvicornWorker                        # ASGI worker (async). For sync, see note below.
+NUM_WORKERS=5                                                     # how many worker processes should Gunicorn spawn (concurrency = workers)
+WORKER_CLASS=sync                                                 # sync (prefork): one request per process. Project default.
 DJANGO_SETTINGS_MODULE=tenants_back.settings                      # which settings file should Django use
-DJANGO_ASGI_MODULE=tenants_back.asgi                              # ASGI module name
+DJANGO_WSGI_MODULE=tenants_back.wsgi                              # WSGI module name
 
-# NOTE: this project runs ASGI by default (UvicornWorker). To switch to a sync
-# server set WORKER_CLASS="gthread" (add --threads), point at tenants_back.wsgi
-# instead of .asgi, and flip ASGI/WSGI in settings.py — see the "Worker model"
-# block in tenants_back/settings.py.
+# NOTE: this project runs SYNC prefork workers (WSGI). Concurrency = NUM_WORKERS
+# processes; rule of thumb 2*cores + 1. CPU-heavy work goes to Celery, not here.
+# To explore the async path (UvicornWorker/ASGI) you must change WORKER_CLASS +
+# DJANGO_WSGI_MODULE→asgi here, flip WSGI/ASGI_APPLICATION in settings.py, AND
+# the tenant/shard middleware would need rework — see the "Worker model" block
+# in tenants_back/settings.py and README "Architecture trade-offs".
 
 set -e
 
@@ -39,7 +41,7 @@ test -d $RUNDIR || mkdir -p $RUNDIR
 echo "rundir ready"
 
 # Start Gunicorn
-exec venv/bin/gunicorn ${DJANGO_ASGI_MODULE}:application \
+exec venv/bin/gunicorn ${DJANGO_WSGI_MODULE}:application \
     --name $NAME \
     --workers $NUM_WORKERS \
     --worker-class $WORKER_CLASS \

@@ -28,7 +28,7 @@ class TenantDatabaseRouter(TenantSyncRouter):
         if (self.app_in_list(label, settings.SHARED_APPS)
                 and not self.app_in_list(label, settings.TENANT_APPS)):
             return "default"
-        # Otherwise use the alias set by DynamicDatabaseMiddleware (or shell ctx).
+        # Otherwise use the alias set by TenantShardRoutingMiddleware (or use_alias in a shell).
         return current_db.get()
 
     def db_for_write(self, model, **hints):

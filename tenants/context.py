@@ -1,6 +1,6 @@
 """ContextVar that carries the active database alias per request/task.
 
-Set by DynamicDatabaseMiddleware (HTTP) or use_alias() (shell, scripts).
+Set by TenantShardRoutingMiddleware (HTTP) or use_alias() (shell, scripts).
 Read by TenantDatabaseRouter on every ORM call.
 """
 

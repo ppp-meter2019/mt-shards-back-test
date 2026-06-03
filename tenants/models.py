@@ -155,7 +155,7 @@ class Tenant(TenantMixin):
 
 
 class Domain(DomainMixin):
-    """hostname -> tenant mapping. Read every request by DynamicDatabaseMiddleware."""
+    """hostname -> tenant mapping. Resolved every request by ShardAwareTenantMiddleware."""
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
