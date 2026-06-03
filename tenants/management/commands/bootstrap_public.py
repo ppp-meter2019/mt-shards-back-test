@@ -9,9 +9,9 @@ Example:
         --password rootpass
 """
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
-from tenants.models import Domain, Tenant
+from tenants.models import Domain, Shard, Tenant
 from users.models import User
 
 
@@ -25,9 +25,21 @@ class Command(BaseCommand):
         parser.add_argument("--email", default="root@example.com")
 
     def handle(self, *args, **opts):
+        try:
+            default_shard = Shard.objects.get(is_default=True)
+        except Shard.DoesNotExist:
+            raise CommandError(
+                "No default shard registered. Run `migrate_schemas --shared "
+                "--database=default` and `sync_shards --activate` first."
+            )
+
         tenant, created = Tenant.objects.get_or_create(
             schema_name="public",
-            defaults={"name": "Public"},
+            defaults={
+                "name": "Public",
+                "shard": default_shard,
+                "status": Tenant.Status.ACTIVE,
+            },
         )
         if created:
             self.stdout.write(self.style.SUCCESS("Created public tenant."))

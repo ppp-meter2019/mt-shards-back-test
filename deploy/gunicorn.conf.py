@@ -2,7 +2,7 @@
 Gunicorn configuration for the tenants_back project.
 
 Loaded with:
-    gunicorn tenants_back.wsgi:application -c /srv/tenants_back/deploy/gunicorn.conf.py
+    gunicorn tenants_back.asgi:application -c /home/ubuntu/tenants_back/deploy/gunicorn.conf.py
 
 Tweak `workers` to match your CPU count (rule of thumb: 2 * cores + 1).
 """
@@ -19,14 +19,16 @@ umask = 0o007
 
 # Worker processes. Override via env if you need to.
 workers = int(os.environ.get("GUNICORN_WORKERS", multiprocessing.cpu_count() * 2 + 1))
-worker_class = "sync"
+# ASGI worker (async) — matches the project default. For a sync server use
+# "gthread" (and add `threads = …`) plus tenants_back.wsgi in the ExecStart.
+worker_class = "uvicorn.workers.UvicornWorker"
 timeout = 60
 graceful_timeout = 30
 keepalive = 5
 
 # Drop privileges. systemd unit also sets User=/Group=, but if you launch
 # gunicorn directly these flags take effect.
-user = os.environ.get("GUNICORN_USER", "tenants")
+user = os.environ.get("GUNICORN_USER", "ubuntu")
 group = os.environ.get("GUNICORN_GROUP", "www-data")
 
 # Logging.

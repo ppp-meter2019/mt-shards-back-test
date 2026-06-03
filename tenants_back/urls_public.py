@@ -9,13 +9,15 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from tenants.admin import public_admin_site
-from tenants.views import TenantViewSet
+from tenants.views import ShardViewSet, TenantViewSet, health
 from users.views import PublicTokenObtainPairView, TokenRefreshView
 
 router = DefaultRouter()
 router.register(r"tenants", TenantViewSet, basename="tenant")
+router.register(r"shards", ShardViewSet, basename="shard")
 
 urlpatterns = [
+    path("api/health/", health),
     path("admin/", public_admin_site.urls),
     path("api/auth/login/", PublicTokenObtainPairView.as_view(), name="public_login"),
     path("api/auth/refresh/", TokenRefreshView.as_view(), name="public_refresh"),

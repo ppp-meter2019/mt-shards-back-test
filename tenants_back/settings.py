@@ -1,13 +1,4 @@
-"""
-Settings for tenants_back — multi-tenant Django/DRF project using django-tenants.
-
-Layout:
-- SHARED_APPS  → live in the `public` schema (tenants registry, tenant-admin users).
-- TENANT_APPS  → live in each tenant schema (cars, drivers, orders, ...).
-- `users` is intentionally in BOTH lists so each schema has its own isolated
-  auth_user table; this is what gives tenant-admin / company-admin / customer /
-  driver users separate identities per database scope.
-"""
+"""Settings for tenants_back - multi-tenant Django/DRF on multi-DB Aurora."""
 
 import os
 from datetime import timedelta
@@ -19,42 +10,46 @@ SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY",
     "django-insecure-3!1c9_e7icl-bz4bf$_1c5k_^vo43bm1ia66uce$zeyf^6(vvn",
 )
-
 DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
 
-# Comma-separated list. In dev "*" lets any tenant subdomain through;
-# in prod set DJANGO_ALLOWED_HOSTS=".example.com,example.com".
-ALLOWED_HOSTS = [h.strip() for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",") if h.strip()]
-
-# Django requires CSRF_TRUSTED_ORIGINS for the admin to accept POSTs over
-# HTTPS behind a reverse proxy. Accepts schemes: "https://*.example.com".
+ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",") if h.strip()
+]
 CSRF_TRUSTED_ORIGINS = [
     o.strip() for o in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if o.strip()
 ]
 
-# When nginx terminates TLS we tell Django to trust X-Forwarded-Proto so
-# `request.is_secure()` returns True and admin/login pages issue Secure cookies.
-if os.environ.get("DJANGO_BEHIND_TLS_PROXY") == "1":
-    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-    SESSION_COOKIE_SECURE = True
-    CSRF_COOKIE_SECURE = True
+# AWS RDS Certificate Authority bundle, used by psycopg's sslrootcert when
+# DB_SSL=1 to verify Aurora's TLS certificate. The file is vendored in the
+# repo at deploy/certs/ so deployment doesn't need to fetch it separately.
+# To refresh (AWS rotates CAs every few years):
+#   curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+#        -o deploy/certs/aws-rds-global-bundle.pem
+AWS_RDS_CA = os.environ.get(
+    "AWS_RDS_CA",
+    str(BASE_DIR / "deploy" / "certs" / "aws-rds-global-bundle.pem"),
+)
+
+# TLS / reverse-proxy settings (SECURE_PROXY_SSL_HEADER, USE_X_FORWARDED_HOST,
+# SESSION_COOKIE_SECURE, CSRF_COOKIE_SECURE) are NOT set here - they would
+# break local dev where Django runs on plain http://localhost. Production
+# values live in settings_local.py (see settings_local.py.example).
 
 
 # ---------------------------------------------------------------------------
 # Apps
 # ---------------------------------------------------------------------------
-
+# IMPORTANT: 'tenants' MUST come BEFORE 'django_tenants' so our management
+# commands (notably migrate_schemas) override the upstream versions.
 SHARED_APPS = [
-    "django_tenants",
     "tenants",
+    "django_tenants",
 
     "django.contrib.contenttypes",
     "django.contrib.auth",
-    # PostGIS: бібліотека з гео-полями + GIS ORM. Без своїх таблиць — їй
-    # вистачає одного запису в SHARED_APPS (у TENANT_APPS не дублюємо).
-    # Вимагає системних gdal/geos/proj і `CREATE EXTENSION postgis` у БД —
-    # див. README §15. Якщо PostGIS поки не налаштовано — закоментуй рядок,
-    # інакше Django впаде на імпорті GIS-модулів.
+    # PostGIS: GIS field types + GIS ORM. No tables of its own here, but the
+    # backend (ORIGINAL_BACKEND below) needs the extension to be installed in
+    # every database. See README "Bootstrap" for `CREATE EXTENSION postgis`.
     "django.contrib.gis",
     "django.contrib.sessions",
     "django.contrib.messages",
@@ -88,32 +83,69 @@ INSTALLED_APPS = list(SHARED_APPS) + [a for a in TENANT_APPS if a not in SHARED_
 
 
 # ---------------------------------------------------------------------------
-# django-tenants configuration
+# django-tenants
 # ---------------------------------------------------------------------------
-
-TENANT_MODEL = "tenants.Tenant"
+TENANT_MODEL        = "tenants.Tenant"
 TENANT_DOMAIN_MODEL = "tenants.Domain"
+PUBLIC_SCHEMA_NAME  = "public"
 
 PUBLIC_SCHEMA_URLCONF = "tenants_back.urls_public"
-ROOT_URLCONF = "tenants_back.urls_tenant"
+ROOT_URLCONF          = "tenants_back.urls_tenant"
 
-DATABASE_ROUTERS = ("django_tenants.routers.TenantSyncRouter",)
+# Our router inherits TenantSyncRouter and adds multi-DB awareness.
+# NOTE: django-tenants validates DATABASE_ROUTERS by a LITERAL string check
+# ('django_tenants.routers.TenantSyncRouter' in DATABASE_ROUTERS), not by
+# isinstance/subclass — so subclassing alone fails with
+# "DATABASE_ROUTERS setting must contain 'django_tenants.routers.TenantSyncRouter'.".
+# We list our router FIRST (it fully overrides db_for_read/write + allow_migrate,
+# so it always decides); the upstream name is a no-op fallback that only
+# satisfies that check.
+DATABASE_ROUTERS = [
+    "tenants.routers.TenantDatabaseRouter",
+    "django_tenants.routers.TenantSyncRouter",
+]
 
-# PostGIS: вказує django-tenants успадковуватись від PostGIS-backend замість
-# стандартного PostgreSQL. Дає одночасно мульти-тенантність і GIS типи /
-# spatial-індекси / GIS ORM. Вимагає `CREATE EXTENSION postgis` у БД +
-# системних gdal/geos/proj — див. README §15. Якщо PostGIS не налаштовано,
-# закоментуй цей рядок (тоді django-tenants підхопить дефолт
-# `django.db.backends.postgresql`).
+# PostGIS backend (required for GIS models in tenant apps such as orders).
 ORIGINAL_BACKEND = "django.contrib.gis.db.backends.postgis"
 
 
 # ---------------------------------------------------------------------------
-# Middleware — TenantMainMiddleware MUST be first; it sets the schema based
-# on the request hostname before anything else looks at the DB.
+# Worker model: this project is currently configured for an ASYNC server
+# (Gunicorn + UvicornWorker / ASGI). To switch to a SYNC server (Gunicorn +
+# gthread/sync / WSGI) three things must change in tandem:
+#
+#   1. settings.MIDDLEWARE entry below:
+#        "tenants.middleware.DynamicDatabaseMiddleware"      (async, current)
+#      ->
+#        "tenants.middleware.DynamicDatabaseMiddlewareSync"  (sync)
+#
+#   2. ASGI_APPLICATION / WSGI_APPLICATION further down:
+#        ASGI_APPLICATION = "tenants_back.asgi.application"
+#        WSGI_APPLICATION = None
+#      ->
+#        ASGI_APPLICATION = None
+#        WSGI_APPLICATION = "tenants_back.wsgi.application"
+#
+#   3. bin/gunicorn_start.sh worker class:
+#        --worker-class uvicorn.workers.UvicornWorker
+#      ->
+#        --worker-class gthread --threads <N>
+#
+# The rest of the codebase (views, serializers, router, models, management
+# commands) is sync regardless of which worker model is active.
+#
+# Middleware order matters:
+# 1. DynamicDatabaseMiddleware*    -> sets current_db ContextVar from request Host.
+# 2. DiagnosticsHeadersMiddleware  -> stamps response with host/pid/alias for the
+#                                     MVP demo strip. Must come INSIDE
+#                                     DynamicDatabaseMiddleware so the
+#                                     ContextVar is still live during response
+#                                     processing.
+# 3. TenantMainMiddleware          -> sets PostgreSQL search_path on the connection.
 # ---------------------------------------------------------------------------
-
 MIDDLEWARE = [
+    "tenants.middleware.DynamicDatabaseMiddleware",
+    "tenants.middleware_diagnostics.DiagnosticsHeadersMiddleware",
     "django_tenants.middleware.main.TenantMainMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
@@ -127,9 +159,8 @@ MIDDLEWARE = [
 
 
 # ---------------------------------------------------------------------------
-# Templates / WSGI
+# Templates / ASGI vs WSGI (see "Worker model" block above for switch steps).
 # ---------------------------------------------------------------------------
-
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
@@ -145,30 +176,51 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = "tenants_back.wsgi.application"
+ASGI_APPLICATION = "tenants_back.asgi.application"
+WSGI_APPLICATION = None
 
 
 # ---------------------------------------------------------------------------
-# Database — must be django-tenants' PG backend.
+# Databases.
+#
+# Only the `default` alias is defined here, with dev defaults pointing at a
+# local Postgres. Production overrides this entry and adds the `tenant_*`
+# shards in settings_local.py - use the _aurora_db_options() helper there to
+# build per-cluster OPTIONS (connect_timeout + verify-full TLS against AWS
+# RDS CA).
 # ---------------------------------------------------------------------------
-from django_tenants import postgresql_backend
-
 DATABASES = {
     "default": {
-        "ENGINE": "django_tenants.postgresql_backend",
-        "NAME": os.environ.get("DB_NAME", "tenants_back"),
-        "USER": os.environ.get("DB_USER", "postgres"),
-        "PASSWORD": os.environ.get("DB_PASSWORD", "postgres"),
-        "HOST": os.environ.get("DB_HOST", "127.0.0.1"),
-        "PORT": os.environ.get("DB_PORT", "5432"),
-    }
+        "ENGINE":             "django_tenants.postgresql_backend",
+        "NAME":               "tenants_back",
+        "USER":               "postgres",
+        "PASSWORD":           "postgres",
+        "HOST":               "127.0.0.1",
+        "PORT":               "5432",
+        "CONN_MAX_AGE":       60,
+        "CONN_HEALTH_CHECKS": True,
+        "OPTIONS":            {"connect_timeout": 5},
+    },
 }
 
 
-# ---------------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------------
+def _aurora_db_options(connect_timeout=5):
+    """Build the OPTIONS dict for an Aurora database entry.
 
+    Used in settings_local.py when defining production DATABASES entries.
+    Returns connect_timeout + verify-full TLS using the vendored AWS RDS CA.
+    """
+    return {
+        "connect_timeout": connect_timeout,
+        "sslmode":         "verify-full",
+        "sslrootcert":     AWS_RDS_CA,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Auth + DRF + JWT
+# (Frontend contract is preserved: /api/auth/login/ returns access/refresh/role/schema.)
+# ---------------------------------------------------------------------------
 AUTH_USER_MODEL = "users.User"
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -177,11 +229,6 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
-
-
-# ---------------------------------------------------------------------------
-# DRF + SimpleJWT
-# ---------------------------------------------------------------------------
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
@@ -193,7 +240,7 @@ REST_FRAMEWORK = {
 }
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
+    "ACCESS_TOKEN_LIFETIME":  timedelta(minutes=60),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
     "AUTH_HEADER_TYPES": ("Bearer",),
     "USER_ID_FIELD": "id",
@@ -202,9 +249,49 @@ SIMPLE_JWT = {
 
 
 # ---------------------------------------------------------------------------
+# Cache: TWO logical caches, intended to map to TWO separate ElastiCache
+# clusters in production (see settings_local.py.example for why - in short:
+# Redis maxmemory and eviction policy are per-instance, not per-DB).
+#
+# For local dev they share a single localhost Redis on different DBs - fine
+# because no eviction pressure exists locally.
+# ---------------------------------------------------------------------------
+CACHES = {
+    # App cache + Django sessions. In production: separate ElastiCache cluster
+    # with maxmemory-policy=allkeys-lru.
+    "default": {
+        "BACKEND":  "django_redis.cache.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/1",
+        "KEY_PREFIX": "app",
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            "IGNORE_EXCEPTIONS": True,
+            "SOCKET_CONNECT_TIMEOUT": 1,
+            "SOCKET_TIMEOUT": 1,
+        },
+    },
+    # Tenant alias resolution cache. In production: separate ElastiCache
+    # cluster with maxmemory-policy=noeviction (small, critical, never evict).
+    "tenant_alias": {
+        "BACKEND":  "django_redis.cache.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/0",
+        "KEY_PREFIX": "alias",
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            "IGNORE_EXCEPTIONS": True,
+            "SOCKET_CONNECT_TIMEOUT": 1,
+            "SOCKET_TIMEOUT": 1,
+        },
+    },
+}
+
+SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"
+SESSION_CACHE_ALIAS = "default"
+
+
+# ---------------------------------------------------------------------------
 # i18n / static
 # ---------------------------------------------------------------------------
-
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
 USE_I18N = True
@@ -218,28 +305,24 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # Where to send users after Django-admin login on each schema.
 LOGIN_REDIRECT_URL = "/admin/"
 
-# Public hostname used when no tenant is matched. Only relevant for explicit
-# checks; the actual public schema is determined by tenants.Tenant(schema_name='public').
-PUBLIC_SCHEMA_NAME = "public"
-
 
 # ---------------------------------------------------------------------------
-# CORS — only relevant in split-origin dev. In production behind nginx the
-# frontend and the API share an origin, so CORS is effectively unused.
+# CORS - only relevant in split-origin dev. In production frontend and
+# backend share an origin through ALB, so CORS is effectively unused.
 # ---------------------------------------------------------------------------
-
 CORS_ALLOW_ALL_ORIGINS = os.environ.get("DJANGO_CORS_ALLOW_ALL", "1") == "1"
 CORS_ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("DJANGO_CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()
 ]
-# Use this to whitelist a wildcard, e.g. all your tenant subdomains:
-#   DJANGO_CORS_ALLOWED_ORIGIN_REGEXES=^https://([a-z0-9-]+\.)?example\.com(:\d+)?$
 CORS_ALLOWED_ORIGIN_REGEXES = [
     r.strip() for r in os.environ.get("DJANGO_CORS_ALLOWED_ORIGIN_REGEXES", "").split(",") if r.strip()
 ]
 CORS_ALLOW_CREDENTIALS = False
 
 
+# ---------------------------------------------------------------------------
+# Local overrides last (production secrets, hostnames, etc.)
+# ---------------------------------------------------------------------------
 try:
     from .settings_local import *  # noqa: F403
 except ImportError:

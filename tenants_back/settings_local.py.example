@@ -1,5 +1,5 @@
 """
-Local production settings — copy this file as `settings_local.py`
+Local production settings - copy this file as `settings_local.py`
 (gitignored) and edit. It is imported at the very end of `settings.py`:
 
     try:
@@ -13,8 +13,8 @@ Replace `example.com` with your real apex domain.
 Run `openssl rand -hex 50` to generate a SECRET_KEY.
 """
 
-# Re-import the names we mutate in-place (DATABASES is a dict).
-from .settings import DATABASES
+# Re-import the names we mutate in-place (DATABASES, CACHES are dicts).
+from .settings import DATABASES, CACHES, _aurora_db_options
 
 
 # --------------------------------------------------------------------------
@@ -29,25 +29,26 @@ ALLOWED_HOSTS = [".example.com", "example.com"]
 
 
 # --------------------------------------------------------------------------
-# TLS / proxy — nginx terminates HTTPS, we trust X-Forwarded-Proto.
+# TLS / proxy - ALB terminates HTTPS, nginx forwards X-Forwarded-Proto.
 # --------------------------------------------------------------------------
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+USE_X_FORWARDED_HOST = True
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
+SESSION_COOKIE_DOMAIN = ".example.com"
+CSRF_COOKIE_DOMAIN    = ".example.com"
 
-# Required for Django admin POST behind TLS proxy. Django (admin + api) живе
-# тільки на :8000 → достатньо origin'ів із цим портом. Apex (`https://example.com:8000`)
-# для tenant-адміна; wildcard — для company-admin'ів кожного тенанта.
+# Required for Django admin POST behind TLS proxy.
 CSRF_TRUSTED_ORIGINS = [
-    "https://example.com:8000",
-    "https://*.example.com:8000",
+    "https://example.com",
+    "https://*.example.com",
 ]
 
+
 # --------------------------------------------------------------------------
-# CORS — frontend at https://<sub>.example.com calls API on
-# https://<sub>.example.com:8000 (different origin → preflight needed).
-# Regex matches apex + every subdomain, with or without port.
+# CORS - production runs frontend and backend behind a single ALB on the
+# same origin, so CORS is effectively unused in prod.
 # --------------------------------------------------------------------------
 
 CORS_ALLOW_ALL_ORIGINS = False
@@ -57,13 +58,59 @@ CORS_ALLOWED_ORIGIN_REGEXES = [
 
 
 # --------------------------------------------------------------------------
-# Database — override the connection details from settings.py.
+# Multi-DB Aurora endpoints. Three clusters: default + tenant_1 + tenant_2.
 # --------------------------------------------------------------------------
 
-DATABASES["default"].update({
-    "NAME": "tenants_back",
-    "USER": "tenants_back",
-    "PASSWORD": "replace-me",
-    "HOST": "127.0.0.1",
-    "PORT": "5432",
-})
+# Shared defaults — engine, schema name on each cluster, port, pool settings,
+# connection options. Per-shard entries below add HOST/USER/PASSWORD.
+_AURORA_DEFAULTS = {
+    "ENGINE":             "django_tenants.postgresql_backend",
+    "NAME":               "tenants_back",
+    "PORT":               "5432",
+    "CONN_MAX_AGE":       60,
+    "CONN_HEALTH_CHECKS": True,
+    "OPTIONS":            _aurora_db_options(),
+}
+
+# Each Aurora cluster has its own credentials. In real deployments load these
+# from AWS Secrets Manager (one secret per cluster) or SSM Parameter Store
+# (one parameter per field per cluster).
+DATABASES["default"] = {
+    **_AURORA_DEFAULTS,
+    "HOST":     "default.cluster-xxx.eu-west-1.rds.amazonaws.com",
+    "USER":     "default_app",
+    "PASSWORD": "replace-me-default",
+}
+DATABASES["tenant_1"] = {
+    **_AURORA_DEFAULTS,
+    "HOST":     "tenant1.cluster-yyy.eu-west-1.rds.amazonaws.com",
+    "USER":     "tenant1_app",
+    "PASSWORD": "replace-me-tenant1",
+}
+DATABASES["tenant_2"] = {
+    **_AURORA_DEFAULTS,
+    "HOST":     "tenant2.cluster-zzz.eu-west-1.rds.amazonaws.com",
+    "USER":     "tenant2_app",
+    "PASSWORD": "replace-me-tenant2",
+}
+
+
+# --------------------------------------------------------------------------
+# Redis (ElastiCache) - TWO separate clusters by design.
+#
+# Why two clusters and not two logical DBs on one cluster:
+#   * `maxmemory` and `maxmemory-policy` are per-INSTANCE in Redis, not
+#     per-database. Two DBs share the same memory pool and the same eviction
+#     policy. App-cache pressure would either evict alias keys (with
+#     allkeys-lru) or block ALL writes including alias invalidations
+#     (with noeviction).
+#   * ElastiCache cluster mode supports only DB 0, so the two-DB shortcut
+#     blocks future horizontal scaling of Redis.
+#
+# Cluster sizing / policy:
+#   tenants-alias  (cache.t4g.small,  noeviction)  - small, critical, no evict
+#   tenants-app    (cache.t4g.medium, allkeys-lru) - larger, disposable
+# --------------------------------------------------------------------------
+
+CACHES["default"]["LOCATION"]      = "redis://tenants-app.xxx.cache.amazonaws.com:6379/0"
+CACHES["tenant_alias"]["LOCATION"] = "redis://tenants-alias.xxx.cache.amazonaws.com:6379/0"

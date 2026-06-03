@@ -13,6 +13,7 @@ from drivers.views import DriverViewSet
 from orders.views import OrderViewSet
 from products.views import ProductViewSet
 from routes.views import RouteViewSet
+from tenants.views import health
 from users.views import TenantTokenObtainPairView, TokenRefreshView
 
 router = DefaultRouter()
@@ -24,6 +25,7 @@ router.register(r"orders", OrderViewSet, basename="order")
 router.register(r"routes", RouteViewSet, basename="route")
 
 urlpatterns = [
+    path("api/health/", health),
     path("admin/", admin.site.urls),
     path("api/auth/login/", TenantTokenObtainPairView.as_view(), name="tenant_login"),
     path("api/auth/refresh/", TokenRefreshView.as_view(), name="tenant_refresh"),

@@ -4,15 +4,15 @@
 
 [Unit]
 Description=tenants_back gunicorn (Django + django-tenants)
-After=network.target postgresql.service
-Requires=postgresql.service
+# DB lives on remote Aurora clusters, so don't hard-require a local postgres.
+After=network.target
 
 [Service]
 Type=notify
-User=tenants
+User=ubuntu
 Group=www-data
 
-WorkingDirectory=/srv/tenants_back
+WorkingDirectory=/home/ubuntu/tenants_back
 
 # Production overrides live in tenants_back/settings_local.py (copied from
 # settings_local.py.example). The unit only sets runtime-level env vars;
@@ -26,9 +26,9 @@ WorkingDirectory=/srv/tenants_back
 RuntimeDirectory=tenants_back
 RuntimeDirectoryMode=0750
 
-ExecStart=/srv/tenants_back/venv/bin/gunicorn \
-  tenants_back.wsgi:application \
-  -c /srv/tenants_back/deploy/gunicorn.conf.py
+ExecStart=/home/ubuntu/tenants_back/venv/bin/gunicorn \
+  tenants_back.asgi:application \
+  -c /home/ubuntu/tenants_back/deploy/gunicorn.conf.py
 
 ExecReload=/bin/kill -s HUP $MAINPID
 KillMode=mixed
