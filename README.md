@@ -741,6 +741,69 @@ The async path (UvicornWorker) is intentionally not used — with our required
 sync tenant/shard middleware it gives no concurrency win (see the *Worker model*
 note in `tenants_back/settings.py`).
 
+#### Why the async path gives no win here (illustration)
+
+Two concurrent requests under UvicornWorker + the (required) sync tenant
+middleware: the event loop accepts both, but **processing serializes on the
+single thread-sensitive thread**, because the tenant schema (`search_path`) is
+**per-connection state** that must be set/reset serially:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Request A<br/>(alpha.example.com)
+    participant B as Request B<br/>(beta.example.com)
+    participant EL as Event loop<br/>(UvicornWorker)
+    participant TS as thread_sensitive thread<br/>(ONE per process)
+    participant PG as PostgreSQL
+
+    par connection accept — genuinely parallel
+        A->>EL: HTTP request
+        B->>EL: HTTP request
+    end
+    Note over EL: async still works here —<br/>both connections accepted concurrently
+
+    EL->>+TS: A: sync TenantMainMiddleware
+    Note right of TS: SET search_path = alpha<br/>state lives ON THE CONNECTION of this thread
+    Note over TS: the thread is held by request A<br/>for the WHOLE request: middleware + view + ORM
+    TS->>PG: SELECT ... schema alpha
+    PG-->>TS: alpha rows
+    TS-->>-EL: response A
+
+    Note over B,TS: request B WAITED all along —<br/>its sync middleware needs the same thread
+
+    EL->>+TS: B: sync TenantMainMiddleware
+    Note right of TS: SET search_path = beta
+    TS->>PG: SELECT ... schema beta
+    PG-->>TS: beta rows
+    TS-->>-EL: response B
+
+    Note over EL,TS: BOTTOM LINE — one request at a time per process.<br/>async def views and await aget do NOT help —<br/>they run on this same thread.<br/>search_path is CONNECTION state. It must be<br/>set and reset serially — otherwise tenant B<br/>would read tenant A data
+```
+
+The same as a timeline — expectation vs reality vs the prefork model we chose:
+
+```mermaid
+gantt
+    title 3 concurrent requests, 1 process. Each request = 100 ms of work
+    dateFormat X
+    axisFormat %s
+    section The async myth
+    Request A : 0, 100
+    Request B : 0, 100
+    Request C : 0, 100
+    section Reality. UvicornWorker + sync tenant middleware
+    A processing : active, 0, 100
+    B waits for the thread : crit, 0, 100
+    B processing : active, 100, 200
+    C waits for the thread : crit, 0, 200
+    C processing : active, 200, 300
+    section Sync prefork. 3 worker processes
+    Request A : done, 0, 100
+    Request B : done, 0, 100
+    Request C : done, 0, 100
+```
+
 ### Bounding heavy-view request duration
 
 **Status: partially addressed by the sync-prefork move; Celery is the real home.**
