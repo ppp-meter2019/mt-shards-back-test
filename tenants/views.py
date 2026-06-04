@@ -3,13 +3,13 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connections
 from django.db.models import F
 from django.http import HttpResponse
-from django_tenants.utils import schema_context
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from users.models import User
 
+from .context import tenant_context
 from .models import Shard, Tenant
 from .permissions import IsTenantAdminOnPublic
 from .serializers import ShardSerializer, TenantSerializer
@@ -117,9 +117,10 @@ class TenantViewSet(viewsets.ModelViewSet):
         except DjangoValidationError as exc:
             return Response({"password": list(exc.messages)}, status=400)
 
-        # Switch search_path to the tenant schema so the INSERT lands in
-        # <schema>.users_user, not public.users_user.
-        with schema_context(tenant.schema_name):
+        # tenant_context wires both axes: routes the ORM to the tenant's shard
+        # AND sets the schema on that shard's connection, so the INSERT lands
+        # in <shard>.<schema>.users_user, not public.users_user.
+        with tenant_context(tenant):
             if User.objects.filter(username=username).exists():
                 return Response(
                     {"username": f"User '{username}' already exists in tenant '{tenant.schema_name}'."},

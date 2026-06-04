@@ -277,7 +277,8 @@ concurrent runs can't migrate the same tenant; on success it finalizes to
 
 The first `company_admin` for the tenant is created either via the admin UI
 ("Create admin" button → `POST /api/tenants/<id>/create-admin/`) or in a shell
-using `use_alias(...)` + `schema_context(...)` (see README Step 5).
+using `tenant_context(tenant)` from `tenants.context` — the shard-aware
+drop-in replacement for the django-tenants helper (see README Step 5).
 
 ---
 

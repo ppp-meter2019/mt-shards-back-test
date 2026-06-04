@@ -17,16 +17,11 @@ Delete protections:
 """
 
 from django.conf import settings
-from django.core.cache import caches
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.deletion import ProtectedError
-from django.db.models.signals import pre_delete
-from django.dispatch import receiver
 from django_tenants.models import DomainMixin, TenantMixin
 from django_tenants.utils import get_public_schema_name
-
-_alias_cache = caches["tenant_alias"]
 
 
 class Shard(models.Model):
@@ -137,12 +132,6 @@ class Tenant(TenantMixin):
             if not self.shard.is_active:
                 raise ValidationError({"shard": "Selected shard is not active."})
 
-    def save(self, *args, **kwargs):
-        super().save(*args, **kwargs)
-        # Invalidate per-host alias cache for all the tenant's domains.
-        for d in self.domains.all().only("domain"):
-            _alias_cache.delete(f"tenant_alias:{d.domain}")
-
     def delete(self, *args, **kwargs):
         """Protect the public tenant from deletion."""
         if self.schema_name == get_public_schema_name():
@@ -156,23 +145,3 @@ class Tenant(TenantMixin):
 
 class Domain(DomainMixin):
     """hostname -> tenant mapping. Resolved every request by ShardAwareTenantMiddleware."""
-
-    def save(self, *args, **kwargs):
-        super().save(*args, **kwargs)
-        _alias_cache.delete(f"tenant_alias:{self.domain}")
-
-    def delete(self, *args, **kwargs):
-        _alias_cache.delete(f"tenant_alias:{self.domain}")
-        super().delete(*args, **kwargs)
-
-
-# Cache invalidation for cascade and bulk deletes that bypass model.delete().
-@receiver(pre_delete, sender=Tenant)
-def _tenant_pre_delete(sender, instance, **kwargs):
-    for d in instance.domains.values_list("domain", flat=True):
-        _alias_cache.delete(f"tenant_alias:{d}")
-
-
-@receiver(pre_delete, sender=Domain)
-def _domain_pre_delete(sender, instance, **kwargs):
-    _alias_cache.delete(f"tenant_alias:{instance.domain}")

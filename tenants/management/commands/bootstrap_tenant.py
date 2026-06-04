@@ -12,9 +12,8 @@ Example:
 
 from django.core.management import call_command
 from django.core.management.base import BaseCommand, CommandError
-from django_tenants.utils import schema_context
 
-from tenants.context import use_alias
+from tenants.context import tenant_context
 from tenants.models import Domain, Shard, Tenant
 from users.models import User
 
@@ -71,28 +70,27 @@ class Command(BaseCommand):
         # the status NEW -> ACTIVE.
         call_command("migrate_schemas", schema_name=schema)
 
-        # Seed the company-admin INSIDE the tenant schema on its shard. Both
-        # use_alias (pick the shard DB) and schema_context (set search_path)
-        # are required so the INSERT lands in <shard>.<schema>.users_user.
+        # Seed the company-admin INSIDE the tenant schema on its shard.
+        # tenant_context wires both axes (router -> shard DB, schema on that
+        # shard's connection), so the INSERT lands in <shard>.<schema>.users_user.
         tenant.refresh_from_db()
-        with use_alias(tenant.shard.alias):
-            with schema_context(schema):
-                user, _ = User.objects.get_or_create(
-                    username=opts["admin_username"],
-                    defaults={
-                        "email": opts["admin_email"],
-                        "role": User.Role.COMPANY_ADMIN,
-                        "is_staff": True,
-                        "is_superuser": True,
-                    },
+        with tenant_context(tenant):
+            user, _ = User.objects.get_or_create(
+                username=opts["admin_username"],
+                defaults={
+                    "email": opts["admin_email"],
+                    "role": User.Role.COMPANY_ADMIN,
+                    "is_staff": True,
+                    "is_superuser": True,
+                },
+            )
+            user.role = User.Role.COMPANY_ADMIN
+            user.is_staff = True
+            user.is_superuser = True
+            user.set_password(opts["admin_password"])
+            user.save()
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Company-admin '{user.username}' ready in schema '{schema}'."
                 )
-                user.role = User.Role.COMPANY_ADMIN
-                user.is_staff = True
-                user.is_superuser = True
-                user.set_password(opts["admin_password"])
-                user.save()
-                self.stdout.write(
-                    self.style.SUCCESS(
-                        f"Company-admin '{user.username}' ready in schema '{schema}'."
-                    )
-                )
+            )

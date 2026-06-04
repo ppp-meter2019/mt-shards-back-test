@@ -96,21 +96,8 @@ DATABASES["tenant_2"] = {
 
 
 # --------------------------------------------------------------------------
-# Redis (ElastiCache) - TWO separate clusters by design.
-#
-# Why two clusters and not two logical DBs on one cluster:
-#   * `maxmemory` and `maxmemory-policy` are per-INSTANCE in Redis, not
-#     per-database. Two DBs share the same memory pool and the same eviction
-#     policy. App-cache pressure would either evict alias keys (with
-#     allkeys-lru) or block ALL writes including alias invalidations
-#     (with noeviction).
-#   * ElastiCache cluster mode supports only DB 0, so the two-DB shortcut
-#     blocks future horizontal scaling of Redis.
-#
-# Cluster sizing / policy:
-#   tenants-alias  (cache.t4g.small,  noeviction)  - small, critical, no evict
-#   tenants-app    (cache.t4g.medium, allkeys-lru) - larger, disposable
+# Redis (ElastiCache) - one cluster for the app cache + sessions.
+# maxmemory-policy=allkeys-lru is fine (disposable cache).
 # --------------------------------------------------------------------------
 
-CACHES["default"]["LOCATION"]      = "redis://tenants-app.xxx.cache.amazonaws.com:6379/0"
-CACHES["tenant_alias"]["LOCATION"] = "redis://tenants-alias.xxx.cache.amazonaws.com:6379/0"
+CACHES["default"]["LOCATION"] = "redis://tenants-app.xxx.cache.amazonaws.com:6379/0"

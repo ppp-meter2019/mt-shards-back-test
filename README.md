@@ -39,7 +39,7 @@ rest.
 
 **Ongoing operations:** code deploys → [Step 7](#step-7---application-deploy-procedure-for-code-updates) · add a shard → [Step 8](#step-8---adding-a-new-shard) · post-deploy checks → [Step 9](#step-9---operational-verification-post-deploy) · disaster recovery → [Step 10](#step-10---disaster-recovery-quick-reference).
 
-**Background / config reference:** [DB initialization internals](deploy/DATABASE_SETUP.md) · [Secrets distribution](#secrets--credential-distribution) · [Redis / ElastiCache policies](#redis--elasticache) · [design decisions](#key-design-decisions) · [status state machine](#status-state-machine) · [management commands](#management-commands).
+**Background / config reference:** [DB initialization internals](deploy/DATABASE_SETUP.md) · [Secrets distribution](#secrets--credential-distribution) · [Redis / ElastiCache](#redis--elasticache) · [design decisions](#key-design-decisions) · [status state machine](#status-state-machine) · [management commands](#management-commands).
 
 ## Stack
 
@@ -76,9 +76,8 @@ rest.
          Domain, User-public,
          Sessions)
 
-                       ElastiCache Redis x 2
-          tenants-alias (noeviction)    tenants-app (allkeys-lru)
-          host -> shard cache           app cache + sessions
+                       ElastiCache Redis
+                       (app cache + sessions)
 ```
 
 ALB routing:
@@ -100,6 +99,7 @@ ALB routing:
 | Two AdminSite instances | `public_admin_site` on apex (manage tenants), `admin.site` on subdomains (business data) |
 | Two sync middlewares for routing (`ShardAwareTenantMiddleware` + `TenantShardRoutingMiddleware`) | Wires BOTH axes: `current_db` (which shard DB the router uses) AND the tenant schema on that shard connection, with per-request reset. Sync because the schema must be set on the same connection/thread the ORM uses |
 | Sync `sync` (prefork) workers, not ASGI | Simplest correct model for sync code + django-tenants; async gives no win with the required sync middleware (see Architecture trade-offs) |
+| Schema-bound JWT (`SchemaBoundJWTAuthentication`) | JWTs carry a `schema` claim; auth rejects a token whose claim ≠ the request's tenant. Without it, a token for `user_id=N` in one tenant authenticates as a different person (same PK) in another. Fail-closed |
 | `auto_create_schema = False` | Schema creation is explicit; done as part of `migrate_schemas` for NEW tenants |
 
 ## Status state machine
@@ -226,67 +226,30 @@ comes from.
 
 ## Redis / ElastiCache
 
-Two **separate** ElastiCache clusters, mapped to the two Django caches defined
-in `settings.py`:
+**One** ElastiCache cluster, for the single Django cache (`default`) that holds
+the app cache + Django sessions.
 
-| Django cache | Cluster | `maxmemory-policy` | Holds | Sizing |
-|---|---|---|---|---|
-| `tenant_alias` | `tenants-alias` | `noeviction` | host -> shard alias mappings | small, critical (`cache.t4g.small`) |
-| `default` | `tenants-app` | `allkeys-lru` | app cache + Django sessions | larger, disposable (`cache.t4g.medium`) |
+| Django cache | `maxmemory-policy` | Holds |
+|---|---|---|
+| `default` | `allkeys-lru` | app cache + Django sessions |
 
-### Why two clusters, not two logical DBs on one
-
-`maxmemory` and `maxmemory-policy` are **per-instance**, not per-database. Two
-logical DBs on one cluster share the same memory pool and the same eviction
-policy, so app-cache pressure would either evict the critical alias keys
-(`allkeys-lru`) or block all writes including alias invalidations
-(`noeviction`). ElastiCache cluster mode also supports only DB 0, so the
-two-DB shortcut blocks future horizontal scaling.
-
-### Why these policies
-
-- **`tenants-alias` -> `noeviction`**: the alias cache holds the host->shard
-  routing that every request depends on. Silently evicting an entry would route
-  requests to the wrong (or default) shard. When the cluster is full, reject new
-  writes rather than drop a live mapping — keep it small and ensure it never
-  fills (see the pollution caveat below).
-- **`tenants-app` -> `allkeys-lru`**: ordinary cache + sessions; under memory
-  pressure, dropping the least-recently-used key is exactly right.
-
-### Setting the policy
-
-`maxmemory-policy` is configured on the cluster's **parameter group**, not in
-application code; `maxmemory` follows the node type.
-
-```bash
-aws elasticache create-cache-parameter-group \
-    --cache-parameter-group-family redis7 \
-    --cache-parameter-group-name tenants-alias-params \
-    --description "alias cache: noeviction"
-aws elasticache modify-cache-parameter-group \
-    --cache-parameter-group-name tenants-alias-params \
-    --parameter-name-values "ParameterName=maxmemory-policy,ParameterValue=noeviction"
-# Attach tenants-alias-params to the tenants-alias cluster.
-# Repeat with maxmemory-policy=allkeys-lru for the tenants-app cluster.
-```
+`allkeys-lru` is fine — it's a disposable cache, and sessions also persist in
+the DB (`SESSION_ENGINE = cached_db`), so an evicted/cold cache only costs a DB
+read, never a logout. There is **no** tenant-routing cache: tenant resolution
+goes through the DB each request (`ShardAwareTenantMiddleware`), exactly like
+stock django-tenants. (An earlier design cached host→shard in a second,
+`noeviction` cluster; it was removed — the routing middleware no longer reads a
+cache, so a single cluster is all that's needed.)
 
 ### Wiring
 
-`settings_local.py` points each cache at its cluster. The dev default in
-`settings.py` shares one localhost Redis on two DBs — fine locally, where there
-is no eviction pressure:
-
 ```python
-CACHES["default"]["LOCATION"]      = "redis://tenants-app.xxx.cache.amazonaws.com:6379/0"
-CACHES["tenant_alias"]["LOCATION"] = "redis://tenants-alias.xxx.cache.amazonaws.com:6379/0"
+# settings_local.py — production points the cache at the cluster:
+CACHES["default"]["LOCATION"] = "redis://tenants-app.xxx.cache.amazonaws.com:6379/0"
 ```
 
-> **Pollution caveat:** a flood of requests with unique unknown hostnames writes
-> short-TTL negative entries into `tenants-alias`. With `noeviction`, enough of
-> them could fill it and block legitimate alias writes. Mitigate at the edge
-> (WAF / nginx rate-limit) or move negative results off the critical cluster
-> (app cache or an in-process bounded LRU). Monitor the cluster's `Evictions`
-> (should stay 0) and memory usage.
+`maxmemory-policy` is configured on the cluster's **parameter group**, not in
+application code. The dev default in `settings.py` is a localhost Redis.
 
 ## Health checks under load (known consideration)
 
@@ -431,10 +394,8 @@ pyenv is only needed to **build and create** the venv.
 3. **Three Aurora PostgreSQL clusters**: `tenants-default`, `tenants-tenant-1`,
    `tenants-tenant-2`. Single instance per cluster is OK for MVP
    (`db.t4g.medium`, single-AZ).
-4. **Two ElastiCache Redis clusters** (see **Redis / ElastiCache** below):
-   `tenants-alias` (`cache.t4g.small`, `noeviction`) and `tenants-app`
-   (`cache.t4g.medium`, `allkeys-lru`). The eviction policy differs per cluster,
-   so they cannot be collapsed into one instance in production.
+4. **One ElastiCache Redis cluster** (`cache.t4g.medium`, `allkeys-lru`) for the
+   app cache + Django sessions. See **Redis / ElastiCache** below.
 5. **ACM certificate** for `*.example.com` + `example.com`, validated via Route 53 DNS.
 6. **Application Load Balancer** with HTTPS listener on :443 using the ACM
    certificate. Two target groups: `backend` (port 80, HTTP) and `frontend`
@@ -572,21 +533,19 @@ pyenv is only needed to **build and create** the venv.
    sudo -u ubuntu bash -c "
        cd /home/ubuntu/tenants_back && source venv/bin/activate &&
        python manage.py shell <<EOF
-   from django_tenants.utils import schema_context
-   from tenants.context import use_alias
+   from tenants.context import tenant_context
    from tenants.models import Tenant
    from users.models import User
 
-   tenant = Tenant.objects.get(schema_name='acme')
-   with use_alias(tenant.shard.alias):
-       with schema_context('acme'):
-           User.objects.create_user(
-               username='acme_admin',
-               email='admin@acme.example.com',
-               password='change-me-too',
-               role=User.Role.COMPANY_ADMIN,
-           )
-           print('OK - company_admin created in acme schema.')
+   tenant = Tenant.objects.select_related('shard').get(schema_name='acme')
+   with tenant_context(tenant):
+       User.objects.create_user(
+           username='acme_admin',
+           email='admin@acme.example.com',
+           password='change-me-too',
+           role=User.Role.COMPANY_ADMIN,
+       )
+       print('OK - company_admin created in acme schema.')
    EOF
    "
    ```
@@ -691,8 +650,7 @@ When you need a fourth Aurora cluster (`tenant_3`):
    - Target group health (must be `healthy` for both backends).
    - `DatabaseConnections` on each Aurora cluster (should stay well below
      `max_connections`).
-   - Redis evictions: `tenants-alias` must stay at 0 (it is `noeviction`);
-     `tenants-app` evictions are normal under `allkeys-lru`.
+   - Redis memory usage; evictions are normal under `allkeys-lru` (disposable cache).
 3. Application logs:
    - `/var/log/gunicorn.log`, `/var/log/gunicorn.err.log`
    - `/var/log/nginx/tenants.error.log`
@@ -716,7 +674,7 @@ When you need a fourth Aurora cluster (`tenant_3`):
 | WSGI | `tenants_back/wsgi.py` | gunicorn entry (sync prefork) |
 | Public URLs | `tenants_back/urls_public.py` | Apex domain: admin, `/api/tenants/` |
 | Tenant URLs | `tenants_back/urls_tenant.py` | Tenant subdomains: admin, business APIs |
-| Context | `tenants/context.py` | ContextVar `current_db` + `use_alias` |
+| Context | `tenants/context.py` | ContextVar `current_db` + `use_alias` + shard-aware `schema_context`/`tenant_context` (drop-in replacements for the django-tenants ones; also monkeypatched over them in `apps.ready()`) |
 | Models | `tenants/models.py` | Shard, Tenant (status FSM), Domain + protections |
 | Admin | `tenants/admin.py` | `public_admin_site` + Shard/Tenant/Domain |
 | Router | `tenants/routers.py` | TenantSyncRouter + multi-DB guard |

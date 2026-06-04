@@ -219,7 +219,9 @@ AUTH_PASSWORD_VALIDATORS = [
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        # Schema-bound: rejects a token whose `schema` claim != the request's
+        # tenant, so a token cannot be reused across tenants (CRITICAL #2).
+        "users.authentication.SchemaBoundJWTAuthentication",
     ),
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
@@ -236,33 +238,15 @@ SIMPLE_JWT = {
 
 
 # ---------------------------------------------------------------------------
-# Cache: TWO logical caches, intended to map to TWO separate ElastiCache
-# clusters in production (see settings_local.py.example for why - in short:
-# Redis maxmemory and eviction policy are per-instance, not per-DB).
-#
-# For local dev they share a single localhost Redis on different DBs - fine
-# because no eviction pressure exists locally.
+# Cache: a single Redis for the app cache + Django sessions. In production this
+# maps to one ElastiCache cluster (maxmemory-policy=allkeys-lru is fine — it's
+# a disposable cache; sessions also live in the DB via cached_db, see below).
 # ---------------------------------------------------------------------------
 CACHES = {
-    # App cache + Django sessions. In production: separate ElastiCache cluster
-    # with maxmemory-policy=allkeys-lru.
     "default": {
         "BACKEND":  "django_redis.cache.RedisCache",
         "LOCATION": "redis://127.0.0.1:6379/1",
         "KEY_PREFIX": "app",
-        "OPTIONS": {
-            "CLIENT_CLASS": "django_redis.client.DefaultClient",
-            "IGNORE_EXCEPTIONS": True,
-            "SOCKET_CONNECT_TIMEOUT": 1,
-            "SOCKET_TIMEOUT": 1,
-        },
-    },
-    # Tenant alias resolution cache. In production: separate ElastiCache
-    # cluster with maxmemory-policy=noeviction (small, critical, never evict).
-    "tenant_alias": {
-        "BACKEND":  "django_redis.cache.RedisCache",
-        "LOCATION": "redis://127.0.0.1:6379/0",
-        "KEY_PREFIX": "alias",
         "OPTIONS": {
             "CLIENT_CLASS": "django_redis.client.DefaultClient",
             "IGNORE_EXCEPTIONS": True,

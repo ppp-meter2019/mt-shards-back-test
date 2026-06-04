@@ -1,10 +1,18 @@
+import re
+
 from django.db import transaction
-from django_tenants.utils import schema_context
 from rest_framework import serializers
 
 from users.models import User
 
+from .context import tenant_context
 from .models import Domain, Shard, Tenant
+
+# ASCII PostgreSQL-safe schema name: starts with a lowercase letter, then
+# lowercase letters / digits / underscores, total 1-63 chars. ASCII-only on
+# purpose - `str.isalnum()` would accept Unicode letters/digits (e.g. Cyrillic
+# or non-ASCII digits), which we do not want in a schema identifier.
+_SCHEMA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
 class DomainSerializer(serializers.ModelSerializer):
@@ -79,13 +87,13 @@ class TenantSerializer(serializers.ModelSerializer):
     def get_admins(self, obj: Tenant) -> list:
         """List of company-admin usernames inside the tenant's schema.
 
-        Implemented as one extra query per tenant (switches search_path via
-        `schema_context`). Cheap for a tens-of-tenants admin UI; if you ever
-        get hundreds of tenants, replace with a single cross-schema raw SQL
-        query.
+        One extra query per tenant, executed on the tenant's SHARD inside its
+        schema via `tenant_context` (wires both the router alias and the
+        search_path). Cheap for a tens-of-tenants admin UI; if you ever get
+        hundreds of tenants, replace with a single cross-schema raw SQL query.
         """
         try:
-            with schema_context(obj.schema_name):
+            with tenant_context(obj):
                 return list(
                     User.objects.filter(role=User.Role.COMPANY_ADMIN)
                     .order_by("username")
@@ -113,9 +121,14 @@ class TenantSerializer(serializers.ModelSerializer):
         value = value.strip().lower()
         if value == "public":
             raise serializers.ValidationError("Schema name 'public' is reserved.")
-        if not value.replace("_", "").isalnum():
+        if not _SCHEMA_NAME_RE.fullmatch(value):
             raise serializers.ValidationError(
-                "schema_name may only contain letters, digits and underscores."
+                "schema_name must be ASCII: start with a lowercase letter, then "
+                "lowercase letters, digits or underscores (max 63 chars)."
+            )
+        if value.startswith("pg_"):
+            raise serializers.ValidationError(
+                "schema_name cannot start with 'pg_' (reserved by PostgreSQL)."
             )
         if Tenant.objects.filter(schema_name=value).exists():
             raise serializers.ValidationError(

@@ -6,7 +6,6 @@
 #
 # Env vars from launch template:
 #   DEFAULT_DB_HOST, TENANT_1_DB_HOST, TENANT_2_DB_HOST   (Aurora endpoints)
-#   REDIS_ALIAS_HOST   (ElastiCache cluster for tenant_alias cache)
 #   REDIS_APP_HOST     (ElastiCache cluster for app cache + sessions)
 #
 # SSM SecureString parameters (one per Aurora cluster):
@@ -97,8 +96,7 @@ DATABASES["tenant_2"] = {
     "PASSWORD": "${TENANT_2_DB_PASSWORD}",
 }
 
-CACHES["default"]["LOCATION"]      = "redis://${REDIS_APP_HOST}:6379/0"
-CACHES["tenant_alias"]["LOCATION"] = "redis://${REDIS_ALIAS_HOST}:6379/0"
+CACHES["default"]["LOCATION"] = "redis://${REDIS_APP_HOST}:6379/0"
 EOF
 
 # Generate static files locally (served by nginx directly).
