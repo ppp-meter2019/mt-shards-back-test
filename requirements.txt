@@ -7,4 +7,6 @@ psycopg[binary]==3.2.*
 django-redis==5.4.*
 PyJWT==2.9.0
 gunicorn==23.*
-uvicorn[standard]==0.34.*
+# uvicorn[standard]==0.34.*   # only needed for the async path (UvicornWorker/ASGI),
+                              # which this project intentionally does not use —
+                              # see the "Worker model" note in tenants_back/settings.py
