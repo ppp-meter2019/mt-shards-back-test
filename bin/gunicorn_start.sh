@@ -8,7 +8,7 @@ GROUP=ubuntu                                                    #
 NUM_WORKERS=2                                                     # how many worker processes should Gunicorn spawn (concurrency = workers)
 WORKER_CLASS=sync                                                 # sync (prefork): one request per process. Project default.
 DJANGO_SETTINGS_MODULE=tenants_back.settings                      # which settings file should Django use
-DJANGO_WSGI_MODULE=mt-tenants_back.wsgi                              # WSGI module name
+DJANGO_WSGI_MODULE=tenants_back.wsgi                              # WSGI module name
 
 # NOTE: this project runs SYNC prefork workers (WSGI). Concurrency = NUM_WORKERS
 # processes; rule of thumb 2*cores + 1. CPU-heavy work goes to Celery, not here.
