@@ -1,14 +1,14 @@
 #!/bin/bash
 
 NAME="tenants_back"                                                # Name of the application
-DJANGODIR=/home/ubuntu/tenants_back                            # Django project directory
-SOCKFILE=/home/ubuntu/tenants_back/run/gunicorn.sock           # we will communicate using this unix socket
+DJANGODIR=/home/ubuntu/mt-shards-back-test                            # Django project directory
+SOCKFILE=/home/ubuntu/mt-shards-back-test/run/gunicorn.sock           # we will communicate using this unix socket
 USER=ubuntu                                                    # the user to run as
-GROUP=www-data                                                    # the group to run as (nginx user's group → can read the socket)
-NUM_WORKERS=5                                                     # how many worker processes should Gunicorn spawn (concurrency = workers)
+GROUP=ubuntu                                                    #
+NUM_WORKERS=2                                                     # how many worker processes should Gunicorn spawn (concurrency = workers)
 WORKER_CLASS=sync                                                 # sync (prefork): one request per process. Project default.
-DJANGO_SETTINGS_MODULE=tenants_back.settings                      # which settings file should Django use
-DJANGO_WSGI_MODULE=tenants_back.wsgi                              # WSGI module name
+DJANGO_SETTINGS_MODULE=mt-shards-back-test.settings                      # which settings file should Django use
+DJANGO_WSGI_MODULE=mt-shards-back-test.wsgi                              # WSGI module name
 
 # NOTE: this project runs SYNC prefork workers (WSGI). Concurrency = NUM_WORKERS
 # processes; rule of thumb 2*cores + 1. CPU-heavy work goes to Celery, not here.
@@ -48,7 +48,8 @@ exec venv/bin/gunicorn ${DJANGO_WSGI_MODULE}:application \
     --user=$USER --group=$GROUP \
     --bind=unix:$SOCKFILE \
     --timeout=120 \
-    --max-requests=10000 \
-    --max-requests-jitter=1000 \
+    --max-requests=100 \
+    --max-requests-jitter=100 \
     --access-logfile=- \
+    --log-file=- \
     --error-logfile=-
