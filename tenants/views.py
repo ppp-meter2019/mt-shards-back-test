@@ -5,6 +5,7 @@ from django.db.models import F
 from django.http import HttpResponse
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from users.models import User
@@ -44,13 +45,28 @@ class ShardViewSet(viewsets.ReadOnlyModelViewSet):
 class TenantViewSet(viewsets.ModelViewSet):
     """CRUD over tenants. Reachable only on the public host."""
 
+    # The public tenant IS listed (so admins can see it), but it is read-only:
+    # every write path below rejects it. It's a system record django-tenants
+    # needs to route the public host.
     queryset = (
-        Tenant.objects.exclude(schema_name="public")
-        .select_related("shard")
-        .order_by("-created_on")
+        Tenant.objects.select_related("shard").order_by("-created_on")
     )
     serializer_class = TenantSerializer
     permission_classes = [IsTenantAdminOnPublic]
+
+    @staticmethod
+    def _guard_public(tenant):
+        """Reject any write targeting the public tenant."""
+        if tenant.schema_name == "public":
+            raise PermissionDenied("The public tenant is read-only.")
+
+    def perform_update(self, serializer):
+        self._guard_public(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._guard_public(instance)
+        instance.delete()
 
     # -------------------------------------------------------------------
     # schema_exists pre-fetch
@@ -101,6 +117,7 @@ class TenantViewSet(viewsets.ModelViewSet):
         the new tenant has no users and nobody can log into its admin.
         """
         tenant = self.get_object()
+        self._guard_public(tenant)
         username = (request.data.get("username") or "").strip()
         password = request.data.get("password") or ""
 
@@ -173,6 +190,7 @@ class TenantViewSet(viewsets.ModelViewSet):
 
     def _transition(self, pk, *, from_status: str, to_status: str):
         tenant = self.get_object()
+        self._guard_public(tenant)
         updated = Tenant.objects.filter(pk=tenant.pk, status=from_status).update(
             previous_status=F("status"),
             status=to_status,

@@ -58,6 +58,10 @@ class TenantSerializer(serializers.ModelSerializer):
     # per shard (see _existing_schemas_for there) — avoids N+1.
     schema_exists = serializers.SerializerMethodField()
 
+    # True for the public/management tenant. It is listed but read-only (the
+    # API rejects every write); the UI uses this to hide its action buttons.
+    is_public = serializers.SerializerMethodField()
+
     class Meta:
         model = Tenant
         fields = [
@@ -70,6 +74,7 @@ class TenantSerializer(serializers.ModelSerializer):
             "status_changed_at",
             "last_error",
             "schema_exists",
+            "is_public",
             "created_on",
             "domain",
             "domains",
@@ -81,7 +86,7 @@ class TenantSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "created_on", "domains", "admins",
             "status", "status_changed_at", "last_error",
-            "schema_exists",
+            "schema_exists", "is_public",
         ]
 
     def get_admins(self, obj: Tenant) -> list:
@@ -116,6 +121,10 @@ class TenantSerializer(serializers.ModelSerializer):
         if existing is None:
             return False
         return (obj.shard.alias, obj.schema_name) in existing
+
+    def get_is_public(self, obj: Tenant) -> bool:
+        """True for the public/management tenant (listed but read-only)."""
+        return obj.schema_name == "public"
 
     def validate_schema_name(self, value: str) -> str:
         value = value.strip().lower()
