@@ -16,11 +16,13 @@ from .serializers import ShardSerializer, TenantSerializer
 
 
 def health(request):
-    """Liveness probe for ALB target group health checks.
+    """Liveness probe for ALB target-group health checks.
 
-    Plain HTTP 200 without touching the database. The nginx proxies this
-    through to gunicorn, so a healthy response means both nginx and the
-    Django ASGI worker are responsive.
+    Returns plain HTTP 200 and touches neither the database nor the tenant:
+    ShardAwareTenantMiddleware skips tenant resolution for this path (see its
+    HEALTH_PATHS), so the probe answers 200 even when the Host has no Domain
+    (e.g. the ALB checking by target IP). nginx proxies it to gunicorn, so a
+    healthy response means both nginx and the Django (sync/WSGI) worker are up.
     """
     return HttpResponse("ok", content_type="text/plain")
 
