@@ -1,3 +1,5 @@
+import re
+
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connections
@@ -14,6 +16,10 @@ from .context import tenant_context
 from .models import Shard, Tenant
 from .permissions import IsTenantAdminOnPublic
 from .serializers import ShardSerializer, TenantSerializer
+
+# Defence-in-depth: schema names are already validated on creation, but they're
+# interpolated as SQL identifiers in _last_migrations_for, so re-check here.
+_SAFE_SCHEMA_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
 def health(request):
@@ -79,7 +85,9 @@ class TenantViewSet(viewsets.ModelViewSet):
         """
         ctx = super().get_serializer_context()
         if self.action in ("list", "retrieve", "deactivate", "activate"):
-            ctx["existing_schemas"] = self._existing_schemas_for(self.get_queryset())
+            qs = self.get_queryset()
+            ctx["existing_schemas"] = self._existing_schemas_for(qs)
+            ctx["last_migrations"] = self._last_migrations_for(qs)
         return ctx
 
     @staticmethod
@@ -101,6 +109,54 @@ class TenantViewSet(viewsets.ModelViewSet):
                 )
                 for (s,) in cur.fetchall():
                     result.add((alias, s))
+        return result
+
+    @staticmethod
+    def _last_migrations_for(qs) -> dict:
+        """Return {(shard_alias, schema_name): {"app","name","applied"}} for the
+        most recently applied migration in each tenant schema.
+
+        Batched per shard (NOT per tenant): for each shard we run one query to
+        find which target schemas actually have a django_migrations table, then
+        one UNION over those schemas picking the latest row per schema via
+        DISTINCT ON. So it's at most two queries per shard regardless of how many
+        tenants live there.
+        """
+        by_shard: dict[str, set[str]] = {}
+        for t in qs:
+            by_shard.setdefault(t.shard.alias, set()).add(t.schema_name)
+
+        result: dict = {}
+        for alias, schemas in by_shard.items():
+            schema_list = list(schemas)
+            with connections[alias].cursor() as cur:
+                # Which of these schemas actually have a django_migrations table?
+                cur.execute(
+                    "SELECT table_schema FROM information_schema.tables "
+                    "WHERE table_name = 'django_migrations' AND table_schema = ANY(%s)",
+                    [schema_list],
+                )
+                migrated = [s for (s,) in cur.fetchall() if _SAFE_SCHEMA_RE.match(s)]
+                if not migrated:
+                    continue
+                # One UNION across the migrated schemas; latest row per schema.
+                # Schema names are validated above, so safe to interpolate.
+                union = " UNION ALL ".join(
+                    f"SELECT '{s}' AS schema, id, app, name, applied "
+                    f'FROM "{s}".django_migrations'
+                    for s in migrated
+                )
+                cur.execute(
+                    "SELECT DISTINCT ON (schema) schema, app, name, applied FROM ("
+                    + union
+                    + ") m ORDER BY schema, applied DESC NULLS LAST, id DESC"
+                )
+                for schema, app, name, applied in cur.fetchall():
+                    result[(alias, schema)] = {
+                        "app": app,
+                        "name": name,
+                        "applied": applied.isoformat() if applied else None,
+                    }
         return result
 
     # -------------------------------------------------------------------

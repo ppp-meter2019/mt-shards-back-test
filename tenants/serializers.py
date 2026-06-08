@@ -62,6 +62,10 @@ class TenantSerializer(serializers.ModelSerializer):
     # API rejects every write); the UI uses this to hide its action buttons.
     is_public = serializers.SerializerMethodField()
 
+    # Last applied migration in the tenant's own schema. Pre-computed per shard
+    # in TenantViewSet.get_serializer_context() (see _last_migrations_for).
+    last_migration = serializers.SerializerMethodField()
+
     class Meta:
         model = Tenant
         fields = [
@@ -75,6 +79,7 @@ class TenantSerializer(serializers.ModelSerializer):
             "last_error",
             "schema_exists",
             "is_public",
+            "last_migration",
             "created_on",
             "domain",
             "domains",
@@ -86,7 +91,7 @@ class TenantSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "created_on", "domains", "admins",
             "status", "status_changed_at", "last_error",
-            "schema_exists", "is_public",
+            "schema_exists", "is_public", "last_migration",
         ]
 
     def get_admins(self, obj: Tenant) -> list:
@@ -125,6 +130,16 @@ class TenantSerializer(serializers.ModelSerializer):
     def get_is_public(self, obj: Tenant) -> bool:
         """True for the public/management tenant (listed but read-only)."""
         return obj.schema_name == "public"
+
+    def get_last_migration(self, obj: Tenant):
+        """{"app","name","applied"} of the latest migration in the tenant's
+        schema, or None. Read from context["last_migrations"] (pre-computed per
+        shard in the viewset); None when used outside the viewset.
+        """
+        table = self.context.get("last_migrations")
+        if table is None:
+            return None
+        return table.get((obj.shard.alias, obj.schema_name))
 
     def validate_schema_name(self, value: str) -> str:
         value = value.strip().lower()
