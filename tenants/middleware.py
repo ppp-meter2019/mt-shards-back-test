@@ -22,7 +22,8 @@ event-loop middleware. See README "Architecture trade-offs".
      Must be listed AFTER ShardAwareTenantMiddleware (it needs request.tenant).
 """
 
-from django.db import connection, connections
+from django.db import connections
+from django.http import HttpResponse
 from django_tenants.middleware.main import TenantMainMiddleware
 
 from .context import current_db
@@ -33,15 +34,17 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
     TenantShardRoutingMiddleware can read request.tenant.shard without an extra
     round-trip."""
 
-    # Liveness paths answered WITHOUT resolving a tenant: they must return 200
-    # even when the Host has no Domain (e.g. the ALB health-checking by target
-    # IP), so we skip the Domain lookup + schema/urlconf setup entirely for them.
+    # Liveness paths answered HERE, by the OUTERMOST middleware, before anything
+    # downstream runs. The ALB health-checks the target by IP, so the Host is the
+    # instance IP - which fails BOTH tenant resolution (no Domain) AND ALLOWED_HOSTS
+    # (DisallowedHost, raised by SecurityMiddleware/CommonMiddleware's get_host()).
+    # Short-circuiting with a static 200 skips both: the response reflects nothing
+    # of the Host, so bypassing ALLOWED_HOSTS for this one path is safe.
     HEALTH_PATHS = frozenset({"/api/health/"})
 
     def process_request(self, request):
         if request.path in self.HEALTH_PATHS:
-            connection.set_schema_to_public()   # known state, no DB hit
-            return None                          # skip tenant resolution
+            return HttpResponse("ok", content_type="text/plain")
         return super().process_request(request)
 
     def get_tenant(self, domain_model, hostname):
