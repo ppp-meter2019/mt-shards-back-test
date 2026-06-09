@@ -231,7 +231,10 @@ class Command(UpstreamCommand):
         #    In autocommit mode (default for management commands), CREATE SCHEMA
         #    is committed immediately and is visible to any connection that the
         #    executor opens for the actual migrations.
-        if not schema_exists(tenant.schema_name, conn):
+        # schema_exists() takes the database ALIAS (a string), not a connection
+        # object: internally it does connections[database]. Passing `conn` here
+        # raised "getattr(): attribute name must be string".
+        if not schema_exists(tenant.schema_name, tenant.shard.alias):
             if tenant.previous_status == Tenant.Status.NEW:
                 with conn.cursor() as cur:
                     cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{tenant.schema_name}"')

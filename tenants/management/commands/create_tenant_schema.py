@@ -45,7 +45,7 @@ class Command(BaseCommand):
 
         alias = tenant.shard.alias
         conn  = connections[alias]
-        if schema_exists(schema, connection=conn):
+        if schema_exists(schema, alias):
             self.stdout.write(f"Schema {schema} already exists in {alias}.")
             return
 

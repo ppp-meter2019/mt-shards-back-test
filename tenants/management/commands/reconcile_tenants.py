@@ -104,7 +104,8 @@ class Command(BaseCommand):
                        f"in settings.DATABASES"),
             )
 
-        exists = schema_exists(tenant.schema_name, conn)
+        # schema_exists() takes the database ALIAS (string), not a connection.
+        exists = schema_exists(tenant.schema_name, tenant.shard.alias)
         if not exists:
             return self._eval_no_schema(tenant)
 
@@ -255,7 +256,7 @@ class Command(BaseCommand):
                 ))
                 continue
 
-            if not schema_exists(t.schema_name, conn):
+            if not schema_exists(t.schema_name, t.shard.alias):
                 applied_str = "-"
                 note = (self.style.ERROR("ACTIVE but no schema!")
                         if t.status == Tenant.Status.ACTIVE else "no schema")
