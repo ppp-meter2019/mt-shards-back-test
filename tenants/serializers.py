@@ -22,16 +22,29 @@ class DomainSerializer(serializers.ModelSerializer):
 
 
 class ShardSerializer(serializers.ModelSerializer):
-    """Read-only representation of a Shard for tenant CRUD.
+    """Read-only representation of a Shard.
 
-    Exposes only the identity (id/alias/name) plus is_default/is_active so the
-    UI can populate the shard dropdown and show shard info on tenant rows.
+    Used in two places:
+      - the tenant create-form dropdown / tenant rows (nested in TenantSerializer);
+      - the Shards management page (ShardViewSet), which also needs tenant_count
+        and timestamps.
     """
+
+    # Annotated by ShardViewSet (Count("tenants")) for the management list.
+    # Absent when nested in TenantSerializer (the tenant list doesn't need it)
+    # -> None, so we don't trigger an extra query per nested shard.
+    tenant_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Shard
-        fields = ["id", "alias", "name", "is_default", "is_active"]
+        fields = [
+            "id", "alias", "name", "is_default", "is_active",
+            "tenant_count", "created_on", "modified",
+        ]
         read_only_fields = fields
+
+    def get_tenant_count(self, obj):
+        return getattr(obj, "tenant_count", None)
 
 
 class TenantSerializer(serializers.ModelSerializer):

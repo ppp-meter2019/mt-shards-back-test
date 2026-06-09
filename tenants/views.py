@@ -3,9 +3,10 @@ import re
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connections
-from django.db.models import F
+from django.db.models import Count, F
+from django.db.models.deletion import ProtectedError
 from django.http import HttpResponse
-from rest_framework import status, viewsets
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
@@ -35,17 +36,83 @@ def health(request):
     return HttpResponse("ok", content_type="text/plain")
 
 
-class ShardViewSet(viewsets.ReadOnlyModelViewSet):
-    """Read-only list of shards available for tenant placement.
+class ShardViewSet(mixins.ListModelMixin,
+                   mixins.RetrieveModelMixin,
+                   mixins.DestroyModelMixin,
+                   viewsets.GenericViewSet):
+    """Shard management, reachable only on the public host.
 
-    Excludes the default shard (reserved for the public schema) and inactive
-    shards. The frontend uses this to populate the shard dropdown in the
-    tenant creation form.
+    Lists ALL shards (with tenant_count + timestamps) and supports
+    activate / deactivate / delete under strict rules. The tenant create-form
+    filters this list client-side to active, non-default shards.
+
+    Rules:
+      - the default shard is READ-ONLY (no activate/deactivate/delete);
+      - activate:   only a deactivated shard;
+      - deactivate: only a shard with zero tenants;
+      - delete:     only a deactivated shard.
     """
 
-    queryset = Shard.objects.filter(is_active=True, is_default=False).order_by("alias")
+    queryset = (
+        Shard.objects.annotate(tenant_count=Count("tenants"))
+                     .order_by("-is_default", "alias")
+    )
     serializer_class = ShardSerializer
     permission_classes = [IsTenantAdminOnPublic]
+
+    @staticmethod
+    def _guard_default(shard):
+        if shard.is_default:
+            raise PermissionDenied("The default shard is read-only.")
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        """Activate a deactivated shard."""
+        shard = self.get_object()
+        self._guard_default(shard)
+        if shard.is_active:
+            return Response({"detail": "Shard is already active."},
+                            status=status.HTTP_409_CONFLICT)
+        shard.is_active = True
+        shard.save(update_fields=["is_active", "modified"])
+        return Response(self.get_serializer(shard).data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        """Deactivate a shard that hosts no tenants."""
+        shard = self.get_object()
+        self._guard_default(shard)
+        if not shard.is_active:
+            return Response({"detail": "Shard is already deactivated."},
+                            status=status.HTTP_409_CONFLICT)
+        tenant_count = shard.tenants.count()
+        if tenant_count:
+            return Response(
+                {"detail": f"Cannot deactivate: shard hosts {tenant_count} "
+                           f"tenant(s). Move or delete them first."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        shard.is_active = False
+        shard.save(update_fields=["is_active", "modified"])
+        return Response(self.get_serializer(shard).data)
+
+    def destroy(self, request, *args, **kwargs):
+        """Delete a deactivated shard (default shard / active shard rejected)."""
+        shard = self.get_object()
+        self._guard_default(shard)
+        if shard.is_active:
+            return Response(
+                {"detail": "Can only delete a deactivated shard. Deactivate it first."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        try:
+            shard.delete()
+        except ProtectedError:
+            return Response(
+                {"detail": "Shard cannot be deleted - it still has tenants."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class TenantViewSet(viewsets.ModelViewSet):

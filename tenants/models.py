@@ -35,7 +35,8 @@ class Shard(models.Model):
     name       = models.CharField(max_length=120, blank=True)
     is_default = models.BooleanField(default=False)
     is_active  = models.BooleanField(default=True)
-    created_on = models.DateField(auto_now_add=True)
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified   = models.DateTimeField(auto_now=True)
 
     class Meta:
         # Partial unique index: at most one row with is_default=True.
