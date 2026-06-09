@@ -23,10 +23,11 @@ event-loop middleware. See README "Architecture trade-offs".
 """
 
 from django.db import connections
-from django.http import HttpResponse
+from django.http import HttpResponse, JsonResponse
 from django_tenants.middleware.main import TenantMainMiddleware
 
 from .context import current_db
+from .models import Tenant
 
 
 class ShardAwareTenantMiddleware(TenantMainMiddleware):
@@ -45,7 +46,24 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
     def process_request(self, request):
         if request.path in self.HEALTH_PATHS:
             return HttpResponse("ok", content_type="text/plain")
-        return super().process_request(request)
+
+        # Resolve the tenant (sets request.tenant + the schema on `default`).
+        response = super().process_request(request)
+        if response is not None:
+            # No tenant / DisallowedHost / public fallback already produced a
+            # response — pass it through unchanged.
+            return response
+
+        # Gate deactivated tenants: their whole host (API + admin) is closed.
+        # Management lives on the PUBLIC host, so the activate action is never
+        # affected. The public tenant is ACTIVE, so it is never blocked here.
+        tenant = getattr(request, "tenant", None)
+        if tenant is not None and tenant.status == Tenant.Status.DEACTIVATED:
+            return JsonResponse(
+                {"detail": "This tenant is deactivated.", "code": "tenant_deactivated"},
+                status=403,
+            )
+        return None
 
     def get_tenant(self, domain_model, hostname):
         return (
