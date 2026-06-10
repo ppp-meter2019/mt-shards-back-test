@@ -96,6 +96,12 @@ class Command(UpstreamCommand):
         SyncCommon.handle(self, *args, **options)
         self.PUBLIC_SCHEMA_NAME = get_public_schema_name()
 
+        # Capture the ORIGINAL --database now. The --shared block below overwrites
+        # self.options["database"] with "default"; without this, a no-arg full run
+        # (--shared + --tenant) would then read "default" in the tenant branch and
+        # skip every shard ("nothing to do").
+        requested_db = self.options.get("database")
+
         # schema_name=public is equivalent to --shared.
         if self.schema_name == self.PUBLIC_SCHEMA_NAME:
             self.schema_name = None
@@ -145,13 +151,14 @@ class Command(UpstreamCommand):
                 # Single tenant - shard already validated above.
                 self._migrate_one(resolved_tenant)
             else:
-                given_db = self.options.get("database")
-                if given_db == "default":
+                # Use the ORIGINAL --database (requested_db), NOT self.options
+                # — the --shared block overwrote the latter with "default".
+                if requested_db == "default":
                     self._notice(
                         "Database 'default' has no tenant schemas - nothing to do."
                     )
-                elif given_db:
-                    self._migrate_all_on_shard(given_db)
+                elif requested_db:
+                    self._migrate_all_on_shard(requested_db)
                 else:
                     shards = list(
                         Shard.objects.filter(is_default=False, is_active=True)
