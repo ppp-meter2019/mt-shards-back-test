@@ -139,10 +139,19 @@ ORIGINAL_BACKEND = "django.contrib.gis.db.backends.postgis"
 #                                     demo). Inside (2) so current_db is still live.
 # ---------------------------------------------------------------------------
 MIDDLEWARE = [
+    # CORS is OUTERMOST on purpose. It is DB-independent (only reads the Origin
+    # header and adds response headers), so wrapping everything is safe and does
+    # NOT violate the "tenant/shard set before any DB access" rule below — the
+    # tenant middlewares still precede every DB-touching middleware.
+    # Being outermost lets CorsMiddleware (a) answer preflight OPTIONS before
+    # tenant resolution, and (b) add CORS headers on the way out even to the
+    # tenant middleware's SHORT-CIRCUITED responses (e.g. the deactivated-tenant
+    # 403) — without this the browser blocks that cross-origin 403 ("Failed to
+    # fetch") and never sees the message.
+    "corsheaders.middleware.CorsMiddleware",
     "tenants.middleware.ShardAwareTenantMiddleware",
     "tenants.middleware.TenantShardRoutingMiddleware",
     "tenants.middleware_diagnostics.DiagnosticsHeadersMiddleware",
-    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
