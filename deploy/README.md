@@ -267,3 +267,75 @@ sudo -u ubuntu venv/bin/python manage.py bootstrap_tenant \
 | Admin: `CSRF verification failed`           | за TLS-проксі, Django про це не знає         | у `settings_local.py`: `SECURE_PROXY_SSL_HEADER` + `CSRF_TRUSTED_ORIGINS` (з `:8000`)         |
 | `502` лише на сабдоменах                    | nginx не передає `Host`                      | `proxy_set_header Host $host;` (вже у шаблоні)                                                |
 | `Connection refused` до сокета              | сервіс не стартував                          | `tail /var/log/supervisor/tenants_back.log` (або `journalctl -u tenants_back -n 50`)          |
+| `ModuleNotFoundError: celery` на старті     | не встановлено celery, а `__init__` його імпортує | `pip install -r requirements.txt`                                                        |
+
+
+## 9. Celery (фонові задачі)
+
+Фонові задачі (провіжн тенанта, періодичні job-и) виконує Celery. Брокер —
+**окремий** Redis (`CELERY_BROKER_URL`, дефолт у `settings.py`, оверайд у
+`settings_local.py`). Стан провіжну тримає `Tenant.status`, тож result backend
+не використовується.
+
+### 9.1 Залежності + міграції
+
+```bash
+cd /home/ubuntu/mt-shards-back-test && source venv/bin/activate
+pip install -r requirements.txt          # celery[redis] + django-celery-beat
+# django_celery_beat у SHARED і TENANT apps → мігруємо і public, і тенантів:
+python manage.py migrate_schemas --shared --database=default
+python manage.py migrate_schemas --tenant
+```
+(Без celery застосунок не стартує — `tenants_back/__init__.py` імпортує app.)
+
+### 9.2 Черги
+
+| Черга | Для чого | Хто обслуговує |
+|-------|----------|----------------|
+| `fast`    | короткі, latency-sensitive (дефолт) | `celery_fast` |
+| `slow`    | довгі бізнес-задачі                  | `celery_slow` + `celery_slow_service` |
+| `service` | обслуговування (провіжн, reconcile)  | `celery_slow_service` |
+
+### 9.3 Воркери + beat (supervisor)
+
+Конфіг — `deploy/supervisor_celery.conf`: три воркери (concurrency 2) + один beat.
+
+```bash
+mkdir -p /home/ubuntu/mt-shards-back-test/logs        # сюди пишуться логи воркерів
+sudo cp deploy/supervisor_celery.conf /etc/supervisor/conf.d/celery.conf
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl status celery:*
+```
+
+Кожен процес — свій лог-файл (через `stdout_logfile`):
+```
+logs/celery_fast.log  logs/celery_slow.log  logs/celery_slow_service.log  logs/celery_beat.log
+```
+
+Запуск «руками» для тесту (з активованим venv):
+```bash
+celery -A tenants_back worker -Q fast          --concurrency=2 -n fast@%h    --loglevel=info
+celery -A tenants_back worker -Q slow          --concurrency=2 -n slow@%h    --loglevel=info
+celery -A tenants_back worker -Q slow,service  --concurrency=2 -n slowsvc@%h --loglevel=info
+celery -A tenants_back beat --loglevel=info
+```
+
+### 9.4 Перевірка
+
+```bash
+# app піднімається й бачить брокер (без воркера дасть "No nodes replied" — це норма):
+python -c "from tenants_back.celery import app; print(app.main, app.conf.broker_url)"
+# живі воркери:
+celery -A tenants_back inspect active_queues
+celery -A tenants_back inspect ping
+```
+
+### 9.5 Граблі Celery
+
+| Симптом | Причина | Як виправити |
+|---|---|---|
+| `redis` доунгрейднувся при `pip install` | `kombu[redis]` пінить `redis <6.5`; це норма (брокер ділить клієнт із кешем) | нічого; **не** піни `redis` вище у `requirements.txt` |
+| beat шле задачі двічі | запущено **два** beat | beat — рівно ОДИН процес; не дублюй на інших хостах |
+| провіжн не виконується | немає воркера на `service` | підняти `celery_slow_service` (`-Q slow,service`) |
+| воркер слухає не ту чергу | плутанина `-Q` | `celery -A tenants_back inspect active_queues` |

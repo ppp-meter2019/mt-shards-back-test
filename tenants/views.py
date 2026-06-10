@@ -230,6 +230,39 @@ class TenantViewSet(viewsets.ModelViewSet):
     # Custom actions
     # -------------------------------------------------------------------
 
+    @action(detail=True, methods=["post"])
+    def provision(self, request, pk=None):
+        """Queue async provisioning (create schema + migrate) for a NEW tenant.
+
+        Enqueues provision_tenant on the `slow` queue; the worker does the
+        atomic NEW->PENDING claim, CREATE SCHEMA, migrate, NEW->ACTIVE/FAILED.
+
+        Re-provisioning guard: only a NEW tenant is provisionable. Any other
+        status is rejected (409) — you cannot re-provision an already-provisioned
+        tenant (ACTIVE/DEACTIVATED), one in progress (PENDING), or a FAILED one
+        (reset it via reconcile_tenants first).
+        """
+        tenant = self.get_object()
+        self._guard_public(tenant)
+        if tenant.status != Tenant.Status.NEW:
+            return Response(
+                {
+                    "detail": (
+                        f"Tenant '{tenant.schema_name}' is not provisionable "
+                        f"(status '{tenant.status}'). Provisioning runs only on a "
+                        f"NEW tenant."
+                    ),
+                    "code": "not_provisionable",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        from .tasks import provision_tenant
+        provision_tenant.delay(tenant.id)
+        return Response(
+            {"detail": "Provisioning queued.", "schema": tenant.schema_name},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
     @action(detail=True, methods=["post"], url_path="create-admin")
     def create_admin(self, request, pk=None):
         """Bootstrap the first `company_admin` user inside the chosen tenant.

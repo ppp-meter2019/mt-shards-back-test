@@ -4,6 +4,8 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+from kombu import Queue
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.environ.get(
@@ -60,6 +62,10 @@ SHARED_APPS = [
     "rest_framework_simplejwt",
     "corsheaders",
 
+    # Celery beat schedules live per-schema (public + each tenant), so this is
+    # in BOTH SHARED_APPS and TENANT_APPS. See tenants.celery.db_scheduler.
+    "django_celery_beat",
+
     "users",
 ]
 
@@ -67,6 +73,8 @@ TENANT_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.auth",
     "django.contrib.admin",
+
+    "django_celery_beat",
 
     "users",
 
@@ -289,6 +297,49 @@ CORS_ALLOWED_ORIGIN_REGEXES = [
     r.strip() for r in os.environ.get("DJANGO_CORS_ALLOWED_ORIGIN_REGEXES", "").split(",") if r.strip()
 ]
 CORS_ALLOW_CREDENTIALS = False
+
+
+# ---------------------------------------------------------------------------
+# Celery — shard+schema-aware tasks (tenants.celery). Namespace "CELERY":
+# CELERY_FOO -> app.conf.foo. The broker is a SEPARATE Redis (noeviction),
+# NOT the cache cluster, so queued tasks are never evicted under memory
+# pressure. No result backend: provisioning state lives in Tenant.status.
+# ---------------------------------------------------------------------------
+CELERY_BROKER_URL = os.environ.get(
+    "CELERY_BROKER_URL",
+    "rediss://master.test-multitenants.qmp0of.use2.cache.amazonaws.com:6379/0",
+)
+CELERY_BROKER_USE_SSL = {"ssl_cert_reqs": "required"}    # rediss:// → verify cert
+CELERY_RESULT_BACKEND = None
+CELERY_TASK_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT  = ["json"]
+CELERY_TIMEZONE        = TIME_ZONE
+CELERY_TASK_ACKS_LATE  = True            # don't lose a task if a worker dies mid-run
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1    # fair dispatch for long tasks
+# Three queues:
+#   fast    - short, latency-sensitive tasks (default)
+#   slow    - long-running tasks (provisioning, migrations, bulk jobs)
+#   service - maintenance / housekeeping (reconcile, cleanup, beat-driven)
+# Run workers per queue, e.g.  celery -A tenants_back worker -Q fast
+#                              celery -A tenants_back worker -Q slow
+#                              celery -A tenants_back worker -Q service
+CELERY_TASK_QUEUES = (
+    Queue("fast"),
+    Queue("slow"),
+    Queue("service"),
+)
+CELERY_TASK_DEFAULT_QUEUE = "fast"
+CELERY_TASK_ROUTES = {
+    "tenants.tasks.provision_tenant": {"queue": "service"},
+}
+# schema -> Tenant(+shard) lookup cache, per worker process. 0 = no cache
+# (always fresh; safe if a tenant is ever moved to another shard). Override in
+# settings_local.py (e.g. 10) when shard assignments are stable.
+CELERY_TASK_TENANT_CACHE_SECONDS = int(
+    os.environ.get("CELERY_TASK_TENANT_CACHE_SECONDS", "0")
+)
+# Tenant-aware DB-backed beat (fans periodic tasks out per tenant schema).
+CELERY_BEAT_SCHEDULER = "tenants.celery.db_scheduler:TenantAwareDatabaseScheduler"
 
 
 # ---------------------------------------------------------------------------
