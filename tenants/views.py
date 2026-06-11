@@ -1,5 +1,6 @@
 import re
 
+from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connections
@@ -36,6 +37,45 @@ def health(request):
     return HttpResponse("ok", content_type="text/plain")
 
 
+def _psql_aligned(headers, rows, title):
+    """Render rows as psql's aligned table (centered title + headers, '+' line
+    continuation for multi-line cells, '(N rows)' footer). Cosmetic — to make
+    the API response read like real \\dn+ console output.
+    """
+    ncols = len(headers)
+    widths = [len(h) for h in headers]
+    grid = []
+    for row in rows:
+        cells = []
+        for i in range(ncols):
+            lines = ("" if row[i] is None else str(row[i])).split("\n")
+            cells.append(lines)
+            for ln in lines:
+                widths[i] = max(widths[i], len(ln))
+        grid.append(cells)
+
+    def hcell(text, w):                       # header: centered, 1 space padding
+        pad = w - len(text)
+        return " " + " " * (pad // 2) + text + " " * (pad - pad // 2) + " "
+
+    def dcell(text, w, cont):                 # data: left-aligned; '+' if continued
+        return " " + text.ljust(w) + ("+" if cont else " ")
+
+    header = "|".join(hcell(headers[i], widths[i]) for i in range(ncols))
+    sep = "+".join("-" * (widths[i] + 2) for i in range(ncols))
+    out = [(" " * max(0, (len(header) - len(title)) // 2)) + title, header, sep]
+    for cells in grid:
+        nsub = max(len(c) for c in cells)
+        for sub in range(nsub):
+            out.append("|".join(
+                dcell(cells[i][sub] if sub < len(cells[i]) else "",
+                      widths[i], sub < len(cells[i]) - 1)
+                for i in range(ncols)
+            ))
+    out.append(f"({len(rows)} row{'s' if len(rows) != 1 else ''})")
+    return "\n".join(out)
+
+
 class ShardViewSet(mixins.ListModelMixin,
                    mixins.RetrieveModelMixin,
                    mixins.DestroyModelMixin,
@@ -64,6 +104,34 @@ class ShardViewSet(mixins.ListModelMixin,
     def _guard_default(shard):
         if shard.is_default:
             raise PermissionDenied("The default shard is read-only.")
+
+    @action(detail=True, methods=["get"])
+    def schemas(self, request, pk=None):
+        """Low-level peek: schemas on this shard's DB, rendered like psql `\\dn+`.
+
+        Read-only, fixed catalog query on the shard's own connection (no user
+        input → no injection). tenant_admin-only via the viewset perms. Returns
+        a single console-style `output` string for display in a <pre>.
+        """
+        shard = self.get_object()
+        with connections[shard.alias].cursor() as cur:
+            cur.execute(
+                "SELECT n.nspname, "
+                "       pg_catalog.pg_get_userbyid(n.nspowner), "
+                "       pg_catalog.array_to_string(n.nspacl, E'\\n'), "
+                "       pg_catalog.obj_description(n.oid, 'pg_namespace') "
+                "FROM pg_catalog.pg_namespace n "
+                "WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' "
+                "ORDER BY 1"
+            )
+            rows = [[r[0], r[1], r[2] or "", r[3] or ""] for r in cur.fetchall()]
+
+        dbname = settings.DATABASES[shard.alias]["NAME"]
+        table = _psql_aligned(
+            ["Name", "Owner", "Access privileges", "Description"], rows, "List of schemas"
+        )
+        output = f"{dbname}=> \\dn+\n{table}"
+        return Response({"shard": shard.alias, "output": output})
 
     @action(detail=True, methods=["post"])
     def activate(self, request, pk=None):
