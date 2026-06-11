@@ -340,6 +340,7 @@ CELERY_TASK_QUEUES = (
 CELERY_TASK_DEFAULT_QUEUE = "fast"
 CELERY_TASK_ROUTES = {
     "tenants.tasks.provision_tenant": {"queue": "service"},
+    "tenants.tasks.drop_tenant_schema_task": {"queue": "service"},
 }
 # schema -> Tenant(+shard) lookup cache, per worker process. 0 = no cache
 # (always fresh; safe if a tenant is ever moved to another shard). Override in

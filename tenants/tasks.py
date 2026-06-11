@@ -41,3 +41,16 @@ def provision_tenant(self, tenant_id):
     tenant.refresh_from_db()
     logger.info("Provision finished: %s -> %s", tenant.schema_name, tenant.status)
     return {"schema": tenant.schema_name, "status": tenant.status, "skipped": False}
+
+
+@shared_task(acks_late=True, max_retries=0)
+def drop_tenant_schema_task(database, schema):
+    """Drop an orphaned tenant schema on `database` (shard alias).
+
+    Enqueued by the tenant DELETE flow when the operator ticks "also drop the
+    schema". The Tenant row is already gone by the time this runs, so
+    drop_tenant_schema's live-tenant guard passes. Runs on the `service` queue.
+    """
+    logger.info("drop_tenant_schema_task: dropping %r on shard %r", schema, database)
+    call_command("drop_tenant_schema", database=database, schema=schema, no_input=True)
+    return {"database": database, "schema": schema, "dropped": True}

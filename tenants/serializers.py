@@ -1,6 +1,6 @@
 import re
 
-from django.db import transaction
+from django.db import connections, transaction
 from rest_framework import serializers
 
 from users.models import User
@@ -182,6 +182,36 @@ class TenantSerializer(serializers.ModelSerializer):
                 f"Domain '{value}' is already in use by another tenant."
             )
         return value
+
+    def validate(self, attrs):
+        """On create, reject a schema that PHYSICALLY exists on the chosen shard.
+
+        validate_schema_name only checks the Tenant table; an orphan schema left
+        by a deleted tenant (auto_drop_schema=False) has no Tenant row, so it
+        would slip through — and migrate_schemas would then reuse it and inherit
+        stale data. Here we have both schema_name and the shard, so we can check
+        the real schema and refuse.
+        """
+        attrs = super().validate(attrs)
+        if self.instance is None:                       # create only
+            schema = attrs.get("schema_name")
+            shard = attrs.get("shard")                  # source of write-only shard_id
+            if schema and shard:
+                with connections[shard.alias].cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                        [schema],
+                    )
+                    if cur.fetchone() is not None:
+                        raise serializers.ValidationError({
+                            "schema_name": (
+                                f"Schema '{schema}' already exists on shard "
+                                f"'{shard.alias}' (orphaned from a deleted tenant?). "
+                                f"Drop it first (manage.py drop_tenant_schema) or "
+                                f"choose another name."
+                            )
+                        })
+        return attrs
 
     def create(self, validated_data):
         domain = validated_data.pop("domain")

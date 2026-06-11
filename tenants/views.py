@@ -207,7 +207,18 @@ class TenantViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         self._guard_public(instance)
+        # Optional: also drop the tenant's schema (DELETE ?drop_schema=true).
+        # Deleting the row leaves the schema (auto_drop_schema=False); when the
+        # operator opts in we queue a service-queue task to drop it on the shard.
+        # Capture shard+schema BEFORE delete (the instance is gone afterwards).
+        drop = str(self.request.query_params.get("drop_schema", "")).lower() in (
+            "1", "true", "yes", "on",
+        )
+        alias, schema = instance.shard.alias, instance.schema_name
         instance.delete()
+        if drop:
+            from .tasks import drop_tenant_schema_task
+            drop_tenant_schema_task.delay(alias, schema)
 
     # -------------------------------------------------------------------
     # schema_exists pre-fetch
