@@ -221,6 +221,24 @@ def _aurora_db_options(connect_timeout=5):
     }
 
 
+def _proxy_db_options(connect_timeout=5):
+    """Build the OPTIONS dict for a database entry that connects through RDS Proxy.
+
+    Unlike a direct Aurora connection, RDS Proxy presents an ACM certificate that
+    chains to the public Amazon Trust Services / Starfield roots - NOT the Amazon
+    RDS CA in AWS_RDS_CA. So verify-full must validate against the system trust
+    store (`sslrootcert=system`, requires libpq >= 16), not the vendored RDS
+    bundle. On older libpq, replace "system" with the OS bundle path
+    (e.g. /etc/ssl/certs/ca-certificates.crt). Used in settings_local.py for
+    DATABASES entries whose HOST is a *.proxy-*.rds.amazonaws.com endpoint.
+    """
+    return {
+        "connect_timeout": connect_timeout,
+        "sslmode":         "verify-full",
+        "sslrootcert":     "system",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Auth + DRF + JWT
 # (Frontend contract is preserved: /api/auth/login/ returns access/refresh/role/schema.)
