@@ -6,15 +6,19 @@ so per-schema reads route to the right shard.
 import json
 import logging
 
-from django_celery_beat.models import PeriodicTask, PeriodicTasks
 from django_celery_beat.schedulers import DatabaseScheduler, ModelEntry
 
-from .compat import (
-    get_public_schema_name, get_tenant_model, schema_context, tenant_context,
-)
+from .compat import get_public_schema_name, get_tenant_model, schema_context
 from .scheduler import TenantAwareSchedulerMixin
 
 logger = logging.getLogger(__name__)
+
+# Built-in global periodic tasks that clean a GLOBAL store (the result backend),
+# not per-tenant data → run once, don't fan out per schema. Per analysis this is
+# the only auto-installed beat task (canvas primitives like chord_unlock are NOT
+# beat-scheduled). Explicit allowlist (not a "celery." prefix) so a user task is
+# never silently deduped.
+_GLOBAL_TASKS = frozenset({"celery.backend_cleanup"})
 
 
 def _task_schema(options):
@@ -22,6 +26,15 @@ def _task_schema(options):
 
 
 class TenantAwareModelEntry(ModelEntry):
+    def __init__(self, model, **kwargs):
+        super().__init__(model, **kwargs)
+        # Namespace the SCHEDULE-ENTRY identity by schema so same-named per-tenant
+        # tasks coexist in the merged schedule and each fires for its own tenant.
+        # The DB model.name is left untouched (save() writes by pk, not name).
+        # Global built-ins keep their plain name (deduped to one copy in enabled_models).
+        if model.name not in _GLOBAL_TASKS:
+            self.name = f"{model.name}@{_task_schema(self.options)}"
+
     def is_due(self):
         with schema_context(_task_schema(self.options)):
             return super().is_due()
@@ -32,17 +45,19 @@ class TenantAwareModelEntry(ModelEntry):
 
 
 class TenantAwarePeriodicTasks:
+    """Change-detection sentinel. Reads ONE Redis marker per schema (bumped by an
+    ORM signal on any schedule change; see change_marker.py) via a single MGET —
+    no per-tenant DB round-trip. Direct-SQL injections bypass the signal; use
+    `manage.py resync_beat_schedules`."""
+
     @classmethod
     def last_change(cls):
-        with schema_context(get_public_schema_name()):
-            all_tenants = list(get_tenant_model().objects.all())
-            last_change = PeriodicTasks.last_change()
-        for tenant in all_tenants:
-            with tenant_context(tenant):
-                tlc = PeriodicTasks.last_change()
-                last_change = (max(last_change, tlc) if last_change and tlc
-                               else (last_change or tlc))
-        return last_change
+        from datetime import datetime, timezone as _tz
+
+        from .change_marker import marker_max
+
+        ts = marker_max()
+        return datetime.fromtimestamp(ts, tz=_tz.utc) if ts else None
 
 
 class TenantAwareDatabaseScheduler(TenantAwareSchedulerMixin, DatabaseScheduler):
@@ -54,6 +69,9 @@ class TenantAwareDatabaseScheduler(TenantAwareSchedulerMixin, DatabaseScheduler)
         self.update_from_dict(
             self._tenant_aware_beat_schedule_to_dict(self.app.conf.beat_schedule)
         )
+        # Seed the baseline from current markers so the first tick after startup
+        # doesn't trigger a redundant full reload (we just loaded everything).
+        self._last_timestamp = self.Changes.last_change()
 
     def get_public_schema_name(self):
         return [get_public_schema_name()]
@@ -67,16 +85,35 @@ class TenantAwareDatabaseScheduler(TenantAwareSchedulerMixin, DatabaseScheduler)
         return [*public, *self.get_tenant_schema_names(public)]
 
     def enabled_models(self):
-        models_, seen = [], {}
+        # Collect enabled PeriodicTasks across public + every tenant schema, stamping
+        # each with its schema (headers._schema_name). We do NOT mutate task.name —
+        # per-schema namespacing of the schedule-entry identity happens in
+        # TenantAwareModelEntry + all_as_schedule, so model.name stays truthful.
+        models_, seen_global = [], set()
         for schema_name in self.get_schema_names():
             with schema_context(schema_name):
                 for task in super().enabled_models_qs():
-                    if prev := seen.get(task.name):
-                        raise ValueError(
-                            f"duplicate periodic task name {task.name!r}; seen in {prev!r}")
+                    if task.name in _GLOBAL_TASKS:
+                        # Global built-in (e.g. celery.backend_cleanup): auto-installed
+                        # into every schema but cleans a GLOBAL store — keep one copy.
+                        if task.name in seen_global:
+                            continue
+                        seen_global.add(task.name)
                     headers = json.loads(task.headers)
                     headers.setdefault("_schema_name", schema_name)
                     task.headers = json.dumps(headers)
                     models_.append(task)
-                    seen[task.name] = schema_name
         return models_
+
+    def all_as_schedule(self):
+        # Key the merged schedule by the (schema-namespaced) entry.name instead of
+        # model.name, so same-named per-tenant tasks don't overwrite each other.
+        # entry.name MUST equal the dict key — sync()/_dirty look entries up by name.
+        s = {}
+        for model in self.enabled_models():
+            try:
+                entry = self.Entry(model, app=self.app)
+                s[entry.name] = entry
+            except ValueError:
+                pass
+        return s

@@ -21,3 +21,9 @@ class TenantsConfig(AppConfig):
 
         dt_utils.schema_context = schema_context
         dt_utils.tenant_context = tenant_context
+
+        # Wire the Redis change-marker signals for the tenant-aware beat scheduler
+        # (one marker per tenant instead of polling every schema each tick).
+        from .celery.change_marker import connect_beat_change_signals
+
+        connect_beat_change_signals()

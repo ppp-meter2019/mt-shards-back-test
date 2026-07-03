@@ -297,6 +297,28 @@ CACHES = {
     },
 }
 
+# Dedicated cache alias for Celery-beat coordination keys (beat:last_change:<schema>).
+# These are CROSS-TENANT markers: written in a tenant's context but read by beat
+# outside any tenant context, so they must NOT carry the per-tenant key prefix used
+# for app data. Same Redis by default; override BEAT_REDIS_URL / LOCATION if needed.
+#
+# OPTIONS is a COPY of default's, NOT a shared reference: when the app-data caches
+# gain a tenant KEY_FUNCTION, add it to CACHES["default"]["OPTIONS"] ONLY — never
+# here. A tenant prefix on this alias would split beat's writer (tenant context)
+# and reader (public context) onto different keys and silently break change-detection.
+CACHES["beat"] = {
+    "BACKEND":    CACHES["default"]["BACKEND"],
+    "LOCATION":   os.environ.get("BEAT_REDIS_URL", CACHES["default"]["LOCATION"]),
+    "KEY_PREFIX": "beat",
+    "OPTIONS":    dict(CACHES["default"].get("OPTIONS", {})),
+}
+
+# Celery-beat change-detection: beat polls every max_interval; keep the per-tenant
+# Redis change-markers alive for k×max_interval (k>=3) so a running beat always
+# observes a marker before it expires, and deleted-tenant markers self-clean.
+DJANGO_CELERY_BEAT_MAX_LOOP_INTERVAL = int(os.environ.get("BEAT_MAX_LOOP_INTERVAL", "5"))
+BEAT_MARKER_TTL_SECONDS = DJANGO_CELERY_BEAT_MAX_LOOP_INTERVAL * 3
+
 SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"
 SESSION_CACHE_ALIAS = "default"
 
