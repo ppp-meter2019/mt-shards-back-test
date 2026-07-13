@@ -399,6 +399,18 @@ CELERY_BEAT_SCHEDULER = "tenants.celery.db_scheduler:TenantAwareDatabaseSchedule
 
 
 # ---------------------------------------------------------------------------
+# S3 - offline GPS/coordinate storage (multi-tenant data lake). Part of moving
+# coordinate storage off MongoDB (Jira IT-21249); objects are written under a
+# per-tenant (numeric id), date-partitioned prefix so downstream analytics
+# (Athena / Kinesis-Firehose, Jira IT-21374) can scan by tenant + day.
+# Bucket + region are environment-specific -> override in settings_local.py.
+# Credentials come from the instance / ECS-task IAM role (no keys in code).
+# ---------------------------------------------------------------------------
+AWS_S3_COORDINATES_BUCKET = os.environ.get("AWS_S3_COORDINATES_BUCKET", "")
+AWS_S3_REGION = os.environ.get("AWS_S3_REGION", "") or None
+
+
+# ---------------------------------------------------------------------------
 # Local overrides last (production secrets, hostnames, etc.)
 # ---------------------------------------------------------------------------
 try:

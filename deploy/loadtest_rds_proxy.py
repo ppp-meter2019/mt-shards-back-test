@@ -31,10 +31,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import random
 import time
 import uuid
 from collections import Counter, defaultdict
+from contextlib import contextmanager
+from pathlib import Path
 from dataclasses import dataclass, field
 
 import httpx
@@ -43,10 +46,13 @@ import httpx
 # CONFIG — edit inline. Fill in real usernames/passwords per tenant.
 # ===========================================================================
 TENANTS = [
+{"name": "extra", "base_url": "https://extra.test2-multitenants.isi-technology.com:8000",
+     "username": "extra_admin", "password": "Ms111111"},
     {"name": "alpha1", "base_url": "https://alpha1.test2-multitenants.isi-technology.com:8000",
      "username": "alpha_admin", "password": "Ms111111"},
     {"name": "beta",  "base_url": "https://beta.test2-multitenants.isi-technology.com:8000",
-     "username": "REPLACE_ME", "password": "REPLACE_ME"},
+     "username": "beta_admin", "password": "Ms111111"},
+
     # add more tenants here...
 ]
 
@@ -78,7 +84,7 @@ def _make_product(tag, ctx):
 def _make_car(tag, ctx):
     return "/api/cars/", {
         "brand": random.choice(_BRANDS), "model": f"M{random.randint(100, 999)}",
-        "year": random.randint(2005, 2024), "license_plate": f"LT{uuid.uuid4().hex[:8]}",
+        "year": random.randint(2005, 2024), "license_plate": f"LT{uuid.uuid4().hex[:8].upper()}",
     }
 
 
@@ -94,17 +100,21 @@ def _make_driver(tag, ctx):
     return "/api/drivers/", {
         "username": f"drv-{tag}", "password": _USER_PW,
         "first_name": "Load", "last_name": "Driver",
-        "date_of_birth": "1990-01-01", "license_number": f"DL{uuid.uuid4().hex[:8]}",
+        "date_of_birth": "1990-01-01", "license_number": f"DL{uuid.uuid4().hex[:8].upper()}",
     }
 
 
 def _make_order(tag, ctx):
-    if "product" not in ctx:
+    # Order needs a product AND a customer: an admin/staff caller must set customer
+    # explicitly (it's only inferred for customer-role callers). Skip if either dep
+    # wasn't created this iteration — otherwise we send a customer-less order and get
+    # a misleading 400 that just cascades from a failed customer create.
+    if "product" not in ctx or "customer" not in ctx:
         return None
-    payload = {"items": [{"product": ctx["product"], "quantity": random.randint(1, 3)}]}
-    if "customer" in ctx:
-        payload["customer"] = ctx["customer"]
-    return "/api/orders/", payload
+    return "/api/orders/", {
+        "customer": ctx["customer"],
+        "items": [{"product": ctx["product"], "quantity": random.randint(1, 3)}],
+    }
 
 
 ENTITY_BUILDERS = {
@@ -198,8 +208,51 @@ def pct(values, q):
     return values[max(0, min(len(values) - 1, int(round(q / 100 * (len(values) - 1)))))]
 
 
+# ---- full-body error capture -------------------------------------------------
+# With DEBUG=True Django serves the full traceback on a 500. Because the client
+# sends Accept: application/json, request.accepts('text/html') is False, so Django
+# returns that traceback as PLAIN TEXT (not HTML). We write the first _MAX_LOGGED
+# such bodies to ERROR_LOG so the console stays readable.
+# Written next to THIS script (deploy/), regardless of the current working
+# directory. Override with the LOADTEST_ERROR_LOG env var if you prefer.
+ERROR_LOG = os.environ.get(
+    "LOADTEST_ERROR_LOG", str(Path(__file__).resolve().parent / "loadtest_errors.log"))
+_MAX_LOGGED = 30
+_logged = 0
+
+
+def _log_failure(tenant, entity, op, what, body):
+    global _logged
+    if not body or _logged >= _MAX_LOGGED:
+        return
+    _logged += 1
+    with open(ERROR_LOG, "a", encoding="utf-8") as f:
+        f.write(f"\n{'=' * 80}\n[{tenant}] {entity} {op} -> {what}\n{'-' * 80}\n{body}\n")
+
+
+# ---- in-flight request gauge -------------------------------------------------
+# Offered concurrency: how many requests the generator has awaiting a response at
+# once. asyncio is single-threaded/cooperative, so plain +=/-= around each await
+# is race-free. We report the peak.
+_inflight = 0
+_peak_inflight = 0
+
+
+@contextmanager
+def _track_inflight():
+    global _inflight, _peak_inflight
+    _inflight += 1
+    if _inflight > _peak_inflight:
+        _peak_inflight = _inflight
+    try:
+        yield
+    finally:
+        _inflight -= 1
+
+
 async def login(client, user, pw):
-    r = await client.post("/api/auth/login/", json={"username": user, "password": pw})
+    with _track_inflight():
+        r = await client.post("/api/auth/login/", json={"username": user, "password": pw})
     r.raise_for_status()
     return r.json()["access"]
 
@@ -215,7 +268,8 @@ async def create_and_verify(client, headers, tenant, vu_id, M) -> bool:
         op = M.op(tenant, kind, "create")
         t0 = time.monotonic()
         try:
-            cr = await client.post(path, json=payload, headers=headers)
+            with _track_inflight():
+                cr = await client.post(path, json=payload, headers=headers)
         except httpx.HTTPError as exc:
             name = type(exc).__name__
             op.error(name, str(exc))
@@ -224,23 +278,26 @@ async def create_and_verify(client, headers, tenant, vu_id, M) -> bool:
         ok = cr.status_code in (200, 201)
         body = "" if ok else cr.text
         op.http(cr.status_code, ok, (time.monotonic() - t0) * 1000, body)
-        kind = classify(cr.status_code, ok, body)
-        if kind == "infra" and cr.status_code == 500:
+        mark_kind = classify(cr.status_code, ok, body)   # was `kind` — don't shadow the entity name!
+        if mark_kind == "infra" and cr.status_code == 500:
             op.infra_500 += 1
-        M.mark(kind)
+        M.mark(mark_kind)
         if cr.status_code == 401:
             saw_401 = True
         if not ok:
+            if cr.status_code >= 500:                     # dump the full 500 traceback to ERROR_LOG
+                _log_failure(tenant, kind, "create", cr.status_code, cr.text)
             continue
         oid = cr.json()["id"]
-        ctx[kind] = oid
+        ctx[kind] = oid                                   # e.g. ctx["product"] — `order` depends on this
         created.append((kind, path, oid))
 
     for kind, path, oid in created:
         op = M.op(tenant, kind, "read")
         t1 = time.monotonic()
         try:
-            vr = await client.get(f"{path}{oid}/", headers=headers)
+            with _track_inflight():
+                vr = await client.get(f"{path}{oid}/", headers=headers)
         except httpx.HTTPError as exc:
             name = type(exc).__name__
             op.error(name, str(exc))
@@ -251,10 +308,12 @@ async def create_and_verify(client, headers, tenant, vu_id, M) -> bool:
         op.http(vr.status_code, hit, (time.monotonic() - t1) * 1000, body)
         if vr.status_code == 200 and not hit:
             op.verify_fail += 1
-        kind = classify(vr.status_code, hit, body)
-        if kind == "infra" and vr.status_code == 500:
+        mark_kind = classify(vr.status_code, hit, body)
+        if mark_kind == "infra" and vr.status_code == 500:
             op.infra_500 += 1
-        M.mark(kind)
+        if not hit and vr.status_code >= 500:
+            _log_failure(tenant, kind, "read", vr.status_code, vr.text)
+        M.mark(mark_kind)
     return saw_401
 
 
@@ -262,7 +321,8 @@ async def virtual_user(vu_id, tenant, deadline, M):
     limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
     async with httpx.AsyncClient(base_url=tenant["base_url"], verify=VERIFY_TLS,
                                  timeout=httpx.Timeout(REQUEST_TIMEOUT),
-                                 limits=limits, http2=False) as client:
+                                 limits=limits, http2=False,
+                                 headers={"Accept": "application/json"}) as client:
         try:
             token = await login(client, tenant["username"], tenant["password"])
         except Exception as exc:  # noqa: BLE001
@@ -309,7 +369,8 @@ def report(M: Metrics, wall):
             print(f"{kind:<10}{phase:<8}{merged.attempts:>10}{merged.ok:>9}{merged.fail:>7}"
                   f"{merged.verify_fail:>13}{pct(merged.latencies_ms, 95):>9.0f}   {top}")
     print("=" * 90)
-    print(f"wall={wall:.1f}s  entities ok/s={sum(s.ok for s in ops.values()) / wall if wall else 0:.1f}")
+    print(f"wall={wall:.1f}s  entities ok/s={sum(s.ok for s in ops.values()) / wall if wall else 0:.1f}"
+          f"  peak concurrent requests={_peak_inflight}")
 
     # 2) PROBLEMS split create / read, with sample bodies
     for phase in ("create", "read"):
@@ -357,6 +418,8 @@ def report(M: Metrics, wall):
     if vfail:
         print(f"\n⚠️  {vfail} verify failures — created entity not read back in its own "
               f"tenant (isolation/routing problem, NOT a proxy issue).")
+    if _logged:
+        print(f"\nFull tracebacks for {_logged} server error(s) (500) written to {ERROR_LOG}")
 
 
 def _merge_by_entity(rows):
@@ -370,8 +433,13 @@ async def run(vus, duration):
     if any(t["password"] == "REPLACE_ME" for t in TENANTS):
         raise SystemExit("Fill in real username/password in the TENANTS dict first.")
     M = Metrics()
+    open(ERROR_LOG, "w").close()                    # fresh error log each run
     deadline = time.monotonic() + duration
-    tasks = [virtual_user(vu, t, deadline, M) for t in TENANTS for vu in range(vus)]
+    # Round-robin tenant order (vu-outer, tenant-inner) so no single tenant's VUs
+    # are all created last and starved of workers under saturation — that's a
+    # generator artifact, not a backend issue. Interleaving spreads any starvation
+    # evenly across tenants, keeping the per-tenant breakdown meaningful.
+    tasks = [virtual_user(vu, t, deadline, M) for vu in range(vus) for t in TENANTS]
     print(f"Starting {len(tasks)} VUs ({vus}/tenant × {len(TENANTS)} tenants), "
           f"{duration}s, entities/iter={ENABLED_ENTITIES}\n")
     wall0 = time.monotonic()
