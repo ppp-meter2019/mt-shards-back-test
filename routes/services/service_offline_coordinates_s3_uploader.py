@@ -30,6 +30,15 @@ from django.utils import timezone
 
 _logger = logging.getLogger(__name__)
 
+# Top-level key prefix for every offline-coordinates object (see the key layout
+# built in build_offline_coordinates_object).
+COORDINATES_PREFIX = "offline-coordinates/"
+
+
+def _tenant_prefix(tenant_id: int) -> str:
+    """S3 key prefix for a single tenant's offline coordinates."""
+    return f"{COORDINATES_PREFIX}tenant={tenant_id}/"
+
 
 @lru_cache(maxsize=None)
 def _s3_client(region: str | None):
@@ -79,8 +88,7 @@ def build_offline_coordinates_object(
     # Hive-style partitions let Athena/Firehose prune by tenant + day. The file
     # stem carries route_id + microseconds so repeated uploads never collide.
     s3_key = (
-        f"offline-coordinates/"
-        f"tenant={tenant_id}/"
+        f"{_tenant_prefix(tenant_id)}"
         f"dt={now:%Y-%m-%d}/"
         f"{route_id}_{now:%H%M%S%f}.{extension}"
     )
@@ -137,6 +145,46 @@ def upload_offline_coordinates_to_s3(
         data, tenant_id, use_gzip=use_gzip
     )
     return put_offline_coordinates_object(s3_key, body, content_type)
+
+
+def list_offline_coordinates_objects(
+    *, tenant_id: int | None = None, prefix: str | None = None, limit: int | None = None
+):
+    """List offline-coordinates objects in the bucket with their sizes.
+
+    :param tenant_id: if given, restrict to this tenant's prefix
+        (``offline-coordinates/tenant=<id>/``).
+    :param prefix: explicit key prefix; overrides ``tenant_id`` when both given.
+    :param limit: stop after yielding this many objects (None = no limit).
+    :yield: dicts ``{"key": str, "size": int, "last_modified": datetime}``,
+        newest keys as S3 returns them (lexicographic by key).
+    :raises ValueError: if the bucket setting is unset.
+    :raises botocore.exceptions.ClientError: on an S3 failure.
+    """
+    bucket_name = getattr(settings, "AWS_S3_COORDINATES_BUCKET", "")
+    if not bucket_name:
+        raise ValueError(
+            "AWS_S3_COORDINATES_BUCKET is not configured "
+            "(set it in settings_local.py)."
+        )
+
+    if prefix is None:
+        prefix = _tenant_prefix(tenant_id) if tenant_id is not None else COORDINATES_PREFIX
+
+    client = _s3_client(getattr(settings, "AWS_S3_REGION", None))
+    paginator = client.get_paginator("list_objects_v2")
+
+    yielded = 0
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            yield {
+                "key": obj["Key"],
+                "size": obj["Size"],
+                "last_modified": obj["LastModified"],
+            }
+            yielded += 1
+            if limit is not None and yielded >= limit:
+                return
 
 
 def generate_offline_coordinates_data(rows_count: int) -> dict:
