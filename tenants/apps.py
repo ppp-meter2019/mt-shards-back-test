@@ -27,3 +27,6 @@ class TenantsConfig(AppConfig):
         from .celery.change_marker import connect_beat_change_signals
 
         connect_beat_change_signals()
+
+        # Register tenant-resolution cache invalidation signals.
+        from . import signals  # noqa: F401

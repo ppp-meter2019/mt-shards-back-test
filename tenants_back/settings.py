@@ -314,6 +314,65 @@ CACHES["beat"] = {
     "OPTIONS":    dict(CACHES["default"].get("OPTIONS", {})),
 }
 
+# ---------------------------------------------------------------------------
+# Tenant-resolution cache (host -> Tenant+shard). Read by ShardAwareTenantMiddleware
+# on EVERY request BEFORE the tenant is known, to remove the per-request Domain
+# lookup from the shared `default` DB — so a worker serving cache-hit traffic stops
+# touching `default` and its connection idles out (fewer connections to `default`).
+#
+# This MUST be a SEPARATE Redis INSTANCE (not just another alias on `default`),
+# because it needs a different maxmemory-policy than the app/session cache.
+#
+#   *** Required config on this instance (ElastiCache parameter group): ***
+#     maxmemory-policy = volatile-ttl
+#       Every entry here is written WITH a TTL (positive AND negative). Under memory
+#       pressure Redis then evicts the NEAREST-to-expiry first — i.e. the short-TTL
+#       negative (miss) entries — protecting the long-TTL positives, and KEEPS
+#       accepting writes (unlike noeviction, which would start failing them).
+#       NEVER write a key here without a TTL (no cache.set(..., timeout=None)):
+#       a persistent key is not an eviction candidate and breaks this guarantee.
+#     A dedicated instance also keeps this namespace tenant-agnostic: resolution
+#     runs in the PUBLIC context (tenant not resolved yet), so keys must carry only
+#     a static KEY_PREFIX ("tres") and NEVER a per-tenant KEY_FUNCTION — same as the
+#     `beat` alias (which likewise uses a static prefix, no per-tenant key function).
+#
+# Failure mode: IGNORE_EXCEPTIONS + short timeouts => a slow/down instance degrades
+# to a `default` DB lookup (fail-open) — today's behavior. Correctness never depends
+# on this cache being up.
+#
+# Production: point LOCATION at the dedicated instance in settings_local.py.
+# ---------------------------------------------------------------------------
+CACHES["tenant_resolve"] = {
+    "BACKEND":  "django_redis.cache.RedisCache",
+    "LOCATION": "redis://127.0.0.1:6379/2",   # dev default; prod -> settings_local.py
+    "KEY_PREFIX": "tres",
+    "OPTIONS": {
+        "CLIENT_CLASS": "django_redis.client.DefaultClient",
+        "IGNORE_EXCEPTIONS": True,             # Redis down/slow => miss => DB (fail-open)
+        "SOCKET_CONNECT_TIMEOUT": 1,
+        "SOCKET_TIMEOUT": 1,
+    },
+}
+
+# Resolution-cache TTLs. 0 disables that half (falls back to a DB lookup).
+# positive: long backstop; correctness is kept by explicit invalidation (signals on
+#           Tenant/Domain). The TTL only self-heals entries an invalidation missed —
+#           e.g. a status/shard change via QuerySet.update()/migration, which does
+#           NOT fire post_save. Do NOT make this unbounded.
+# negative: short; bounds the memory a flood of unknown-host requests can occupy.
+#           A just-created domain is made resolvable immediately by invalidating its
+#           negative entry on Domain creation, so this TTL is only a safety bound.
+TENANT_RESOLVE_CACHE_SECONDS      = 3600   # positive (success): 1 hour
+TENANT_RESOLVE_MISS_CACHE_SECONDS = 60     # negative (miss): 60 s
+
+# Invalidation writes a short-lived "hold" marker instead of deleting the key; while
+# it lives, get_tenant resolves DB-direct and an nx=True populate CANNOT overwrite it —
+# closing the read-then-write race (a slow resolver repopulating a stale snapshot just
+# after invalidation). Self-heals on expiry. 0 => plain delete (no hold, race open).
+# Keep it a few seconds (comfortably above a resolver's read->write latency). NOTE: it
+# is the shortest-TTL key here, so volatile-ttl evicts it first under memory pressure.
+TENANT_RESOLVE_HOLD_SECONDS = 5
+
 # Celery-beat change-detection: beat polls every max_interval; keep the per-tenant
 # Redis change-markers alive for k×max_interval (k>=3) so a running beat always
 # observes a marker before it expires, and deleted-tenant markers self-clean.

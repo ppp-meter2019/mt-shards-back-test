@@ -55,6 +55,7 @@ from django_tenants.utils import (
 )
 
 from tenants.models import Shard, Tenant
+from tenants.resolve_cache import forget_tenant
 
 
 # Statuses that may be claimed by a migration run.
@@ -260,6 +261,7 @@ class Command(UpstreamCommand):
                     last_error=error,
                     status_changed_at=timezone.now(),
                 )
+                forget_tenant(tenant)   # .update() bypasses post_save
                 self._notice(f"FAIL {tenant.schema_name} - {error}")
                 raise CommandError(error)
 
@@ -281,6 +283,7 @@ class Command(UpstreamCommand):
                 last_error=f"{type(e).__name__}: {e}"[:2000],
                 status_changed_at=timezone.now(),
             )
+            forget_tenant(tenant)   # .update() bypasses post_save
             self._notice(f"FAIL {tenant.schema_name} - {e}")
             raise
 
@@ -294,6 +297,7 @@ class Command(UpstreamCommand):
             status=new_status,
             status_changed_at=timezone.now(),
         )
+        forget_tenant(tenant)   # .update() bypasses post_save
         self._notice(f"OK   {tenant.schema_name} -> {new_status}")
 
     # ------------------------------------------------------------------

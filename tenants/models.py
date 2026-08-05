@@ -24,6 +24,15 @@ from django_tenants.models import DomainMixin, TenantMixin
 from django_tenants.utils import get_public_schema_name
 
 
+class ReadOnlyInstanceError(RuntimeError):
+    """Raised when code tries to save()/delete() a request-scoped, read-only Tenant
+    or Shard. tenants.middleware marks request.tenant (and its .shard) read-only —
+    whether resolved fresh OR rebuilt from the resolution cache — because it is a
+    routing snapshot, not a handle for mutating the registry. Re-fetch a fresh
+    instance (Model.objects.get(pk=...)) to persist changes. Subclasses RuntimeError
+    so existing `except RuntimeError` handlers still catch it."""
+
+
 class Shard(models.Model):
     """A physical Aurora cluster that can host tenant schemas.
 
@@ -37,6 +46,12 @@ class Shard(models.Model):
     is_active  = models.BooleanField(default=True)
     created_on = models.DateTimeField(auto_now_add=True)
     modified   = models.DateTimeField(auto_now=True)
+
+    # Set True by tenants.middleware on request.tenant / its .shard — a read-only
+    # routing snapshot (resolved fresh OR rebuilt from the resolution cache). Saving
+    # it would clobber the real row (a cache-rebuilt instance carries only cached
+    # fields). Plain attribute, not a model field: no column, no migration.
+    read_only = False
 
     class Meta:
         # Partial unique index: at most one row with is_default=True.
@@ -54,6 +69,12 @@ class Shard(models.Model):
 
     def clean(self):
         super().clean()
+        if self.pk is not None:
+            old_alias = Shard.objects.filter(pk=self.pk).values_list("alias", flat=True).first()
+            if old_alias is not None and old_alias != self.alias:
+                raise ValidationError({
+                    "alias": "Shard alias is immutable once set (it maps to a settings.DATABASES key)."
+                })
         if self.alias not in settings.DATABASES:
             raise ValidationError({
                 "alias": (
@@ -68,12 +89,25 @@ class Shard(models.Model):
                 "alias": "The 'default' database is reserved for the public schema."
             })
 
-    def delete(self, *args, **kwargs):
-        """Protect default shard from deletion at the model level.
+    def save(self, *args, **kwargs):
+        if self.read_only:
+            raise ReadOnlyInstanceError(
+                "This Shard is a read-only request snapshot (tenants.middleware); "
+                "re-fetch it via Shard.objects.get(pk=...) before saving."
+            )
+        return super().save(*args, **kwargs)
 
-        Combined with Tenant.shard on_delete=PROTECT, this means a shard can
-        only be deleted if it has no tenants AND is not the default shard.
+    def delete(self, *args, **kwargs):
+        """Refuse to delete a read-only request snapshot; protect the default shard.
+
+        Combined with Tenant.shard on_delete=PROTECT, a real shard can only be
+        deleted if it has no tenants AND is not the default shard.
         """
+        if self.read_only:
+            raise ReadOnlyInstanceError(
+                "This Shard is a read-only request snapshot; re-fetch it via "
+                "Shard.objects.get(pk=...) before deleting (would remove the real row)."
+            )
         if self.is_default:
             raise ProtectedError(
                 "Default shard cannot be deleted - it is reserved for the public schema.",
@@ -113,6 +147,9 @@ class Tenant(TenantMixin):
     auto_create_schema = False
     auto_drop_schema   = False
 
+    # See Shard.read_only.
+    read_only = False
+
     def __str__(self):
         return self.name
 
@@ -133,8 +170,21 @@ class Tenant(TenantMixin):
             if not self.shard.is_active:
                 raise ValidationError({"shard": "Selected shard is not active."})
 
+    def save(self, *args, **kwargs):
+        if self.read_only:
+            raise ReadOnlyInstanceError(
+                "This Tenant is a read-only request snapshot (tenants.middleware); "
+                "re-fetch it via Tenant.objects.get(pk=...) before saving."
+            )
+        return super().save(*args, **kwargs)
+
     def delete(self, *args, **kwargs):
-        """Protect the public tenant from deletion."""
+        """Refuse to delete a read-only request snapshot; protect the public tenant."""
+        if self.read_only:
+            raise ReadOnlyInstanceError(
+                "This Tenant is a read-only request snapshot; re-fetch it via "
+                "Tenant.objects.get(pk=...) before deleting (would remove the real row)."
+            )
         if self.schema_name == get_public_schema_name():
             raise ProtectedError(
                 "Public tenant cannot be deleted - it is required by django-tenants "

@@ -18,6 +18,11 @@ def stamp_tenant_schema(sender, request, user, **kwargs):
     Runs inside auth.login() (before the session is saved), so `schema` is
     persisted in the same final save as the auth keys — an authenticated
     session therefore always carries `schema`.
+
+    This stamp is what SchemaBoundSessionMiddleware enforces (fail-closed). It
+    relies on auth.login() firing user_logged_in; any session-auth path that
+    bypasses auth.login() must set session["schema"] itself, or the guard will
+    reject those sessions. See users/middleware.py.
     """
     if request is not None and hasattr(request, "session"):
         request.session["schema"] = connection.schema_name
