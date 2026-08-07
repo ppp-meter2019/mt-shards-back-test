@@ -34,22 +34,22 @@ class FakeNxCache:
         for k in keys:
             self.store.pop(k, None)
 
+    def delete_pattern(self, pattern):   # test double: only "*" is exercised
+        n = len(self.store)
+        self.store.clear()
+        return n
+
 
 @contextmanager
-def use_cache(fake, *modules):
-    """Patch caches['tenant_resolve'] -> `fake` in the given modules for the block."""
-    class _Registry:
-        def __getitem__(self, key):
-            return fake
+def use_resolve_cache(fake):
+    """Patch tenants.middleware.resolve_cache with a TenantResolveCache backed by
+    `fake` (DI — no monkeypatching of the global caches registry)."""
+    import tenants.middleware as _mw
+    from tenants.resolve_cache import TenantResolveCache
 
-    patchers = [mock.patch.object(m, "caches", _Registry()) for m in modules]
-    for p in patchers:
-        p.start()
-    try:
-        yield fake
-    finally:
-        for p in patchers:
-            p.stop()
+    rc = TenantResolveCache(cache=fake)
+    with mock.patch.object(_mw, "resolve_cache", rc):
+        yield rc
 
 
 def make_tenant(status=None, schema_name="alpha", shard_alias="shard_a"):

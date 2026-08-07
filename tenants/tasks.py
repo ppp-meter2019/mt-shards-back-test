@@ -12,7 +12,7 @@ already-provisioned tenant. The real concurrency guard is migrate_schemas'
 atomic NEW->PENDING claim (UPDATE ... WHERE status='new'); this status check is
 a cheap early-out, and the view rejects ineligible statuses up front.
 """
-from celery import shared_task
+from celery import Task, shared_task
 from celery.utils.log import get_task_logger
 from django.core.management import call_command
 
@@ -54,3 +54,12 @@ def drop_tenant_schema_task(database, schema):
     logger.info("drop_tenant_schema_task: dropping %r on shard %r", schema, database)
     call_command("drop_tenant_schema", database=database, schema=schema, no_input=True)
     return {"database": database, "schema": schema, "dropped": True}
+
+
+# Plain Task base (NOT TenantTask): tenant-agnostic — it only warms the resolve cache
+# (which runs in the public/default context), so it must not go through the schema-
+# switching machinery. Defined but intentionally NOT routed/scheduled yet.
+@shared_task(base=Task, acks_late=True, max_retries=0)
+def warm_resolve_cache_task(force=False):
+    from tenants.resolve_cache import resolve_cache
+    return resolve_cache.warm(force=force)

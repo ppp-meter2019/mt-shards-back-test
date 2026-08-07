@@ -20,7 +20,7 @@ from django.utils import timezone
 from django_tenants.utils import schema_exists
 
 from tenants.models import Tenant
-from tenants.resolve_cache import forget_tenant
+from tenants.resolve_cache import resolve_cache
 
 
 @dataclass
@@ -196,7 +196,7 @@ class Command(BaseCommand):
         else:
             update_fields["last_error"] = reason
         Tenant.objects.filter(pk=tenant.pk).update(**update_fields)
-        forget_tenant(tenant)   # .update() bypasses post_save
+        resolve_cache.forget_tenant(tenant)   # .update() bypasses post_save
 
     # ------------------------------------------------------------------
     # Migration introspection

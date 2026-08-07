@@ -17,7 +17,7 @@ from users.models import User
 from .context import tenant_context
 from .models import Shard, Tenant
 from .permissions import IsTenantAdminOnPublic
-from .resolve_cache import forget_tenant
+from .resolve_cache import resolve_cache
 from .serializers import ShardSerializer, TenantSerializer
 
 # Defence-in-depth: schema names are already validated on creation, but they're
@@ -442,7 +442,7 @@ class TenantViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_409_CONFLICT,
             )
-        forget_tenant(tenant)   # .update() bypasses post_save; drop cached snapshot(s)
+        resolve_cache.forget_tenant(tenant)   # .update() bypasses post_save; drop cached snapshot(s)
         tenant.refresh_from_db()
         serializer = self.get_serializer(tenant)
         return Response(serializer.data)
