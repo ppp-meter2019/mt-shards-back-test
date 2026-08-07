@@ -373,6 +373,11 @@ TENANT_RESOLVE_MISS_CACHE_SECONDS = 60     # negative (miss): 60 s
 # is the shortest-TTL key here, so volatile-ttl evicts it first under memory pressure.
 TENANT_RESOLVE_HOLD_SECONDS = 5
 
+# API path prefixes — request-handling code that treats API traffic as stateless/JSON:
+# the session guard (users.middleware) and error content negotiation (tenants.errors).
+# Single source of truth so the two stay in sync.
+API_PATH_PREFIXES = ("/api/v1/", "/open_api/api/v1/")
+
 # Celery-beat change-detection: beat polls every max_interval; keep the per-tenant
 # Redis change-markers alive for k×max_interval (k>=3) so a running beat always
 # observes a marker before it expires, and deleted-tenant markers self-clean.

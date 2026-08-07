@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Error{% endblock %}</title>
+  <style>
+    body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+         font:16px/1.5 system-ui,Segoe UI,Roboto,Arial,sans-serif;background:#f5f6f8;color:#1f2933}
+    .card{max-width:34rem;margin:1.5rem;padding:2.5rem;background:#fff;border-radius:12px;
+          box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:center}
+    h1{margin:.25rem 0 1rem;font-size:1.6rem}
+    p{margin:.5rem 0;color:#52606d}
+    a{color:#2563eb;text-decoration:none}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>{% block heading %}Something went wrong{% endblock %}</h1>
+    {% block body %}{% endblock %}
+  </main>
+</body>
+</html>

@@ -35,15 +35,12 @@ class SchemaBoundSessionMiddleware:
     sync_capable = True
     async_capable = False
 
-    # API paths are stateless (JWT-guarded); sessions are irrelevant there.
-    # Mirrors the exemption in the session middleware added on the project merge.
-    API_PREFIXES = ("/api/v1/", "/open_api/api/v1/")
-
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
-        if request.path.startswith(self.API_PREFIXES):
+        # API paths are stateless (JWT-guarded); sessions are irrelevant there.
+        if request.path.startswith(settings.API_PATH_PREFIXES):
             return self.get_response(request)
 
         # No session cookie => no session to validate (a cross-tenant replay MUST

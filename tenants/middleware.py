@@ -14,12 +14,13 @@ must be set on the same connection/thread the ORM later uses):
 """
 import logging
 
-from django.db import connections
-from django.http import HttpResponse, JsonResponse
+from django.db import OperationalError, connections
+from django.http import Http404, HttpResponse
 from django_tenants.middleware.main import TenantMainMiddleware
 from django_tenants.utils import get_public_schema_name
 
 from .context import current_db
+from .errors import error_response
 from .models import Tenant
 from .resolve_cache import resolve_cache
 
@@ -39,7 +40,26 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
         if request.path in self.HEALTH_PATHS:
             return HttpResponse("ok", content_type="text/plain")
 
-        response = super().process_request(request)   # sets request.tenant + schema on `default`
+        try:
+            response = super().process_request(request)   # sets request.tenant + schema on `default`
+        except Http404:
+            # django-tenants raises Http404 for an unknown host (no Domain) — incl. our
+            # cached-negative path. Serve a branded, negotiated 404 instead.
+            logger.info("tenant not found: host=%r path=%s",
+                        request.META.get("HTTP_HOST"), request.path)
+            return error_response(
+                request, status=404, code="tenant_not_found",
+                detail="No workspace found for this address.",
+                template="tenants/errors/not_found.html",
+            )
+        except OperationalError:
+            # DB unreachable during resolution — branded 500 instead of a raw 500.
+            logger.error("tenant resolution DB error: path=%s", request.path, exc_info=True)
+            return error_response(
+                request, status=500, code="database_error",
+                detail="A temporary error occurred. Please try again.",
+                template="tenants/errors/database_error.html",
+            )
         if response is not None:
             return response
 
@@ -57,19 +77,21 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
         if tenant is not None and tenant.schema_name != get_public_schema_name():
             st = tenant.status
             if st == Tenant.Status.DEACTIVATED:
-                return JsonResponse(
-                    {"detail": "This tenant is deactivated.", "code": "tenant_deactivated"},
-                    status=403,
+                return error_response(
+                    request, status=403, code="tenant_deactivated",
+                    detail="This tenant is deactivated.",
+                    template="tenants/errors/deactivated.html",
                 )
             if st != Tenant.Status.ACTIVE:
                 # `/admin` (no slash) counts too — APPEND_SLASH would redirect it to
                 # `/admin/`, but CommonMiddleware runs after us, so match it here.
                 is_admin = request.path == "/admin" or request.path.startswith("/admin/")
                 if not (st == Tenant.Status.FAILED and is_admin):
-                    return JsonResponse(
-                        {"detail": "This tenant is not ready.", "code": "tenant_not_ready",
-                         "status": st},
-                        status=503,
+                    return error_response(
+                        request, status=503, code="tenant_not_ready",
+                        detail="This tenant is not ready.",
+                        template="tenants/errors/not_ready.html",
+                        retry_after=300, extra={"status": st},
                     )
         return None
 
@@ -84,6 +106,8 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
             return self._get_tenant_cached(domain_model, hostname)
         except domain_model.DoesNotExist:
             raise
+        except OperationalError:
+            raise   # DB down — surface for the 500 handler; don't retry a dead DB
         except Exception:
             logger.warning("tenant_resolve cache path failed for %r; falling back to DB",
                            hostname, exc_info=True)
