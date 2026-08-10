@@ -116,6 +116,13 @@ DATABASE_ROUTERS = [
 # PostGIS backend (required for GIS models in tenant apps such as orders).
 ORIGINAL_BACKEND = "django.contrib.gis.db.backends.postgis"
 
+# Platform base domains, for reference / future base-scoped rules. NOT read on the
+# request path — tenant resolution is by full Host. Reserved-host enforcement lives
+# entirely in tenants.ReservedHostRule (seeded in migration 0004): the service
+# subdomains (www/api/admin/...) are reserved GLOBALLY, and the apexes below are
+# reserved as EXACT rules. Kept here so the set of bases has one documented home.
+TENANT_BASE_DOMAINS = ("routegenie.com", "isi-technology.com")
+
 
 # ---------------------------------------------------------------------------
 # Worker model: this project runs a SYNC server — Gunicorn `sync` (prefork)

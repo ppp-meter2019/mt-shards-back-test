@@ -37,11 +37,11 @@ class InvalidateCommandTests(SimpleTestCase):
     def test_dispatch_to_ids_names_all(self):
         with mock.patch.object(rc_mod.resolve_cache, "redis_alive", return_value=True), \
              mock.patch.object(rc_mod.resolve_cache, "forget_ids", return_value=2) as fi, \
-             mock.patch.object(rc_mod.resolve_cache, "forget_names", return_value=1) as fn, \
+             mock.patch.object(rc_mod.resolve_cache, "forget_schemas", return_value=1) as fn, \
              mock.patch.object(rc_mod.resolve_cache, "forget_all", return_value=9) as fa:
             call_command("invalidate_resolve_cache", ids=[1, 2])
             fi.assert_called_once()
-            call_command("invalidate_resolve_cache", names=["alpha"])
+            call_command("invalidate_resolve_cache", schemas=["alpha"])
             fn.assert_called_once()
             call_command("invalidate_resolve_cache", all=True)
             fa.assert_called_once()

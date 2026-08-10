@@ -146,10 +146,12 @@ class TenantResolveCache:
             raise_on_error=raise_on_error,
         )
 
-    def forget_names(self, names, *, raise_on_error=False):
+    def forget_schemas(self, schemas, *, raise_on_error=False):
+        # Identify tenants by schema_name (the real identifier) — NOT by the human
+        # company_name, which is a display label only.
         from .models import Domain
         return self.forget_hosts(
-            Domain.objects.filter(tenant__name__in=names).values_list("domain", flat=True),
+            Domain.objects.filter(tenant__schema_name__in=schemas).values_list("domain", flat=True),
             raise_on_error=raise_on_error,
         )
 

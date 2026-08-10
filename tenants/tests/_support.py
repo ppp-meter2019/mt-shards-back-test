@@ -54,7 +54,7 @@ def use_resolve_cache(fake):
 
 def make_tenant(status=None, schema_name="alpha", shard_alias="shard_a"):
     status = status or Tenant.Status.ACTIVE
-    t = Tenant(id=5, schema_name=schema_name, name="Alpha", status=status)
+    t = Tenant(id=5, schema_name=schema_name, company_name="Alpha", status=status)
     t.shard = Shard(id=2, alias=shard_alias, name="A")
     return t
 

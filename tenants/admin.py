@@ -19,7 +19,7 @@ from django.db.models.deletion import ProtectedError
 from django_tenants.admin import TenantAdminMixin
 from django_tenants.utils import get_public_schema_name
 
-from .models import Domain, Shard, Tenant
+from .models import Domain, ReservedHostRule, Shard, Tenant
 
 
 class PublicAdminSite(AdminSite):
@@ -162,10 +162,18 @@ class TenantAdminForm(forms.ModelForm):
 
 class TenantAdmin(TenantAdminMixin, admin.ModelAdmin):
     form = TenantAdminForm
-    list_display    = ("name", "schema_name", "shard", "status", "status_changed_at", "created_on")
+    list_display    = ("company_name", "schema_name", "shard", "status", "status_changed_at", "created_on")
     list_filter     = ("status", "shard")
-    search_fields   = ("name", "schema_name")
+    search_fields   = ("company_name", "schema_name")
     readonly_fields = ("previous_status", "status_changed_at", "last_error", "created_on")
+
+    def get_readonly_fields(self, request, obj=None):
+        """schema_name maps to a physical PG schema — immutable once created. Read-only
+        on the change form; still settable on the add form."""
+        ro = list(super().get_readonly_fields(request, obj))
+        if obj is not None and "schema_name" not in ro:
+            ro.append("schema_name")
+        return ro
 
     def delete_model(self, request, obj):
         try:
@@ -194,9 +202,27 @@ class DomainAdmin(admin.ModelAdmin):
 
 
 # ---------------------------------------------------------------------------
+# ReservedHostRule
+# ---------------------------------------------------------------------------
+class ReservedHostRuleAdmin(admin.ModelAdmin):
+    """Manage reserved-host rules. Model.clean() normalizes/validates value and
+    base_domain per match_type (the ModelForm runs full_clean), so the admin and
+    the management API enforce identical rules.
+    """
+
+    list_display  = ("__str__", "match_type", "value", "base_domain", "is_active", "modified")
+    list_filter   = ("match_type", "is_active")
+    search_fields = ("value", "base_domain", "note")
+    readonly_fields = ("created_on", "modified")
+    fields = ("match_type", "value", "base_domain", "is_active", "note",
+              "created_on", "modified")
+
+
+# ---------------------------------------------------------------------------
 # Registration on the public admin site
 # ---------------------------------------------------------------------------
 public_admin_site.register(Shard, ShardAdmin)
 public_admin_site.register(Tenant, TenantAdmin)
 public_admin_site.register(Domain, DomainAdmin)
+public_admin_site.register(ReservedHostRule, ReservedHostRuleAdmin)
 public_admin_site.register(Group, GroupAdmin)

@@ -1,28 +1,38 @@
+import logging
 import re
 
 from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import connections
+from django.db import Error as DBError, connections
 from django.db.models import Count, F
 from django.db.models.deletion import ProtectedError
+from django.db.utils import ConnectionDoesNotExist
 from django.http import HttpResponse
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
+from django_tenants.utils import get_public_schema_name
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from users.models import User
 
 from .context import tenant_context
-from .models import Shard, Tenant
+from .models import Domain, ReservedHostRule, Shard, Tenant
 from .permissions import IsTenantAdminOnPublic
 from .resolve_cache import resolve_cache
-from .serializers import ShardSerializer, TenantSerializer
+from .serializers import (
+    ReservedHostRuleSerializer,
+    ShardSerializer,
+    TenantSerializer,
+)
 
 # Defence-in-depth: schema names are already validated on creation, but they're
 # interpolated as SQL identifiers in _last_migrations_for, so re-check here.
 _SAFE_SCHEMA_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+logger = logging.getLogger(__name__)
 
 
 def health(request):
@@ -36,6 +46,17 @@ def health(request):
     either way the probe touches neither the database nor the tenant.
     """
     return HttpResponse("ok", content_type="text/plain")
+
+
+class BaseDomainsView(APIView):
+    """Read-only list of platform base domains (settings.TENANT_BASE_DOMAINS) for the
+    tenant/domain create+edit form's base-domain dropdown. Public host, tenant_admin
+    only. The dropdown adds its own "custom domain" option client-side."""
+
+    permission_classes = [IsTenantAdminOnPublic]
+
+    def get(self, request):
+        return Response({"base_domains": list(getattr(settings, "TENANT_BASE_DOMAINS", ()))})
 
 
 def _psql_aligned(headers, rows, title):
@@ -199,7 +220,7 @@ class TenantViewSet(viewsets.ModelViewSet):
     @staticmethod
     def _guard_public(tenant):
         """Reject any write targeting the public tenant."""
-        if tenant.schema_name == "public":
+        if tenant.schema_name == get_public_schema_name():
             raise PermissionDenied("The public tenant is read-only.")
 
     def perform_update(self, serializer):
@@ -226,15 +247,31 @@ class TenantViewSet(viewsets.ModelViewSet):
     # -------------------------------------------------------------------
 
     def get_serializer_context(self):
-        """For list/retrieve, pre-compute which tenant schemas physically
-        exist by issuing one SELECT against information_schema.schemata per
-        shard. This avoids N+1 in TenantSerializer.get_schema_exists.
+        """Pre-compute schema_exists/last_migration (physical state) so the serializer
+        doesn't N+1.
+
+        Scope by action:
+          - list                         -> all tenants (that IS the console's job);
+          - retrieve/activate/deactivate -> ONLY the target tenant, so a single-object
+                                            response scans just its shard, not every
+                                            shard (avoids waste + a cross-shard failure).
+          - create/update/partial_update -> nothing (schema irrelevant / FE ignores it).
+
+        The probes themselves degrade per shard (see the helpers): a down shard never
+        500s the whole page.
         """
         ctx = super().get_serializer_context()
-        if self.action in ("list", "retrieve", "deactivate", "activate"):
+        if self.action == "list":
             qs = self.get_queryset()
-            ctx["existing_schemas"] = self._existing_schemas_for(qs)
-            ctx["last_migrations"] = self._last_migrations_for(qs)
+        elif self.action in ("retrieve", "deactivate", "activate"):
+            # Single-object response → scope to just this tenant (its shard only).
+            # Mirror DRF's get_object() lookup so it survives a custom lookup_field.
+            lookup = self.lookup_url_kwarg or self.lookup_field
+            qs = self.get_queryset().filter(**{self.lookup_field: self.kwargs.get(lookup)})
+        else:
+            return ctx                                  # create/update: no physical scan
+        ctx["existing_schemas"] = self._existing_schemas_for(qs)
+        ctx["last_migrations"] = self._last_migrations_for(qs)
         return ctx
 
     @staticmethod
@@ -248,14 +285,24 @@ class TenantViewSet(viewsets.ModelViewSet):
 
         result: set = set()
         for alias, schemas in by_shard.items():
-            with connections[alias].cursor() as cur:
-                cur.execute(
-                    "SELECT schema_name FROM information_schema.schemata "
-                    "WHERE schema_name = ANY(%s)",
-                    [list(schemas)],
-                )
-                for (s,) in cur.fetchall():
-                    result.add((alias, s))
+            # Degrade per shard: a down/unreachable shard must not 500 the whole
+            # tenants console (a diagnostic tool). Its tenants fall back to
+            # schema_exists=False ("not confirmed") and are logged.
+            try:
+                with connections[alias].cursor() as cur:
+                    cur.execute(
+                        "SELECT schema_name FROM information_schema.schemata "
+                        "WHERE schema_name = ANY(%s)",
+                        [list(schemas)],
+                    )
+                    for (s,) in cur.fetchall():
+                        result.add((alias, s))
+            except (DBError, ConnectionDoesNotExist):
+                # Degrade only on DB/connection failures (shard down, alias not in
+                # DATABASES). A programming error is NOT swallowed — let it 500 so
+                # it's noticed, not silently hidden behind an empty result.
+                logger.warning("schema_exists probe failed for shard %r; its tenants "
+                               "shown as unconfirmed", alias, exc_info=True)
         return result
 
     @staticmethod
@@ -276,34 +323,41 @@ class TenantViewSet(viewsets.ModelViewSet):
         result: dict = {}
         for alias, schemas in by_shard.items():
             schema_list = list(schemas)
-            with connections[alias].cursor() as cur:
-                # Which of these schemas actually have a django_migrations table?
-                cur.execute(
-                    "SELECT table_schema FROM information_schema.tables "
-                    "WHERE table_name = 'django_migrations' AND table_schema = ANY(%s)",
-                    [schema_list],
-                )
-                migrated = [s for (s,) in cur.fetchall() if _SAFE_SCHEMA_RE.match(s)]
-                if not migrated:
-                    continue
-                # One UNION across the migrated schemas; latest row per schema.
-                # Schema names are validated above, so safe to interpolate.
-                union = " UNION ALL ".join(
-                    f"SELECT '{s}' AS schema, id, app, name, applied "
-                    f'FROM "{s}".django_migrations'
-                    for s in migrated
-                )
-                cur.execute(
-                    "SELECT DISTINCT ON (schema) schema, app, name, applied FROM ("
-                    + union
-                    + ") m ORDER BY schema, applied DESC NULLS LAST, id DESC"
-                )
-                for schema, app, name, applied in cur.fetchall():
-                    result[(alias, schema)] = {
-                        "app": app,
-                        "name": name,
-                        "applied": applied.isoformat() if applied else None,
-                    }
+            # Degrade per shard, like _existing_schemas_for: an unreachable shard is
+            # skipped (its tenants show last_migration=None), never 500s the console.
+            try:
+                with connections[alias].cursor() as cur:
+                    # Which of these schemas actually have a django_migrations table?
+                    cur.execute(
+                        "SELECT table_schema FROM information_schema.tables "
+                        "WHERE table_name = 'django_migrations' AND table_schema = ANY(%s)",
+                        [schema_list],
+                    )
+                    migrated = [s for (s,) in cur.fetchall() if _SAFE_SCHEMA_RE.match(s)]
+                    if not migrated:
+                        continue
+                    # One UNION across the migrated schemas; latest row per schema.
+                    # Schema names are validated above, so safe to interpolate.
+                    union = " UNION ALL ".join(
+                        f"SELECT '{s}' AS schema, id, app, name, applied "
+                        f'FROM "{s}".django_migrations'
+                        for s in migrated
+                    )
+                    cur.execute(
+                        "SELECT DISTINCT ON (schema) schema, app, name, applied FROM ("
+                        + union
+                        + ") m ORDER BY schema, applied DESC NULLS LAST, id DESC"
+                    )
+                    for schema, app, name, applied in cur.fetchall():
+                        result[(alias, schema)] = {
+                            "app": app,
+                            "name": name,
+                            "applied": applied.isoformat() if applied else None,
+                        }
+            except (DBError, ConnectionDoesNotExist):
+                # Degrade only on DB/connection failures — see _existing_schemas_for.
+                logger.warning("last_migration probe failed for shard %r; its tenants "
+                               "shown without a last migration", alias, exc_info=True)
         return result
 
     # -------------------------------------------------------------------
@@ -446,3 +500,50 @@ class TenantViewSet(viewsets.ModelViewSet):
         tenant.refresh_from_db()
         serializer = self.get_serializer(tenant)
         return Response(serializer.data)
+
+
+class ReservedHostRuleViewSet(viewsets.ModelViewSet):
+    """CRUD over reserved-host rules, reachable only on the public host.
+
+    These rules forbid business tenants from claiming service subdomains
+    (www/api/admin/...) and platform hosts. Enforced on tenant/domain creation by
+    tenants.validators.validate_tenant_domain.
+    """
+
+    queryset = ReservedHostRule.objects.all()          # Meta.ordering handles order
+    serializer_class = ReservedHostRuleSerializer
+    permission_classes = [IsTenantAdminOnPublic]
+
+    # How many example domains to include in the response body. `count` is ALWAYS
+    # exact (we stream the full candidate set); this only bounds the payload, so a
+    # pathological rule can't return megabytes. `sample=true` tells the caller the
+    # `domains` list is a subset of `count`.
+    CONFLICTS_SAMPLE = 200
+
+    @action(detail=True, methods=["get"])
+    def conflicts(self, request, pk=None):
+        """Report EXISTING (non-public) tenant domains this rule already reserves.
+
+        Lets an operator see, before relying on a rule, which live hosts it would
+        have blocked — a rule only gates FUTURE creations, so pre-existing matches
+        keep working and are surfaced here rather than silently ignored.
+
+        Hybrid: candidate_q() narrows to a SUPERSET in SQL, then matches() (the one
+        matcher) confirms — DB does the bulk work without re-implementing matching.
+        The full candidate set is STREAMED (memory bounded by the iterator), so
+        `count` is exact with no completeness cap; only the example list is bounded.
+        """
+        rule = self.get_object()
+        qs = (
+            Domain.objects.select_related("tenant")
+            .exclude(tenant__schema_name=get_public_schema_name())
+            .filter(rule.candidate_q())
+            .order_by("domain")
+        )
+        count, sample = 0, []
+        for d in qs.iterator(chunk_size=1000):
+            if rule.matches(d.domain):
+                count += 1
+                if len(sample) < self.CONFLICTS_SAMPLE:
+                    sample.append({"domain": d.domain, "tenant": d.tenant.schema_name})
+        return Response({"count": count, "domains": sample, "sample": len(sample) < count})

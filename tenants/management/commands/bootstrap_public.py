@@ -36,7 +36,7 @@ class Command(BaseCommand):
         tenant, created = Tenant.objects.get_or_create(
             schema_name="public",
             defaults={
-                "name": "Public",
+                "company_name": "Public",
                 "shard": default_shard,
                 "status": Tenant.Status.ACTIVE,
             },
