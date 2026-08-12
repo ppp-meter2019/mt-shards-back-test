@@ -213,6 +213,28 @@ class TenantUpdateDBTests(TestCase):
         self.assertTrue(s.is_valid(), s.errors)
 
 
+class BeatSchemaFilterDBTests(TestCase):
+    """beat schedules ONLY ACTIVE tenants — NEW/PENDING/FAILED/DEACTIVATED are skipped
+    (their schemas may be unprovisioned/half-migrated, which would crash the scheduler)."""
+
+    def test_only_active_tenants_returned(self):
+        from django_tenants.utils import get_public_schema_name
+        from tenants.celery.db_scheduler import TenantAwareDatabaseScheduler
+
+        Shard.objects.create(alias="default", name="Default", is_default=True, is_active=True)
+        s1 = Shard.objects.create(alias="tenant_1", name="T1", is_default=False, is_active=True)
+        Tenant.objects.create(schema_name="act", company_name="Act", shard=s1, status=Tenant.Status.ACTIVE)
+        Tenant.objects.create(schema_name="newt", company_name="Newt", shard=s1, status=Tenant.Status.NEW)
+        Tenant.objects.create(schema_name="deact", company_name="Deact", shard=s1, status=Tenant.Status.DEACTIVATED)
+        Tenant.objects.create(schema_name="failt", company_name="Failt", shard=s1, status=Tenant.Status.FAILED)
+
+        # self is unused by the method; call unbound to avoid constructing a scheduler.
+        names = TenantAwareDatabaseScheduler.get_tenant_schema_names(None, [get_public_schema_name()])
+        self.assertIn("act", names)
+        for excluded in ("newt", "deact", "failt"):
+            self.assertNotIn(excluded, names)
+
+
 class BaseDomainsEndpointDBTests(TestCase):
     """Permission gating for GET /api/base-domains/ (needs a User row → DB)."""
 

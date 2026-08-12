@@ -158,6 +158,16 @@ class Tenant(TenantMixin):
     def __str__(self):
         return self.company_name
 
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        # Remember the status as loaded, so the post_save signal can bump beat ONLY on
+        # an actual status change (any .save() path: admin, shell, a command using
+        # obj.save()) — and NOT on a company_name/description edit.
+        instance = super().from_db(db, field_names, values)
+        if "status" in field_names:          # don't force a query on .only()/.defer() loads
+            instance._loaded_status = instance.status
+        return instance
+
     @property
     def db_alias(self) -> str:
         return self.shard.alias

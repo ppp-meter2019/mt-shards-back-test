@@ -63,6 +63,25 @@ def bump(instance=None, **kwargs):
     _cache().set(marker_key(current_schema_name()), time.time(), timeout=_ttl())
 
 
+def bump_schema(schema):
+    """Mark a SPECIFIC schema's schedule/eligibility as changed, so a running beat
+    reloads and (re)includes or drops it.
+
+    Unlike bump() (a signal handler that reads the ACTIVE connection's schema), this
+    takes the schema explicitly — callers are tenant STATUS transitions that run in
+    the public/command context and go through QuerySet.update(), which bypasses the
+    ORM signals. We ALSO bump the public marker: beat always reads it (it is static
+    in beat's schema list), so the reload is observed on the next tick regardless of
+    beat's 30 s tenant-list cache — otherwise a just-provisioned tenant might wait up
+    to that long to be picked up.
+    """
+    now = time.time()
+    _cache().set_many(
+        {marker_key(schema): now, marker_key(get_public_schema_name()): now},
+        timeout=_ttl(),
+    )
+
+
 def _schema_names():
     now = time.monotonic()
     if _schema_cache["names"] is None or now - _schema_cache["ts"] > _SCHEMA_CACHE_TTL:

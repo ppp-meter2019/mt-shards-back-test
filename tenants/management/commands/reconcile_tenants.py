@@ -19,6 +19,7 @@ from django.db.utils import ConnectionDoesNotExist
 from django.utils import timezone
 from django_tenants.utils import schema_exists
 
+from tenants.celery.change_marker import bump_schema
 from tenants.models import Tenant
 from tenants.resolve_cache import resolve_cache
 
@@ -197,6 +198,7 @@ class Command(BaseCommand):
             update_fields["last_error"] = reason
         Tenant.objects.filter(pk=tenant.pk).update(**update_fields)
         resolve_cache.forget_tenant(tenant)   # .update() bypasses post_save
+        bump_schema(tenant.schema_name)       # nudge beat: ACTIVE-membership may have changed
 
     # ------------------------------------------------------------------
     # Migration introspection

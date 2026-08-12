@@ -4,7 +4,7 @@ import re
 from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import Error as DBError, connections
+from django.db import Error as DBError, connections, transaction
 from django.db.models import Count, F
 from django.db.models.deletion import ProtectedError
 from django.db.utils import ConnectionDoesNotExist
@@ -237,7 +237,7 @@ class TenantViewSet(viewsets.ModelViewSet):
             "1", "true", "yes", "on",
         )
         alias, schema = instance.shard.alias, instance.schema_name
-        instance.delete()
+        instance.delete()   # Tenant post_delete signal nudges beat to drop it
         if drop:
             from .tasks import drop_tenant_schema_task
             drop_tenant_schema_task.delay(alias, schema)
@@ -496,7 +496,11 @@ class TenantViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_409_CONFLICT,
             )
-        resolve_cache.forget_tenant(tenant)   # .update() bypasses post_save; drop cached snapshot(s)
+        # .update() bypasses post_save — invalidate the resolve snapshot AND nudge beat
+        # (activate/deactivate changes whether this tenant is scheduled).
+        resolve_cache.forget_tenant(tenant)
+        from .celery.change_marker import bump_schema
+        transaction.on_commit(lambda: bump_schema(tenant.schema_name))  # match forget_tenant's on_commit
         tenant.refresh_from_db()
         serializer = self.get_serializer(tenant)
         return Response(serializer.data)

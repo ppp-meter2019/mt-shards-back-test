@@ -54,6 +54,7 @@ from django_tenants.utils import (
     schema_exists,
 )
 
+from tenants.celery.change_marker import bump_schema
 from tenants.models import Shard, Tenant
 from tenants.resolve_cache import resolve_cache
 
@@ -77,6 +78,13 @@ class Command(UpstreamCommand):
     # ------------------------------------------------------------------
     def add_arguments(self, parser):
         super().add_arguments(parser)
+        parser.add_argument(
+            "--no-beat-notify", action="store_true",
+            help="Skip the per-tenant celery-beat marker bump. Use for BULK runs "
+                 "(provisioning/migrating many tenants), then run "
+                 "`manage.py resync_beat_schedules` ONCE at the end — a single beat "
+                 "reload instead of one per tenant.",
+        )
         # Strip the upstream default of --database='default' so we can
         # distinguish "not specified" from "explicitly default".
         for action in parser._actions:
@@ -262,6 +270,7 @@ class Command(UpstreamCommand):
                     status_changed_at=timezone.now(),
                 )
                 resolve_cache.forget_tenant(tenant)   # .update() bypasses post_save
+                self._beat_notify(tenant)             # nudge beat: left ACTIVE set
                 self._notice(f"FAIL {tenant.schema_name} - {error}")
                 raise CommandError(error)
 
@@ -284,6 +293,7 @@ class Command(UpstreamCommand):
                 status_changed_at=timezone.now(),
             )
             resolve_cache.forget_tenant(tenant)   # .update() bypasses post_save
+            self._beat_notify(tenant)             # nudge beat: left ACTIVE set
             self._notice(f"FAIL {tenant.schema_name} - {e}")
             raise
 
@@ -298,7 +308,15 @@ class Command(UpstreamCommand):
             status_changed_at=timezone.now(),
         )
         resolve_cache.forget_tenant(tenant)   # .update() bypasses post_save
+        self._beat_notify(tenant)             # nudge beat: NEW->ACTIVE now schedulable
         self._notice(f"OK   {tenant.schema_name} -> {new_status}")
+
+    # ------------------------------------------------------------------
+    def _beat_notify(self, tenant):
+        """Bump the tenant's beat marker so a running beat reloads and (re)includes/
+        excludes it — unless --no-beat-notify (bulk mode: one resync at the end)."""
+        if not self.options.get("no_beat_notify"):
+            bump_schema(tenant.schema_name)
 
     # ------------------------------------------------------------------
     def _get_executor(self):

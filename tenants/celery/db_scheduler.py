@@ -6,6 +6,8 @@ so per-schema reads route to the right shard.
 import json
 import logging
 
+from django.db import Error as DBError
+from django.db.utils import ConnectionDoesNotExist
 from django_celery_beat.schedulers import DatabaseScheduler, ModelEntry
 
 from .compat import get_public_schema_name, get_tenant_model, schema_context
@@ -77,7 +79,15 @@ class TenantAwareDatabaseScheduler(TenantAwareSchedulerMixin, DatabaseScheduler)
         return [get_public_schema_name()]
 
     def get_tenant_schema_names(self, exclude):
-        return list(get_tenant_model().objects.exclude(schema_name__in=exclude)
+        # ONLY ACTIVE tenants: their schema is provisioned + migrated. NEW/PENDING have
+        # no schema/tables yet (a restart before provisioning would otherwise crash beat
+        # with "relation does not exist"); FAILED may be half-migrated; DEACTIVATED is
+        # intentionally closed (don't schedule its tasks). A tenant returning to ACTIVE
+        # is re-included on the next reload — see the marker bump on status transitions.
+        model = get_tenant_model()
+        return list(model.objects
+                    .filter(status=model.Status.ACTIVE)
+                    .exclude(schema_name__in=exclude)
                     .values_list("schema_name", flat=True))
 
     def get_schema_names(self):
@@ -91,18 +101,38 @@ class TenantAwareDatabaseScheduler(TenantAwareSchedulerMixin, DatabaseScheduler)
         # TenantAwareModelEntry + all_as_schedule, so model.name stays truthful.
         models_, seen_global = [], set()
         for schema_name in self.get_schema_names():
-            with schema_context(schema_name):
-                for task in super().enabled_models_qs():
-                    if task.name in _GLOBAL_TASKS:
-                        # Global built-in (e.g. celery.backend_cleanup): auto-installed
-                        # into every schema but cleans a GLOBAL store — keep one copy.
-                        if task.name in seen_global:
-                            continue
-                        seen_global.add(task.name)
-                    headers = json.loads(task.headers)
-                    headers.setdefault("_schema_name", schema_name)
-                    task.headers = json.dumps(headers)
-                    models_.append(task)
+            # Per-schema resilience: one unreachable shard / broken schema must NOT
+            # take down the whole beat process — skip it THIS cycle and log. It is
+            # re-tried on the next reload. (Status filtering already excludes
+            # unprovisioned tenants; this is the safety net for transient failures.)
+            try:
+                with schema_context(schema_name):
+                    # select_related the schedule FKs so they are loaded HERE, inside
+                    # the tenant's schema. Otherwise ModelEntry (built later in
+                    # all_as_schedule, OUTSIDE this context) would lazily fetch
+                    # crontab/interval/... against the wrong schema (public/default)
+                    # → wrong schedule or DoesNotExist for tenant tasks.
+                    tasks = list(
+                        super().enabled_models_qs()
+                        .select_related("interval", "crontab", "solar", "clocked")
+                    )
+            except (DBError, ConnectionDoesNotExist):
+                logger.warning(
+                    "beat: skipping schema %r this cycle — schedule unreadable "
+                    "(shard down / schema not ready)", schema_name, exc_info=True,
+                )
+                continue
+            for task in tasks:
+                if task.name in _GLOBAL_TASKS:
+                    # Global built-in (e.g. celery.backend_cleanup): auto-installed
+                    # into every schema but cleans a GLOBAL store — keep one copy.
+                    if task.name in seen_global:
+                        continue
+                    seen_global.add(task.name)
+                headers = json.loads(task.headers)
+                headers.setdefault("_schema_name", schema_name)
+                task.headers = json.dumps(headers)
+                models_.append(task)
         return models_
 
     def all_as_schedule(self):
