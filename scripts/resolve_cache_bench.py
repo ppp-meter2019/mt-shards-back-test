@@ -39,9 +39,9 @@ MODES
     compare    A/B DB-query load test: replay one request sequence with the cache OFF vs ON
                and count actual `default` queries each way — shows how many DB hits the
                cache eliminates (the optimization, in hard numbers).
-    load       Concurrent throughput benchmark over a mix of known (positive) and
-               unknown (miss) hosts; reports req/s, latency percentiles, logical
-               hit/miss counts, and the Redis server-side hit-ratio delta.
+    load       TWO concurrent passes over the same workload — no gate, then WARM+GATE —
+               side by side: throughput, latency, errors, real DB queries and PEAK
+               concurrent DB connections each way (shows the gate cutting DB pressure).
     seed       Create the bench tenants/domains and exit (for manual poking).
     cleanup    Delete all bench_ rows and forget their cached hosts.
 
@@ -52,7 +52,7 @@ USAGE
     python scripts/resolve_cache_bench.py gate --known 50 --requests 500 --miss-ratio 0.5
     python scripts/resolve_cache_bench.py compare --requests 2000 --known 50 --miss-ratio 0.3
     python scripts/resolve_cache_bench.py load --duration 20 --concurrency 32 \
-        --known 200 --miss-ratio 0.2 --warm
+        --known 200 --miss-ratio 0.5 --unique-misses
     python scripts/resolve_cache_bench.py cleanup
 
 Settings module defaults to tenants_back.settings; override with
@@ -350,35 +350,39 @@ def mode_verify(args):
     sys.exit(0 if ok else 1)
 
 
-def mode_load(args):
-    require_redis()
-    if not resolve_cache.enabled:
-        sys.exit("resolve_cache is disabled (both TTLs are 0) — load test is meaningless.")
-    known = ensure_bench_data(args.known)
-    # Bounded pool of unknown hosts. Reused -> exercises the NEGATIVE-cache hit path.
-    # With --unique-misses each miss is a fresh host -> exercises the miss FILL path.
-    miss_pool = [f"missing-{i:06d}{BENCH_DOMAIN_SUFFIX}" for i in range(max(1, args.known))]
+def _run_load_pass(args, known, miss_pool, *, gate_on):
+    """Run ONE concurrent load pass and return its metrics. gate_on toggles WARM+GATE
+    (builds the SET first); either way snapshots start cold (forget_all) for a fair fill
+    pattern. Instruments real `default` DB queries + PEAK concurrency via execute_wrapper."""
+    from django.conf import settings as dj
 
-    if args.reset:
-        for d in known:
-            resolve_cache.cache.delete(_snap(d))
-        print(f"reset: cleared {len(known)} positive entries (cold-fill test)")
-    if args.warm:
-        n = resolve_cache.warm(force=True)
-        print(f"warm: preloaded {n} positive entries")
+    if gate_on:
+        _enable_warm_gate(gate=True)
+        host_registry.run_locked()               # build treg:hosts (positives cleared below)
+    else:
+        dj.TENANT_REGISTRY = {"WARM_ENABLED": False, "GATE_ENABLED": False}
+    resolve_cache.forget_all()                   # cold snapshots (SET, if any, survives)
 
     stop = threading.Event()
-    deadline = None
-    remaining = None
     lock = threading.Lock()
-    if args.duration:
-        deadline = time.perf_counter() + args.duration
-    else:
-        remaining = [args.requests]
-
+    deadline = time.perf_counter() + args.duration if args.duration else None
+    remaining = None if args.duration else [args.requests]
     latencies = []
-    counts = {"pos_found": 0, "miss": 0, "errors": 0}
-    rnd_seed = 0
+    counts = {"served": 0, "rejected": 0, "unexpected": 0, "exc": 0}
+    exc_types = {}
+    gauge_lock = threading.Lock()
+    db_stat = {"queries": 0, "inflight": 0, "peak": 0}
+
+    def db_gauge(execute, sql, params, many, context):
+        with gauge_lock:
+            db_stat["queries"] += 1
+            db_stat["inflight"] += 1
+            db_stat["peak"] = max(db_stat["peak"], db_stat["inflight"])
+        try:
+            return execute(sql, params, many, context)
+        finally:
+            with gauge_lock:
+                db_stat["inflight"] -= 1
 
     def take_work():
         if deadline is not None:
@@ -390,39 +394,45 @@ def mode_load(args):
             return True
 
     def worker(wid):
-        rng = random.Random(1000 + wid)          # deterministic, no Date/rand-at-import
+        rng = random.Random(1000 + wid)          # deterministic per worker
         local_lat = []
-        local = {"pos_found": 0, "miss": 0, "errors": 0}
+        local = {"served": 0, "rejected": 0, "unexpected": 0, "exc": 0}
+        local_exc = {}
         try:
-            while take_work():
-                if rng.random() < args.miss_ratio:
-                    if args.unique_misses:
-                        host = f"uniq-{wid}-{local['miss']}-{rng.randint(0, 1_000_000)}{BENCH_DOMAIN_SUFFIX}"
+            with connections["default"].execute_wrapper(db_gauge):
+                while take_work():
+                    if rng.random() < args.miss_ratio:
+                        if args.unique_misses:
+                            host = f"uniq-{wid}-{local['rejected']}-{rng.randint(0, 1_000_000)}{BENCH_DOMAIN_SUFFIX}"
+                        else:
+                            host = rng.choice(miss_pool)
+                        expect_found = False
                     else:
-                        host = rng.choice(miss_pool)
-                    expect_found = False
-                else:
-                    host = rng.choice(known)
-                    expect_found = True
-                t0 = time.perf_counter()
-                try:
-                    found = resolve(host)
-                except Exception:                # fail-open path should swallow cache errors
-                    local["errors"] += 1
-                    continue
-                local_lat.append((time.perf_counter() - t0) * 1000.0)
-                if found:
-                    local["pos_found"] += 1
-                elif not expect_found:
-                    local["miss"] += 1
-                else:
-                    local["errors"] += 1         # known host failed to resolve — unexpected
+                        host = rng.choice(known)
+                        expect_found = True
+                    t0 = time.perf_counter()
+                    try:
+                        found = resolve(host)
+                    except Exception as exc:      # resolve raised (e.g. DB pool timeout)
+                        local["exc"] += 1
+                        name = type(exc).__name__
+                        local_exc[name] = local_exc.get(name, 0) + 1
+                        continue
+                    local_lat.append((time.perf_counter() - t0) * 1000.0)
+                    if found:
+                        local["served"] += 1
+                    elif not expect_found:
+                        local["rejected"] += 1
+                    else:
+                        local["unexpected"] += 1
         finally:
             connections.close_all()              # release this thread's DB conn
             with lock:
                 latencies.extend(local_lat)
                 for k in counts:
                     counts[k] += local[k]
+                for name, cnt in local_exc.items():
+                    exc_types[name] = exc_types.get(name, 0) + cnt
 
     before = info_stats()
     t_start = time.perf_counter()
@@ -440,35 +450,82 @@ def mode_load(args):
     wall = time.perf_counter() - t_start
     after = info_stats()
 
-    n = len(latencies)
-    lat_sorted = sorted(latencies)
     d_hits = after["hits"] - before["hits"]
     d_miss = after["misses"] - before["misses"]
     d_total = d_hits + d_miss
-    server_ratio = (d_hits / d_total * 100.0) if d_total else 0.0
-    total_reqs = counts["pos_found"] + counts["miss"] + counts["errors"]
+    total = sum(counts.values())
+    return {
+        "gate_on": gate_on, "wall": wall, "total": total,
+        "throughput": total / wall if wall else 0.0,
+        "counts": dict(counts), "exc_types": dict(exc_types),
+        "lat": sorted(latencies),
+        "db_queries": db_stat["queries"], "db_peak": db_stat["peak"],
+        "d_hits": d_hits, "d_miss": d_miss,
+        "offload": (d_hits / d_total * 100.0) if d_total else 0.0,
+    }
 
-    print("\n== load result ==")
-    print(f"  concurrency        : {args.concurrency} threads")
-    print(f"  miss ratio (target): {args.miss_ratio:.0%}   "
-          f"({'unique' if args.unique_misses else 'pooled'} miss hosts)")
-    print(f"  warm/reset         : warm={args.warm} reset={args.reset}")
-    print(f"  wall time          : {wall:.2f}s")
-    print(f"  requests           : {total_reqs}  "
-          f"(positive={counts['pos_found']}, miss={counts['miss']}, errors={counts['errors']})")
-    print(f"  throughput         : {total_reqs / wall:,.0f} req/s")
-    if n:
-        print(f"  latency ms         : p50={pct(lat_sorted,50):.3f}  p90={pct(lat_sorted,90):.3f}  "
-              f"p99={pct(lat_sorted,99):.3f}  max={lat_sorted[-1]:.3f}")
-    print("  -- Redis server (delta over this run) --")
-    print(f"  keyspace_hits  +{d_hits}")
-    print(f"  keyspace_misses+{d_miss}")
-    print(f"  server hit ratio   : {server_ratio:.1f}%")
-    live, _ = count_tres_keys()
-    print(f"  live tres keys now : {live}")
 
-    if not args.keep:
-        cleanup_bench_data()
+def _fmt_pass(r):
+    c, lat = r["counts"], r["lat"]
+    lat_s = (f"p50={pct(lat,50):.1f} p90={pct(lat,90):.1f} p99={pct(lat,99):.1f} max={lat[-1]:.0f}"
+             if lat else "n/a")
+    top = ", ".join(f"{k}×{v}" for k, v in sorted(r["exc_types"].items(), key=lambda kv: -kv[1])) or "—"
+    print(f"\n--- {'WARM+GATE' if r['gate_on'] else 'no gate (cache only)'} ---")
+    print(f"  throughput      : {r['throughput']:,.0f} req/s   ({r['total']} reqs in {r['wall']:.1f}s)")
+    line = f"  requests        : served={c['served']}  rejected={c['rejected']}"
+    if c["unexpected"]:
+        line += f"  unexpected={c['unexpected']}"
+    line += f"  errors={c['exc']}" + (f" [{top}]" if c["exc"] else "")
+    print(line)
+    print(f"  latency ms      : {lat_s}")
+    print(f"  DB queries      : {r['db_queries']}   (resolves that missed cache and hit the DB)")
+    print(f"  peak concurrent : {r['db_peak']}   ← max DB queries in flight at once")
+    print(f"  cache offload   : {r['offload']:.1f}%")
+
+
+def mode_load(args):
+    """Two concurrent passes over the SAME workload — WITHOUT the gate, then WITH WARM+GATE —
+    so the gate's effect on efficiency and on peak DB connections is visible side by side.
+    Each pass measures real `default` DB queries + peak concurrency (execute_wrapper)."""
+    require_redis()
+    if not resolve_cache.enabled:
+        sys.exit("resolve_cache is disabled (both TTLs are 0) — load test is meaningless.")
+    from unittest import mock
+
+    from django.conf import settings as dj
+
+    known = ensure_bench_data(args.known)
+    miss_pool = [f"missing-{i:06d}{BENCH_DOMAIN_SUFFIX}" for i in range(max(1, args.known))]
+
+    with mock.patch.object(host_registry, "trigger_warm", lambda: None):
+        off = _run_load_pass(args, known, miss_pool, gate_on=False)
+        gate = _run_load_pass(args, known, miss_pool, gate_on=True)
+        # back to safe defaults so cleanup's delete signals don't enqueue on a broker
+        dj.TENANT_REGISTRY = {"WARM_ENABLED": False, "GATE_ENABLED": False}
+        get_redis_raw_client().delete(HOSTS_KEY)
+        if not args.keep:
+            cleanup_bench_data()
+
+    bar = "=" * 64
+    print(f"\n{bar}\nLOAD TEST — cache-only vs WARM+GATE\n{bar}")
+    print(f"{args.concurrency} threads | {'unique' if args.unique_misses else 'pooled'} misses | "
+          f"miss-ratio {args.miss_ratio:.0%} | "
+          + (f"{args.duration:.0f}s each pass" if args.duration else f"{args.requests} reqs each pass"))
+    print("Same workload both passes; only the gate differs. errors = OperationalError when")
+    print("concurrent cache-MISS resolves outrun the `default` pool (see peak concurrent).")
+    _fmt_pass(off)
+    _fmt_pass(gate)
+
+    print(f"\n{bar}\nEFFECT OF THE GATE (no-gate → gate)")
+    print(f"  DB queries      : {off['db_queries']} → {gate['db_queries']}   "
+          f"({off['db_queries'] - gate['db_queries']} fewer)")
+    print(f"  peak concurrent : {off['db_peak']} → {gate['db_peak']}   (lower = less pool pressure)")
+    print(f"  errors          : {off['counts']['exc']} → {gate['counts']['exc']}   "
+          f"({off['counts']['exc'] - gate['counts']['exc']} fewer)")
+    print(f"  throughput      : {off['throughput']:,.0f} → {gate['throughput']:,.0f} req/s")
+    print("  Under the gate, unknown hosts are rejected in Redis and never reach the DB, so")
+    print("  peak connections and error storms stay flat under an unknown-host flood.")
+    print(bar)
 
 
 def mode_seed(args):
@@ -765,15 +822,13 @@ def build_parser():
     pv.add_argument("--keep", action="store_true", help="Do not delete bench data after")
     pv.set_defaults(func=mode_verify)
 
-    pl = sub.add_parser("load", help="Concurrent throughput benchmark")
+    pl = sub.add_parser("load", help="Two passes (no-gate vs WARM+GATE): throughput, errors, peak DB conns")
     g = pl.add_mutually_exclusive_group()
     g.add_argument("--duration", type=float, help="Run for N seconds")
     g.add_argument("--requests", type=int, help="Run exactly N requests")
     pl.add_argument("--concurrency", type=int, default=16, help="Worker threads")
     pl.add_argument("--known", type=int, default=100, help="Distinct known (positive) hosts")
     pl.add_argument("--miss-ratio", type=float, default=0.2, help="Fraction of miss requests (0..1)")
-    pl.add_argument("--warm", action="store_true", help="Preload positive entries first")
-    pl.add_argument("--reset", action="store_true", help="Clear positive entries first (cold fill)")
     pl.add_argument("--unique-misses", action="store_true",
                     help="Each miss is a fresh host (tests miss FILL, not negative-cache hit)")
     pl.add_argument("--keep", action="store_true", help="Do not delete bench data after")
