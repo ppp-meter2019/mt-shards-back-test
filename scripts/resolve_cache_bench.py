@@ -356,12 +356,15 @@ def _run_load_pass(args, known, miss_pool, *, gate_on):
     pattern. Instruments real `default` DB queries + PEAK concurrency via execute_wrapper."""
     from django.conf import settings as dj
 
+    resolve_cache.forget_all()                   # clean slate for this pass
     if gate_on:
         _enable_warm_gate(gate=True)
-        host_registry.run_locked()               # build treg:hosts (positives cleared below)
+        host_registry.run_locked()               # build SET + warm KNOWN positives
     else:
         dj.TENANT_REGISTRY = {"WARM_ENABLED": False, "GATE_ENABLED": False}
-    resolve_cache.forget_all()                   # cold snapshots (SET, if any, survives)
+        resolve_cache.warm(force=True)           # warm KNOWN positives (gate-off)
+    # KNOWN hosts are pre-warmed → steady state; only MISS handling differs between passes,
+    # so measured DB load / errors come from the flood, not a one-time known cold-fill herd.
 
     stop = threading.Event()
     lock = threading.Lock()
@@ -470,12 +473,13 @@ def _fmt_pass(r):
     lat_s = (f"p50={pct(lat,50):.1f} p90={pct(lat,90):.1f} p99={pct(lat,99):.1f} max={lat[-1]:.0f}"
              if lat else "n/a")
     top = ", ".join(f"{k}×{v}" for k, v in sorted(r["exc_types"].items(), key=lambda kv: -kv[1])) or "—"
+    err_rate = (c["exc"] / r["total"] * 100.0) if r["total"] else 0.0
     print(f"\n--- {'WARM+GATE' if r['gate_on'] else 'no gate (cache only)'} ---")
     print(f"  throughput      : {r['throughput']:,.0f} req/s   ({r['total']} reqs in {r['wall']:.1f}s)")
     line = f"  requests        : served={c['served']}  rejected={c['rejected']}"
     if c["unexpected"]:
         line += f"  unexpected={c['unexpected']}"
-    line += f"  errors={c['exc']}" + (f" [{top}]" if c["exc"] else "")
+    line += f"  errors={c['exc']} ({err_rate:.2f}%)" + (f" [{top}]" if c["exc"] else "")
     print(line)
     print(f"  latency ms      : {lat_s}")
     print(f"  DB queries      : {r['db_queries']}   (resolves that missed cache and hit the DB)")
@@ -511,20 +515,23 @@ def mode_load(args):
     print(f"{args.concurrency} threads | {'unique' if args.unique_misses else 'pooled'} misses | "
           f"miss-ratio {args.miss_ratio:.0%} | "
           + (f"{args.duration:.0f}s each pass" if args.duration else f"{args.requests} reqs each pass"))
-    print("Same workload both passes; only the gate differs. errors = OperationalError when")
-    print("concurrent cache-MISS resolves outrun the `default` pool (see peak concurrent).")
+    print("Same workload both passes; KNOWN hosts pre-warmed, so only MISS handling differs.")
+    print("errors = OperationalError when concurrent DB fills outrun the `default` pool. Compare")
+    print("the error RATE (per request), NOT the raw count — the gate pass handles far more reqs.")
     _fmt_pass(off)
     _fmt_pass(gate)
 
+    off_er = off["counts"]["exc"] / off["total"] * 100 if off["total"] else 0.0
+    gate_er = gate["counts"]["exc"] / gate["total"] * 100 if gate["total"] else 0.0
     print(f"\n{bar}\nEFFECT OF THE GATE (no-gate → gate)")
     print(f"  DB queries      : {off['db_queries']} → {gate['db_queries']}   "
-          f"({off['db_queries'] - gate['db_queries']} fewer)")
+          f"({off['db_queries'] - gate['db_queries']} fewer — the flood no longer hits the DB)")
     print(f"  peak concurrent : {off['db_peak']} → {gate['db_peak']}   (lower = less pool pressure)")
-    print(f"  errors          : {off['counts']['exc']} → {gate['counts']['exc']}   "
-          f"({off['counts']['exc'] - gate['counts']['exc']} fewer)")
+    print(f"  error rate      : {off_er:.2f}% → {gate_er:.2f}%   "
+          f"(raw {off['counts']['exc']} vs {gate['counts']['exc']}, over different volumes)")
     print(f"  throughput      : {off['throughput']:,.0f} → {gate['throughput']:,.0f} req/s")
-    print("  Under the gate, unknown hosts are rejected in Redis and never reach the DB, so")
-    print("  peak connections and error storms stay flat under an unknown-host flood.")
+    print("  Unknown hosts are rejected in Redis under the gate → they never reach the DB, so")
+    print("  the DB load and error RATE from an unknown-host flood collapse toward zero.")
     print(bar)
 
 
