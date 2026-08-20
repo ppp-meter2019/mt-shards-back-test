@@ -36,6 +36,9 @@ MODES
                hit 0 DB, unknown = hard reject 0 DB).
     gate       Prove GATE steady-state: unknown hosts rejected with ZERO `default` queries;
                known hosts cold-fill once then hit.
+    compare    A/B DB-query load test: replay one request sequence with the cache OFF vs ON
+               and count actual `default` queries each way — shows how many DB hits the
+               cache eliminates (the optimization, in hard numbers).
     load       Concurrent throughput benchmark over a mix of known (positive) and
                unknown (miss) hosts; reports req/s, latency percentiles, logical
                hit/miss counts, and the Redis server-side hit-ratio delta.
@@ -47,6 +50,7 @@ USAGE
     python scripts/resolve_cache_bench.py rebuild
     python scripts/resolve_cache_bench.py coldstart
     python scripts/resolve_cache_bench.py gate --known 50 --requests 500 --miss-ratio 0.5
+    python scripts/resolve_cache_bench.py compare --requests 2000 --known 50 --miss-ratio 0.3
     python scripts/resolve_cache_bench.py load --duration 20 --concurrency 32 \
         --known 200 --miss-ratio 0.2 --warm
     python scripts/resolve_cache_bench.py cleanup
@@ -631,6 +635,88 @@ def mode_coldstart(args):
     sys.exit(0 if ok else 1)
 
 
+def mode_compare(args):
+    """A/B/C DB-query load test: replay ONE request sequence three ways and count actual
+    `default` queries each — showing what the cache, and then the gate, eliminate:
+      OFF          cache disabled → every request hits the DB (baseline);
+      ON           positive + negative cache, gate off → 1 cold-fill per DISTINCT host;
+      WARM+GATE    unknown hosts are hard-rejected with ZERO DB queries → only distinct
+                   KNOWN hosts cold-fill (unknowns cost nothing — the anti-cache-penetration win).
+    With --unique-misses each miss is a fresh host (DoS shape): ON pays 1 DB per unique miss,
+    WARM+GATE pays 0. Single-threaded so CaptureQueriesContext is authoritative; the query
+    RATIO is concurrency-independent (use `load` for raw throughput)."""
+    require_redis()
+    from unittest import mock
+
+    from django.conf import settings as dj
+
+    known = ensure_bench_data(args.known)
+    miss_pool = [f"missing-{i:06d}{BENCH_DOMAIN_SUFFIX}" for i in range(max(1, args.known))]
+    rng = random.Random(0)
+    seq, uniq = [], 0                                    # ONE fixed sequence, replayed for all arms
+    for _ in range(args.requests):
+        if rng.random() < args.miss_ratio:
+            if args.unique_misses:
+                seq.append(f"uniq-{uniq}{BENCH_DOMAIN_SUFFIX}"); uniq += 1
+            else:
+                seq.append(rng.choice(miss_pool))
+        else:
+            seq.append(rng.choice(known))
+    distinct = len(set(seq))
+
+    def run():
+        resolve_cache.forget_all()                       # cold snapshots (SET, if any, survives)
+        found = 0
+        t0 = time.perf_counter()
+        with count_default_queries() as q:
+            for h in seq:
+                if resolve(h):
+                    found += 1
+        return len(q), found, time.perf_counter() - t0
+
+    # --- OFF: both TTLs 0, no WARM/GATE → resolve() goes straight to the DB ---
+    dj.TENANT_RESOLVE = {"POSITIVE_CACHE_SECONDS": 0, "MISS_CACHE_SECONDS": 0}
+    dj.TENANT_REGISTRY = {"WARM_ENABLED": False, "GATE_ENABLED": False}
+    off_q, off_found, off_wall = run()
+
+    # --- ON: positive + negative caching; gate off ---
+    dj.TENANT_RESOLVE = {"POSITIVE_CACHE_SECONDS": 3600, "MISS_CACHE_SECONDS": 60}
+    on_q, on_found, on_wall = run()
+
+    # --- WARM+GATE: SET built; unknowns hard-rejected with ZERO DB ---
+    _enable_warm_gate(gate=True)
+    with mock.patch.object(host_registry, "trigger_warm", lambda: None):
+        host_registry.run_locked()                       # build treg:hosts (run() then clears positives)
+        gate_q, gate_found, gate_wall = run()
+
+    def pctless(x):
+        return f"{(1 - x / off_q) * 100:.1f}% fewer than OFF" if off_q else "n/a"
+
+    print("\n== cache A/B/C (single-threaded, exact default-query counts) ==")
+    print(f"  requests           : {args.requests}  (distinct hosts={distinct}, "
+          f"miss-ratio={args.miss_ratio:.0%}, known={args.known}, "
+          f"misses={'unique' if args.unique_misses else 'pooled'})")
+    sane = off_found == on_found == gate_found
+    print(f"  found (sanity)     : off={off_found} on={on_found} gate={gate_found}  "
+          f"[{'PASS' if sane else 'FAIL'} — same workload, same result]")
+    print("  DB queries:")
+    print(f"    OFF            : {off_q:>7}  ({off_q / args.requests:.2f}/req)  baseline")
+    print(f"    ON (no gate)   : {on_q:>7}  ({on_q / args.requests:.2f}/req)  {pctless(on_q)}")
+    print(f"    WARM+GATE      : {gate_q:>7}  ({gate_q / args.requests:.2f}/req)  {pctless(gate_q)}; "
+          f"{on_q - gate_q} fewer than ON — unknown hosts cost 0 DB")
+    print(f"  wall  off={off_wall:.2f}s  on={on_wall:.2f}s  gate={gate_wall:.2f}s")
+    ok = sane and gate_q <= on_q < off_q
+    print("\nRESULT:", "PASS — cache reduces DB queries; gate removes the unknown-host DB cost"
+          if ok else "FAIL")
+    # Turn WARM/GATE back OFF so cleanup's delete signals don't enqueue a reconcile onto a
+    # (possibly absent) broker, and drop the SET the gate arm built.
+    dj.TENANT_REGISTRY = {"WARM_ENABLED": False, "GATE_ENABLED": False}
+    get_redis_raw_client().delete(HOSTS_KEY)
+    if not args.keep:
+        cleanup_bench_data()
+    sys.exit(0 if ok else 1)
+
+
 # --- CLI --------------------------------------------------------------------
 def build_parser():
     p = argparse.ArgumentParser(description="Tenant-resolution cache verifier + load tester")
@@ -682,6 +768,15 @@ def build_parser():
     pcs.add_argument("--known", type=int, default=5, help="Bench domains to seed")
     pcs.add_argument("--keep", action="store_true", help="Do not delete bench data after")
     pcs.set_defaults(func=mode_coldstart)
+
+    pcm = sub.add_parser("compare", help="A/B DB-query load: cache OFF vs ON, count default queries")
+    pcm.add_argument("--requests", type=int, default=2000, help="Requests replayed for each run")
+    pcm.add_argument("--known", type=int, default=50, help="Distinct known (positive) hosts")
+    pcm.add_argument("--miss-ratio", type=float, default=0.3, help="Fraction of miss requests (0..1)")
+    pcm.add_argument("--unique-misses", action="store_true",
+                     help="Each miss is a fresh host (cache-penetration/DoS shape)")
+    pcm.add_argument("--keep", action="store_true", help="Do not delete bench data after")
+    pcm.set_defaults(func=mode_compare)
     return p
 
 
