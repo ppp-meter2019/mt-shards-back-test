@@ -689,25 +689,59 @@ def mode_compare(args):
         host_registry.run_locked()                       # build treg:hosts (run() then clears positives)
         gate_q, gate_found, gate_wall = run()
 
-    def pctless(x):
-        return f"{(1 - x / off_q) * 100:.1f}% fewer than OFF" if off_q else "n/a"
-
-    print("\n== cache A/B/C (single-threaded, exact default-query counts) ==")
-    print(f"  requests           : {args.requests}  (distinct hosts={distinct}, "
-          f"miss-ratio={args.miss_ratio:.0%}, known={args.known}, "
-          f"misses={'unique' if args.unique_misses else 'pooled'})")
+    R = args.requests
     sane = off_found == on_found == gate_found
-    print(f"  found (sanity)     : off={off_found} on={on_found} gate={gate_found}  "
-          f"[{'PASS' if sane else 'FAIL'} — same workload, same result]")
-    print("  DB queries:")
-    print(f"    OFF            : {off_q:>7}  ({off_q / args.requests:.2f}/req)  baseline")
-    print(f"    ON (no gate)   : {on_q:>7}  ({on_q / args.requests:.2f}/req)  {pctless(on_q)}")
-    print(f"    WARM+GATE      : {gate_q:>7}  ({gate_q / args.requests:.2f}/req)  {pctless(gate_q)}; "
-          f"{on_q - gate_q} fewer than ON — unknown hosts cost 0 DB")
-    print(f"  wall  off={off_wall:.2f}s  on={on_wall:.2f}s  gate={gate_wall:.2f}s")
+    known_set = set(known)
+    distinct_known = len({h for h in seq if h in known_set})
+    distinct_miss = distinct - distinct_known
+    miss_reqs = R - off_found
+
+    def pct(x):
+        return (1 - x / off_q) * 100 if off_q else 0.0
+
+    bar = "=" * 64
+    print(f"\n{bar}\nCACHE / GATE A/B/C COMPARISON\n{bar}")
+    print("Replayed the SAME request sequence through three configurations and counted how")
+    print("many requests reached the `default` DB. FEWER DB queries = the cache/gate helping.\n")
+
+    print("Workload:")
+    print(f"  {R} requests over {distinct} distinct hosts")
+    print(f"    known  (in DB) : {off_found} requests across {distinct_known} hosts  → should resolve")
+    print(f"    unknown (miss) : {miss_reqs} requests across {distinct_miss} hosts  "
+          f"({'each UNIQUE' if args.unique_misses else 'reused pool'}) → should NOT resolve")
+    print(f"  same answer every run (found off={off_found} on={on_found} gate={gate_found}) "
+          f"[{'OK' if sane else 'MISMATCH'}] — only the DB cost differs.\n")
+
+    print("DB queries to `default` (lower is better):\n")
+    print(f"  [1] CACHE OFF          {off_q:>6}   ({off_q / R:.2f}/req)   baseline")
+    print( "      no cache at all — every request goes to the DB.\n")
+    print(f"  [2] CACHE ON, no gate  {on_q:>6}   ({on_q / R:.2f}/req)   {pct(on_q):.1f}% fewer than [1]")
+    if args.unique_misses:
+        print( "      positive+negative cache, but each DISTINCT host still costs one DB fill.")
+        print( "      Unique unknowns are never repeated → one DB query PER unknown: the cache")
+        print( "      is \"penetrated\" and degrades toward no-cache under a flood.\n")
+    else:
+        print( "      positive+negative cache: repeated hosts (known AND miss) are served from")
+        print( "      cache; only the first hit of each distinct host costs a DB fill.\n")
+    print(f"  [3] WARM + GATE        {gate_q:>6}   ({gate_q / R:.2f}/req)   {pct(gate_q):.1f}% fewer than [1]")
+    print( "      the gate rejects unknown hosts from a Redis SET WITHOUT touching the DB, so")
+    print(f"      only the {distinct_known} known hosts ever cold-fill. {on_q - gate_q} fewer DB queries than [2]")
+    print( "      — unknown hosts cost ZERO DB, no matter how many or how unique.\n")
+
+    print(f"Wall time:  OFF {off_wall:.2f}s   ON {on_wall:.2f}s   GATE {gate_wall:.2f}s   "
+          "(fewer DB round-trips ⇒ faster)")
+
     ok = sane and gate_q <= on_q < off_q
-    print("\nRESULT:", "PASS — cache reduces DB queries; gate removes the unknown-host DB cost"
-          if ok else "FAIL")
+    print(f"\n{bar}")
+    if ok and args.unique_misses:
+        print("VERDICT: PASS — under an unknown-host flood a plain cache degrades toward")
+        print(f"         no-cache ({on_q}≈{off_q}); only the GATE keeps DB load flat ({gate_q}).")
+    elif ok:
+        print("VERDICT: PASS — the cache cuts DB load; the gate additionally makes unknown")
+        print("         hosts cost zero DB (run with --unique-misses to see the DoS case).")
+    else:
+        print("VERDICT: FAIL")
+    print(bar)
     # Turn WARM/GATE back OFF so cleanup's delete signals don't enqueue a reconcile onto a
     # (possibly absent) broker, and drop the SET the gate arm built.
     dj.TENANT_REGISTRY = {"WARM_ENABLED": False, "GATE_ENABLED": False}
