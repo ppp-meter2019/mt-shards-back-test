@@ -4,8 +4,8 @@ from unittest import mock
 
 from django.test import SimpleTestCase
 
-from tenants.resolve_cache import CacheUnavailable, TenantResolveCache
-from tenants.resolve_markers import NEGATIVE, TOMBSTONE
+from tenants.resolver import CacheUnavailable, TenantResolveCache
+from tenants.resolver import NEGATIVE, TOMBSTONE
 
 from ._support import FakeNxCache, make_tenant
 
@@ -25,42 +25,71 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertIs(rc.get_snapshot("h"), rc.MISS)
 
     def test_get_snapshot_tombstone_is_miss(self):
-        fake = FakeNxCache(); fake.store["h"] = TOMBSTONE
-        rc = self.rc(fake)
+        rc = self.rc()
+        rc.cache.store[rc._snap_key("h")] = TOMBSTONE
         self.assertIs(rc.get_snapshot("h"), rc.MISS)
 
     def test_get_snapshot_negative(self):
-        fake = FakeNxCache(); fake.store["h"] = NEGATIVE
-        rc = self.rc(fake)
+        rc = self.rc()
+        rc.cache.store[rc._snap_key("h")] = NEGATIVE
         self.assertIs(rc.get_snapshot("h"), rc.NEG)
 
     def test_get_snapshot_positive_loads_readonly_tenant(self):
-        fake = FakeNxCache()
-        rc = self.rc(fake)
-        fake.store["h"] = rc.dump(make_tenant())
+        rc = self.rc()
+        rc.cache.store[rc._snap_key("h")] = rc.dump(make_tenant())
         got = rc.get_snapshot("h")
         self.assertEqual(got.schema_name, "alpha")
         self.assertTrue(got.read_only and got.shard.read_only)
 
+    def test_classify_covers_all_value_kinds(self):
+        rc = self.rc()
+        K = rc._Kind
+        self.assertIs(rc._classify(None), K.MISS)
+        self.assertIs(rc._classify(TOMBSTONE), K.HOLD)
+        self.assertIs(rc._classify(NEGATIVE), K.NEG)
+        self.assertIs(rc._classify(rc.dump(make_tenant())), K.POSITIVE)
+        self.assertIs(rc._classify({"tenant": {}, "shard": {}}), K.POSITIVE)  # right shape
+        self.assertIs(rc._classify({"foo": 1}), K.UNKNOWN)                    # malformed dict
+        self.assertIs(rc._classify("garbage"), K.UNKNOWN)                     # non-dict
+
+    def test_get_snapshot_malformed_dict_is_miss_not_raise(self):
+        rc = self.rc()
+        rc.cache.store[rc._snap_key("h")] = {"foo": 1}   # dict but wrong shape
+        self.assertIs(rc.get_snapshot("h"), rc.MISS)     # UNKNOWN → MISS, no load()/KeyError
+
+    def test_dump_allowlist_excludes_non_routing_fields(self):
+        # Snapshot carries ONLY the routing allowlist — no company_name/last_error/etc.
+        rc = self.rc()
+        snap = rc.dump(make_tenant())
+        self.assertEqual(set(snap["tenant"]), {"id", "schema_name", "status", "shard_id"})
+        self.assertEqual(set(snap["shard"]), {"id", "alias"})
+        # routing fields round-trip; a non-carried field is the model default, never read
+        # off request.tenant (see the _SNAPSHOT_FIELDS contract).
+        got = rc.load(snap)
+        self.assertEqual(got.schema_name, "alpha")
+        self.assertEqual(got.shard.alias, "shard_a")
+        self.assertEqual(got.company_name, "")      # make_tenant set "Alpha" — NOT carried
+
     # --- store / store_miss (nx respects tombstone) ---
     def test_store_is_nx_and_respects_tombstone(self):
-        fake = FakeNxCache(); fake.store["h"] = TOMBSTONE
-        self.rc(fake).store("h", make_tenant())
-        self.assertEqual(fake.store["h"], TOMBSTONE)
+        rc = self.rc()
+        k = rc._snap_key("h")
+        rc.cache.store[k] = TOMBSTONE
+        rc.store("h", make_tenant())
+        self.assertEqual(rc.cache.store[k], TOMBSTONE)
 
     def test_store_miss_writes_negative(self):
-        fake = FakeNxCache()
-        self.rc(fake).store_miss("h")
-        self.assertEqual(fake.store["h"], NEGATIVE)
+        rc = self.rc()
+        rc.store_miss("h")
+        self.assertEqual(rc.cache.store[rc._snap_key("h")], NEGATIVE)
 
     # --- invalidation ---
     def test_forget_host_writes_tombstone(self):
-        fake = FakeNxCache()
-        rc = self.rc(fake)
-        with mock.patch("tenants.resolve_cache.transaction.on_commit", side_effect=lambda fn: fn()):
+        rc = self.rc()
+        with mock.patch("tenants.resolver.cache.transaction.on_commit", side_effect=lambda fn: fn()):
             n = rc.forget_host("h")
         self.assertEqual(n, 1)
-        self.assertEqual(fake.store["h"], TOMBSTONE)
+        self.assertEqual(rc.cache.store[rc._snap_key("h")], TOMBSTONE)
 
     def test_forget_all_clears_by_pattern_and_counts(self):
         fake = FakeNxCache(); fake.store.update({"a": 1, "b": 2})
@@ -70,26 +99,26 @@ class TenantResolveCacheTests(SimpleTestCase):
 
     # --- warm (Domain mocked) ---
     def test_warm_fill_gaps_skips_tombstone(self):
-        fake = FakeNxCache(); fake.store["h1"] = TOMBSTONE
-        rc = self.rc(fake)
+        rc = self.rc()
+        rc.cache.store[rc._snap_key("h1")] = TOMBSTONE
         rows = [_Row("h1", make_tenant()), _Row("h2", make_tenant(schema_name="beta"))]
         with mock.patch("tenants.models.Domain") as D:
             D.objects.select_related.return_value.iterator.return_value = iter(rows)
             n = rc.warm()
         self.assertEqual(n, 1)                        # only h2 filled (h1 held by tombstone)
-        self.assertEqual(fake.store["h1"], TOMBSTONE)
-        self.assertIsInstance(fake.store["h2"], dict)
+        self.assertEqual(rc.cache.store[rc._snap_key("h1")], TOMBSTONE)
+        self.assertIsInstance(rc.cache.store[rc._snap_key("h2")], dict)
 
     def test_warm_force_overwrites_everything(self):
-        fake = FakeNxCache(); fake.store["h1"] = TOMBSTONE
-        rc = self.rc(fake)
+        rc = self.rc()
+        rc.cache.store[rc._snap_key("h1")] = TOMBSTONE
         rows = [_Row("h1", make_tenant()), _Row("h2", make_tenant())]
         with mock.patch("tenants.models.Domain") as D:
             D.objects.select_related.return_value.iterator.return_value = iter(rows)
             n = rc.warm(force=True)
         self.assertEqual(n, 2)
-        self.assertIsInstance(fake.store["h1"], dict)  # tombstone overwritten
-        self.assertIsInstance(fake.store["h2"], dict)
+        self.assertIsInstance(rc.cache.store[rc._snap_key("h1")], dict)  # tombstone overwritten
+        self.assertIsInstance(rc.cache.store[rc._snap_key("h2")], dict)
 
     # --- health / raise_on_error ---
     def test_raise_on_error_raises_when_down(self):

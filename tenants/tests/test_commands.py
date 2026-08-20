@@ -5,7 +5,7 @@ from unittest import mock
 from django.core.management import CommandError, call_command
 from django.test import SimpleTestCase
 
-import tenants.resolve_cache as rc_mod
+import tenants.resolver as rc_mod
 
 
 class WarmCommandTests(SimpleTestCase):

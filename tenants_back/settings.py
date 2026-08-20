@@ -361,24 +361,65 @@ CACHES["tenant_resolve"] = {
     },
 }
 
-# Resolution-cache TTLs. 0 disables that half (falls back to a DB lookup).
-# positive: long backstop; correctness is kept by explicit invalidation (signals on
-#           Tenant/Domain). The TTL only self-heals entries an invalidation missed —
-#           e.g. a status/shard change via QuerySet.update()/migration, which does
-#           NOT fire post_save. Do NOT make this unbounded.
-# negative: short; bounds the memory a flood of unknown-host requests can occupy.
-#           A just-created domain is made resolvable immediately by invalidating its
-#           negative entry on Domain creation, so this TTL is only a safety bound.
-TENANT_RESOLVE_CACHE_SECONDS      = 3600   # positive (success): 1 hour
-TENANT_RESOLVE_MISS_CACHE_SECONDS = 60     # negative (miss): 60 s
+# ---------------------------------------------------------------------------
+# Resolver settings — two namespaced dicts over in-code DEFAULTS (tenants/resolver/config.py).
+# Override per key here (or in settings_local.py); unspecified keys fall back to DEFAULTS.
+# ---------------------------------------------------------------------------
+# TENANT_RESOLVE — resolution-cache tuning (always relevant).
+#   POSITIVE_CACHE_SECONDS: positive (success) TTL. Long backstop; correctness is kept by
+#     explicit invalidation (Tenant/Domain signals). Only self-heals entries an invalidation
+#     missed (e.g. a QuerySet.update()/migration status/shard change — no post_save). 0
+#     disables positive caching. Do NOT make it unbounded.
+#   MISS_CACHE_SECONDS: negative (miss) TTL. Short — bounds memory a flood of unknown hosts
+#     can occupy. A new domain is made resolvable immediately by invalidating its negative on
+#     creation, so this is only a safety bound. 0 disables negative caching.
+#   HOLD_SECONDS: invalidation writes a short "hold" (tombstone) instead of deleting; while it
+#     lives, resolve goes DB-direct and an nx populate cannot overwrite it (closes the
+#     read-then-write race). 0 => plain delete (race open). Shortest-TTL key → volatile-ttl
+#     evicts it first.
+#   WARM_TTL_BY_STATUS: positive TTL by tenant status, used ONLY under WARM. None => no expiry
+#     (kept warm by reconcile + orphan-sweep). Statuses absent here fall back to
+#     POSITIVE_CACHE_SECONDS.
+#   FILLCAP_PER_SEC / FILLCAP_LOCAL_PER_SEC: fill_cap rate-limits DB resolves ONLY on the
+#     flag-absent branch (cold / flush / warm-in-progress). Global (Redis fixed-window) with a
+#     per-pod bucket fallback. Member cold-fills and non-member rejects do NOT consume it.
+TENANT_RESOLVE = {
+    "POSITIVE_CACHE_SECONDS": 3600,
+    "MISS_CACHE_SECONDS": 60,
+    "HOLD_SECONDS": 5,
+    "WARM_TTL_BY_STATUS": {
+        "active": None, "deactivated": 3600, "failed": 1800, "new": 120, "pending": 120,
+    },
+    "FILLCAP_PER_SEC": 20,
+    "FILLCAP_LOCAL_PER_SEC": 5,
+}
 
-# Invalidation writes a short-lived "hold" marker instead of deleting the key; while
-# it lives, get_tenant resolves DB-direct and an nx=True populate CANNOT overwrite it —
-# closing the read-then-write race (a slow resolver repopulating a stale snapshot just
-# after invalidation). Self-heals on expiry. 0 => plain delete (no hold, race open).
-# Keep it a few seconds (comfortably above a resolver's read->write latency). NOTE: it
-# is the shortest-TTL key here, so volatile-ttl evicts it first under memory pressure.
-TENANT_RESOLVE_HOLD_SECONDS = 5
+# TENANT_REGISTRY — anti-DoS host gate, two-stage rollout. Defaults OFF (byte-for-byte
+# today's behavior); enable per environment in settings_local.py. Full design:
+# deploy/resolve_gate_design.md.
+#   WARM_ENABLED (Stage 1, write side): maintain the `tres:hosts` SET (SADD/SREM + dead-man
+#     switch), run reconcile, write positives with WARM_TTL_BY_STATUS. No read impact.
+#   GATE_ENABLED (Stage 2, read side): on a positive-cache MISS, consult `tres:hosts` and
+#     reject unknown (non-member) hosts WITHOUT a DB hit. Requires WARM (fail-safe: GATE
+#     without WARM is treated as OFF; the tenants.E001 check flags the misconfig).
+#   HOSTS_ARM_SECONDS: dead-man TTL armed on domain add/delete/rename — if the follow-up
+#     reconcile never runs, the key expires and the gate fails open.
+#   RECONCILE_SECONDS: daily safety reconcile (catches signal-bypassing drift). NB: consumed
+#     by the ops beat schedule, not read by code.
+#   WARM_LOCK_SECONDS: `tres:warming` single-writer lock TTL. INVARIANT: must comfortably
+#     exceed the WORST-CASE reconcile (full DB scan × up to 3 dirty-recheck rebuilds); if it
+#     expires mid-reconcile, a second writer can overlap. ~sub-second at ~700 tenants → 120s
+#     is ample; raise it if domain count / DB latency grows.
+#   WARM_PENDING_SECONDS: reconcile-trigger enqueue-coalescing window (`tres:warm_pending`,
+#     self-expiring NX). Also the worst-case re-enqueue delay if a broker publish was lost.
+TENANT_REGISTRY = {
+    "WARM_ENABLED": False,
+    "GATE_ENABLED": False,
+    "HOSTS_ARM_SECONDS": 300,
+    "RECONCILE_SECONDS": 86400,
+    "WARM_LOCK_SECONDS": 120,
+    "WARM_PENDING_SECONDS": 10,
+}
 
 # API path prefixes — request-handling code that treats API traffic as stateless/JSON:
 # the session guard (users.middleware) and error content negotiation (tenants.errors).

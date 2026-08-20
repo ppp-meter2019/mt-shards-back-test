@@ -18,7 +18,7 @@ from django.core.exceptions import ValidationError
 from django.test import TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
-import tenants.resolve_cache as rc
+import tenants.resolver as rc
 from tenants.models import Domain, ReservedHostRule, Shard, Tenant
 from tenants.serializers import TenantSerializer
 from tenants.validators import validate_tenant_domain, validate_tenant_schema_name

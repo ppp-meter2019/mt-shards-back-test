@@ -21,7 +21,7 @@ from users.models import User
 from .context import tenant_context
 from .models import Domain, ReservedHostRule, Shard, Tenant
 from .permissions import IsTenantAdminOnPublic
-from .resolve_cache import resolve_cache
+from .resolver import resolve_cache
 from .serializers import (
     ReservedHostRuleSerializer,
     ShardSerializer,

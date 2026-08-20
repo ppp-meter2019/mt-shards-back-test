@@ -30,3 +30,6 @@ class TenantsConfig(AppConfig):
 
         # Register tenant-resolution cache invalidation signals.
         from . import signals  # noqa: F401
+
+        # Register deploy-time config checks (gate/warm flag invariants).
+        from . import checks  # noqa: F401

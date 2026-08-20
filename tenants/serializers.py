@@ -10,7 +10,7 @@ from users.models import User
 
 from .context import tenant_context
 from .models import Domain, ReservedHostRule, Shard, Tenant
-from .resolve_cache import resolve_cache
+from .resolver import resolve_cache
 from .validators import validate_tenant_domain, validate_tenant_schema_name
 
 # ASCII PostgreSQL-safe schema name: starts with a lowercase letter, then

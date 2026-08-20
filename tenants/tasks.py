@@ -56,10 +56,11 @@ def drop_tenant_schema_task(database, schema):
     return {"database": database, "schema": schema, "dropped": True}
 
 
-# Plain Task base (NOT TenantTask): tenant-agnostic — it only warms the resolve cache
-# (which runs in the public/default context), so it must not go through the schema-
-# switching machinery. Defined but intentionally NOT routed/scheduled yet.
+# Tenant-resolve gate reconcile: rebuild the tres:hosts SET + warm positive snapshots
+# from the DB, single-writer (tres:warming lock lives inside run_locked). Tenant-agnostic
+# (public context) → plain Task. Enqueued on-demand (host_registry.trigger_warm) and,
+# in production, scheduled daily as a safety net. No-op unless TENANT_REGISTRY_WARM_ENABLED.
 @shared_task(base=Task, acks_late=True, max_retries=0)
-def warm_resolve_cache_task(force=False):
-    from tenants.resolve_cache import resolve_cache
-    return resolve_cache.warm(force=force)
+def reconcile_host_registry_task():
+    from tenants.resolver import host_registry
+    return {"reconciled": host_registry.run_locked()}

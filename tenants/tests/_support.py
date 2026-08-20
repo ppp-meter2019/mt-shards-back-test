@@ -30,6 +30,9 @@ class FakeNxCache:
     def set_many(self, mapping, timeout=None, **kw):
         self.store.update(mapping)
 
+    def get_many(self, keys):
+        return {k: self.store[k] for k in keys if k in self.store}
+
     def delete_many(self, keys):
         for k in keys:
             self.store.pop(k, None)
@@ -42,13 +45,14 @@ class FakeNxCache:
 
 @contextmanager
 def use_resolve_cache(fake):
-    """Patch tenants.middleware.resolve_cache with a TenantResolveCache backed by
-    `fake` (DI — no monkeypatching of the global caches registry)."""
-    import tenants.middleware as _mw
-    from tenants.resolve_cache import TenantResolveCache
+    """Patch the resolver service's `resolve_cache` with a TenantResolveCache backed by
+    `fake` (DI — no monkeypatching of the global caches registry). The service facade is
+    where the resolve path reads/writes the cache, so patch it there."""
+    import tenants.resolver.service as _svc
+    from tenants.resolver import TenantResolveCache
 
     rc = TenantResolveCache(cache=fake)
-    with mock.patch.object(_mw, "resolve_cache", rc):
+    with mock.patch.object(_svc, "resolve_cache", rc):
         yield rc
 
 

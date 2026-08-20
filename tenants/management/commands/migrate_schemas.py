@@ -56,7 +56,7 @@ from django_tenants.utils import (
 
 from tenants.celery.change_marker import bump_schema
 from tenants.models import Shard, Tenant
-from tenants.resolve_cache import resolve_cache
+from tenants.resolver import resolve_cache
 
 
 # Statuses that may be claimed by a migration run.

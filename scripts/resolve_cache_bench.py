@@ -22,21 +22,31 @@ SAFETY (built for staging)
     against staging, not production.
 
 MODES
-    inspect   Show Redis INFO stats (keyspace hit ratio), key count, and a sample
-              of live `tres:*` keys classified as positive / negative / hold.
-    verify    Single-threaded correctness proofs (uses query counting):
-                - positive hit serves from cache with ZERO `default` queries
-                - negative (miss) is cached and re-served with ZERO queries
-                - the nx + tombstone hold protocol survives a racing populate
-    load      Concurrent throughput benchmark over a mix of known (positive) and
-              unknown (miss) hosts; reports req/s, latency percentiles, logical
-              hit/miss counts, and the Redis server-side hit-ratio delta.
-    seed      Create the bench tenants/domains and exit (for manual poking).
-    cleanup   Delete all bench_ rows and forget their cached hosts.
+    inspect    Show Redis INFO stats (keyspace hit ratio), key count, and a sample
+               of live `tres:*` keys classified as positive / negative / hold.
+    verify     Single-threaded correctness proofs (uses query counting):
+                 - positive hit serves from cache with ZERO `default` queries
+                 - negative (miss) is cached and re-served with ZERO queries
+                 - the nx + tombstone hold protocol survives a racing populate
+    rebuild    Prove the SET + snapshots REBUILD on DB changes (WARM on): domain add →
+               incremental SADD; delete → SREM + orphan-sweep; status flip → reconcile
+               force-overwrites the cached snapshot.
+    coldstart  Prove the cold-start idea (WARM+GATE): a cold Redis fails OPEN (valid hosts
+               still served, no outage), then after warm the gate is active (known = cache
+               hit 0 DB, unknown = hard reject 0 DB).
+    gate       Prove GATE steady-state: unknown hosts rejected with ZERO `default` queries;
+               known hosts cold-fill once then hit.
+    load       Concurrent throughput benchmark over a mix of known (positive) and
+               unknown (miss) hosts; reports req/s, latency percentiles, logical
+               hit/miss counts, and the Redis server-side hit-ratio delta.
+    seed       Create the bench tenants/domains and exit (for manual poking).
+    cleanup    Delete all bench_ rows and forget their cached hosts.
 
 USAGE
-    python scripts/resolve_cache_bench.py inspect
     python scripts/resolve_cache_bench.py verify
+    python scripts/resolve_cache_bench.py rebuild
+    python scripts/resolve_cache_bench.py coldstart
+    python scripts/resolve_cache_bench.py gate --known 50 --requests 500 --miss-ratio 0.5
     python scripts/resolve_cache_bench.py load --duration 20 --concurrency 32 \
         --known 200 --miss-ratio 0.2 --warm
     python scripts/resolve_cache_bench.py cleanup
@@ -68,8 +78,7 @@ from django.test.utils import CaptureQueriesContext  # noqa: E402
 
 from tenants.middleware import ShardAwareTenantMiddleware  # noqa: E402
 from tenants.models import Domain, Shard, Tenant  # noqa: E402
-from tenants.resolve_cache import resolve_cache  # noqa: E402
-from tenants.resolve_markers import NEGATIVE, TOMBSTONE  # noqa: E402
+from tenants.resolver import HOSTS_KEY, host_registry, resolve_cache  # noqa: E402
 
 # Bench namespace — everything the script creates/mutates lives under here so it
 # can never touch real tenants and cleanup is a simple prefix match.
@@ -82,9 +91,9 @@ _MW = ShardAwareTenantMiddleware(get_response=lambda request: None)
 
 
 # --- low-level helpers ------------------------------------------------------
-def raw_client():
+def get_redis_raw_client():
     """The underlying redis-py client for the tenant_resolve cache (write node)."""
-    return resolve_cache.cache.client.get_client(write=True)
+    return resolve_cache.get_redis_raw_client()
 
 
 def require_redis():
@@ -93,18 +102,28 @@ def require_redis():
                  f"(check LOCATION for CACHES['tenant_resolve']).")
 
 
+def _snap(host):
+    """Physical snapshot cache key for a host (goes through the resolver's namespacing)."""
+    return resolve_cache._snap_key(host)
+
+
 def classify(host):
-    """What is stored for `host` right now: positive | negative | hold | absent."""
-    v = resolve_cache.cache.get(host)
-    if v is None:
-        return "absent"
-    if v == NEGATIVE:
-        return "negative"
-    if v == TOMBSTONE:
-        return "hold"
-    if isinstance(v, dict):
-        return "positive"
-    return "unknown"
+    """What is stored for `host` right now: positive | negative | hold | absent | unknown.
+    Delegates to the resolver's single classifier so the bench never re-implements the shapes."""
+    K = resolve_cache._Kind
+    kind = resolve_cache._classify(resolve_cache.cache.get(_snap(host)))
+    return {K.MISS: "absent", K.NEG: "negative"}.get(kind, kind)   # HOLD/POSITIVE/UNKNOWN already match
+
+
+def _is_member(host):
+    """True iff `host` is currently in the gate SET (treg:hosts)."""
+    return bool(get_redis_raw_client().sismember(HOSTS_KEY, host))
+
+
+def _enable_warm_gate(gate=True):
+    """Force WARM (+ optionally GATE) on for this process — read live by registry_cfg."""
+    from django.conf import settings as dj
+    dj.TENANT_REGISTRY = {"WARM_ENABLED": True, "GATE_ENABLED": gate}
 
 
 def resolve(host):
@@ -168,6 +187,20 @@ def ensure_bench_data(n):
     return want
 
 
+def _add_bench_domain(i):
+    """Create ONE extra bench tenant+domain at index `i` (fires the real post_save signals).
+    Returns its domain."""
+    shard = Shard.objects.get(alias=BENCH_SHARD_ALIAS)
+    schema = f"{BENCH_SCHEMA_PREFIX}{i:05d}"
+    tenant, _ = Tenant.objects.get_or_create(
+        schema_name=schema,
+        defaults={"company_name": f"Bench {i}", "shard": shard, "status": Tenant.Status.ACTIVE},
+    )
+    d = _bench_domain(i)
+    Domain.objects.get_or_create(domain=d, defaults={"tenant": tenant, "is_primary": True})
+    return d
+
+
 def _sweep_bench_cache_keys():
     """Delete every cached tres key in the bench domain namespace — including the
     negative miss-markers (missing-*/uniq-*) that have no DB row. A bench-only
@@ -176,8 +209,8 @@ def _sweep_bench_cache_keys():
     A single SCAN can skip keys while others are expiring/rehashing, so gather
     into a set over a few passes until no new keys appear (short-TTL negatives that
     expire meanwhile just drop out — deleting them would be a no-op anyway)."""
-    c = raw_client()
-    physical_prefix = f"{resolve_cache.cache.key_prefix}:{resolve_cache.cache.version}:"
+    c = get_redis_raw_client()
+    physical_prefix = resolve_cache._snapshot_key_prefix()   # single source of the key layout
     pattern = f"{physical_prefix}*{BENCH_DOMAIN_SUFFIX}"
     found = set()
     for _ in range(5):
@@ -209,7 +242,7 @@ def cleanup_bench_data():
 
 # --- INFO stats -------------------------------------------------------------
 def info_stats():
-    c = raw_client()
+    c = get_redis_raw_client()
     info = c.info("stats")
     hits = int(info.get("keyspace_hits", 0))
     misses = int(info.get("keyspace_misses", 0))
@@ -219,18 +252,12 @@ def info_stats():
 def count_tres_keys(sample=0):
     """Count (and optionally sample) live keys in the tenant_resolve namespace via
     SCAN — never KEYS. Returns (count, [sample logical hosts])."""
-    c = raw_client()
-    prefix = resolve_cache.cache.key_prefix
-    version = resolve_cache.cache.version
-    physical_prefix = f"{prefix}:{version}:"          # django_redis: prefix:version:key
-    pattern = f"{physical_prefix}*"
     count = 0
     sampled = []
-    for k in c.scan_iter(match=pattern, count=500):
+    for host in resolve_cache.iter_snapshot_hosts():   # cache owns the key layout
         count += 1
         if len(sampled) < sample:
-            key = k.decode() if isinstance(k, (bytes, bytearray)) else k
-            sampled.append(key[len(physical_prefix):])
+            sampled.append(host)
     return count, sampled
 
 
@@ -241,7 +268,7 @@ def mode_inspect(args):
     total = st["hits"] + st["misses"]
     ratio = (st["hits"] / total * 100.0) if total else 0.0
     print("== tenant_resolve Redis ==")
-    print(f"  LOCATION prefix : {resolve_cache.cache.key_prefix}:{resolve_cache.cache.version}:")
+    print(f"  snapshot prefix : {resolve_cache._snapshot_key_prefix()}")
     print(f"  keyspace_hits   : {st['hits']}")
     print(f"  keyspace_misses : {st['misses']}")
     print(f"  server hit ratio: {ratio:.1f}%   (cumulative, since Redis start)")
@@ -250,7 +277,7 @@ def mode_inspect(args):
     if sample:
         print(f"  sample (up to {args.sample}):")
         for host in sample:
-            print(f"    [{classify(host):8}] ttl={resolve_cache.cache.ttl(host)!s:>6}  {host}")
+            print(f"    [{classify(host):8}] ttl={resolve_cache.cache.ttl(_snap(host))!s:>6}  {host}")
 
 
 def _check(label, ok, detail=""):
@@ -268,7 +295,7 @@ def mode_verify(args):
     unknown = f"nope-{known}"       # guaranteed absent from DB
     ok = True
     print("== verify: positive (success) caching ==")
-    resolve_cache.cache.delete(known)
+    resolve_cache.cache.delete(_snap(known))
     with count_default_queries() as q1:
         found1 = resolve(known)
     fill_q = len(q1)
@@ -277,12 +304,12 @@ def mode_verify(args):
     hit_q = len(q2)
     ok &= _check("first resolve is a DB fill", found1 and fill_q >= 1, f"{fill_q} default queries")
     ok &= _check("stored as positive snapshot", classify(known) == "positive",
-                 f"ttl={resolve_cache.cache.ttl(known)}")
+                 f"ttl={resolve_cache.cache.ttl(_snap(known))}")
     ok &= _check("second resolve serves from cache with ZERO default queries",
                  found2 and hit_q == 0, f"{hit_q} default queries")
 
     print("== verify: negative (miss) caching ==")
-    resolve_cache.cache.delete(unknown)
+    resolve_cache.cache.delete(_snap(unknown))
     with count_default_queries() as q3:
         found3 = resolve(unknown)
     miss_fill_q = len(q3)
@@ -292,7 +319,7 @@ def mode_verify(args):
     ok &= _check("first miss hits the DB", (not found3) and miss_fill_q >= 1,
                  f"{miss_fill_q} default queries")
     ok &= _check("stored as NEGATIVE marker", classify(unknown) == "negative",
-                 f"ttl={resolve_cache.cache.ttl(unknown)}")
+                 f"ttl={resolve_cache.cache.ttl(_snap(unknown))}")
     ok &= _check("second miss served from cache with ZERO default queries",
                  (not found4) and miss_hit_q == 0, f"{miss_hit_q} default queries")
 
@@ -300,7 +327,7 @@ def mode_verify(args):
     # Warm, then invalidate -> a hold/tombstone marker is written. A racing populate
     # (store uses nx=True) must NOT overwrite the marker, so a stale snapshot can't
     # resurrect during the hold window.
-    resolve_cache.cache.delete(known)
+    resolve_cache.cache.delete(_snap(known))
     resolve(known)                                   # positive again
     resolve_cache.forget_host(known)                 # -> TOMBSTONE (autocommit: runs now)
     tomb_ok = classify(known) == "hold"
@@ -330,7 +357,7 @@ def mode_load(args):
 
     if args.reset:
         for d in known:
-            resolve_cache.cache.delete(d)
+            resolve_cache.cache.delete(_snap(d))
         print(f"reset: cleared {len(known)} positive entries (cold-fill test)")
     if args.warm:
         n = resolve_cache.warm(force=True)
@@ -450,6 +477,160 @@ def mode_cleanup(args):
     cleanup_bench_data()
 
 
+def mode_gate(args):
+    """Prove the gate: with WARM+GATE on and the SET built, UNKNOWN-host requests are
+    rejected with ZERO `default` queries; known hosts cold-fill once then hit.
+
+    Single-threaded on purpose — CaptureQueriesContext is authoritative per connection.
+    Forces both flags on and neutralizes the celery trigger so the proof is
+    broker-independent (production uses the real host_registry.trigger_warm)."""
+    require_redis()
+    from unittest import mock
+
+    _enable_warm_gate(gate=True)
+    dbq_unknown = dbq_known = n_unknown = n_known = leaked = 0
+    with mock.patch.object(host_registry, "trigger_warm", lambda: None):
+        known = ensure_bench_data(args.known)
+        for d in known:                                # clear create-time holds so warm can populate
+            resolve_cache.cache.delete(_snap(d))
+        n = host_registry.run_locked()                 # build treg:hosts + warm positives
+        print(f"reconcile: warmed {n} positive(s); {HOSTS_KEY} members = {get_redis_raw_client().scard(HOSTS_KEY)}")
+
+        rng = random.Random(0)
+        for i in range(args.requests):
+            if rng.random() < args.miss_ratio:
+                host = f"uniq-{i}-{rng.randint(0, 1_000_000_000)}{BENCH_DOMAIN_SUFFIX}"  # fresh unknown
+                with count_default_queries() as q:
+                    found = resolve(host)
+                dbq_unknown += len(q); n_unknown += 1
+                leaked += 1 if found else 0
+            else:
+                host = rng.choice(known)
+                with count_default_queries() as q:
+                    resolve(host)
+                dbq_known += len(q); n_known += 1
+
+        print("\n== gate result (single-threaded, CaptureQueriesContext) ==")
+        print(f"  unknown reqs : {n_unknown}  default queries = {dbq_unknown}   "
+              f"[{'PASS' if dbq_unknown == 0 else 'FAIL'} — expect 0: gate rejects without DB]")
+        print(f"  known reqs   : {n_known}  default queries = {dbq_known}   "
+              f"(cold-fill once per distinct host, then 0)")
+        print(f"  leaked unknown resolves: {leaked}  [{'PASS' if leaked == 0 else 'FAIL'} — expect 0]")
+
+        if not args.keep:
+            cleanup_bench_data()                       # inside patch: delete signals won't enqueue
+    sys.exit(0 if (dbq_unknown == 0 and leaked == 0) else 1)
+
+
+def mode_rebuild(args):
+    """Prove the cache REBUILDS on DB changes (WARM on; broker trigger neutralized):
+      * add domain    → instant member via incremental SADD (post_save signal),
+                        reconcile writes its positive snapshot;
+      * delete domain → instant non-member via incremental SREM (post_delete signal),
+                        reconcile + orphan-sweep drop the stale positive;
+      * status change → reconcile force-overwrites the cached snapshot with the new status.
+    Single-threaded; CaptureQueriesContext is authoritative per connection."""
+    require_redis()
+    from unittest import mock
+
+    _enable_warm_gate(gate=True)
+    c = get_redis_raw_client()
+    ok = True
+    with mock.patch.object(host_registry, "trigger_warm", lambda: None):
+        known = ensure_bench_data(args.known)
+        for d in known:                                    # clear create-holds so warm can populate
+            resolve_cache.cache.delete(_snap(d))
+        host_registry.run_locked()
+        base = c.scard(HOSTS_KEY)
+        ok &= _check("baseline: SET built from DB", base == len(known),
+                     f"{base} members == {len(known)} domains")
+
+        print("== change: ADD a domain ==")
+        newd = _add_bench_domain(args.known)               # index N (one past the seeded range)
+        ok &= _check("add → instant member (incremental SADD via signal)", _is_member(newd),
+                     f"member={_is_member(newd)}")
+        host_registry.run_locked()
+        ok &= _check("add → reconcile writes the positive snapshot",
+                     classify(newd) == "positive",
+                     f"state={classify(newd)}, scard={c.scard(HOSTS_KEY)}")
+
+        print("== change: DELETE a domain ==")
+        gone = known[0]
+        Domain.objects.filter(domain=gone).delete()
+        ok &= _check("delete → instant non-member (incremental SREM via signal)",
+                     not _is_member(gone), f"member={_is_member(gone)}")
+        host_registry.run_locked()
+        ok &= _check("delete → reconcile + orphan-sweep drop the stale positive",
+                     classify(gone) != "positive", f"state={classify(gone)}")
+
+        print("== change: STATUS flip (signal-bypassing-safe: reconcile force-overwrites) ==")
+        live = known[1]
+        t = Domain.objects.get(domain=live).tenant
+        t.status = Tenant.Status.DEACTIVATED
+        t.save(update_fields=["status"])
+        host_registry.run_locked()
+        snap = resolve_cache.get_snapshot(live)
+        got = getattr(snap, "status", None)
+        ok &= _check("status change → cached snapshot refreshed by reconcile",
+                     got == Tenant.Status.DEACTIVATED, f"snapshot status={got}")
+
+        print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
+        if not args.keep:
+            cleanup_bench_data()
+    sys.exit(0 if ok else 1)
+
+
+def mode_coldstart(args):
+    """Prove the COLD-START idea. With a cold Redis (no SET, no snapshots) under WARM+GATE:
+      * a valid host is STILL served (fail-open) — no cold-start outage, nobody 404'd because
+        Redis is empty; an unknown host is checked via the DB (fail-open), NOT a no-DB reject;
+      then after warm (reconcile builds the SET+snapshots) the gate is fully active:
+      * known host  → served from cache with ZERO default queries;
+      * unknown host → HARD-REJECTED with ZERO default queries.
+    Single-threaded; CaptureQueriesContext is authoritative per connection."""
+    require_redis()
+    from unittest import mock
+
+    _enable_warm_gate(gate=True)
+    c = get_redis_raw_client()
+    ok = True
+    with mock.patch.object(host_registry, "trigger_warm", lambda: None):
+        known = ensure_bench_data(args.known)
+        k = known[0]
+        c.delete(HOSTS_KEY)                                # go COLD: drop the SET ...
+        resolve_cache.forget_all()                         # ... and flush all snapshots
+        print(f"cold: EXISTS(hosts)={c.exists(HOSTS_KEY)}, snapshots={count_tres_keys()[0]}")
+
+        print("== cold phase (SET absent → fail-open, NO outage) ==")
+        with count_default_queries() as q1:
+            found_k = resolve(k)
+        ok &= _check("cold: known host STILL resolves (fail-open, not 404'd)", found_k,
+                     f"{len(q1)} default queries (a DB fill is expected here)")
+        with count_default_queries() as q2:
+            found_u = resolve(f"cold-unknown{BENCH_DOMAIN_SUFFIX}")
+        ok &= _check("cold: unknown host checked via DB (fail-open, not a no-DB hard reject)",
+                     (not found_u) and len(q2) >= 1, f"{len(q2)} default queries")
+
+        print("== warm (reconcile builds SET + snapshots) ==")
+        n = host_registry.run_locked()
+        print(f"warm: {c.scard(HOSTS_KEY)} SET members, {n} positive(s)")
+
+        print("== warm phase (gate active) ==")
+        with count_default_queries() as q3:
+            found_k2 = resolve(k)
+        ok &= _check("warm: known host served from cache, ZERO default queries",
+                     found_k2 and len(q3) == 0, f"{len(q3)} default queries")
+        with count_default_queries() as q4:                # fresh unknown → no negative cached
+            found_u2 = resolve(f"warm-unknown{BENCH_DOMAIN_SUFFIX}")
+        ok &= _check("warm: unknown host HARD-REJECTED with ZERO default queries",
+                     (not found_u2) and len(q4) == 0, f"{len(q4)} default queries")
+
+        print("\nRESULT:", "ALL PASS" if ok else "FAILURES ABOVE")
+        if not args.keep:
+            cleanup_bench_data()
+    sys.exit(0 if ok else 1)
+
+
 # --- CLI --------------------------------------------------------------------
 def build_parser():
     p = argparse.ArgumentParser(description="Tenant-resolution cache verifier + load tester")
@@ -484,6 +665,23 @@ def build_parser():
 
     pc = sub.add_parser("cleanup", help="Delete all bench data + forget cached hosts")
     pc.set_defaults(func=mode_cleanup)
+
+    pg = sub.add_parser("gate", help="Prove GATE: unknown hosts rejected with ZERO default queries")
+    pg.add_argument("--known", type=int, default=50, help="Distinct known (member) hosts")
+    pg.add_argument("--requests", type=int, default=500, help="Total requests")
+    pg.add_argument("--miss-ratio", type=float, default=0.5, help="Fraction of unknown-host requests")
+    pg.add_argument("--keep", action="store_true", help="Do not delete bench data after")
+    pg.set_defaults(func=mode_gate)
+
+    pr = sub.add_parser("rebuild", help="Prove the cache rebuilds on DB add/delete/status changes")
+    pr.add_argument("--known", type=int, default=5, help="Bench domains to seed")
+    pr.add_argument("--keep", action="store_true", help="Do not delete bench data after")
+    pr.set_defaults(func=mode_rebuild)
+
+    pcs = sub.add_parser("coldstart", help="Prove cold-start: fail-open (no outage) then gate-active after warm")
+    pcs.add_argument("--known", type=int, default=5, help="Bench domains to seed")
+    pcs.add_argument("--keep", action="store_true", help="Do not delete bench data after")
+    pcs.set_defaults(func=mode_coldstart)
     return p
 
 

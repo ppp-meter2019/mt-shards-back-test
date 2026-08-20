@@ -21,7 +21,7 @@ from django_tenants.utils import schema_exists
 
 from tenants.celery.change_marker import bump_schema
 from tenants.models import Tenant
-from tenants.resolve_cache import resolve_cache
+from tenants.resolver import resolve_cache
 
 
 @dataclass

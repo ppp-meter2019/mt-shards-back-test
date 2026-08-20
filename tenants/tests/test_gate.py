@@ -9,6 +9,7 @@ from django.test import RequestFactory, SimpleTestCase
 
 import tenants.middleware as mw
 from tenants.models import Tenant
+from tenants.resolver import resolve_cache
 
 S = Tenant.Status
 
@@ -138,6 +139,6 @@ class TenantResolutionErrorTests(SimpleTestCase):
 
         # enabled is True from settings; get_snapshot raising OperationalError must be
         # re-raised (surface for the 500 handler), NOT swallowed / retried against the DB.
-        with mock.patch.object(mw.resolve_cache, "get_snapshot", side_effect=OperationalError("down")):
+        with mock.patch.object(resolve_cache, "get_snapshot", side_effect=OperationalError("down")):
             with self.assertRaises(OperationalError):
                 m.get_tenant(FakeDomain, "h")

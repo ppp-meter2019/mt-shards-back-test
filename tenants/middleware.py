@@ -5,7 +5,7 @@ must be set on the same connection/thread the ORM later uses):
 
   A. ShardAwareTenantMiddleware - resolves the tenant from the Host (+ its shard in one
      query), sets request.tenant + the schema on the DEFAULT connection, gates on
-     status, and delegates host->Tenant caching to tenants.resolve_cache. The cache is
+     status, and delegates host->Tenant caching to tenants.resolver. The cache is
      an optimization: any cache-layer failure degrades to a plain DB resolve.
 
   B. TenantShardRoutingMiddleware - reads request.tenant, points the router at the
@@ -13,6 +13,8 @@ must be set on the same connection/thread the ORM later uses):
      Must be listed AFTER ShardAwareTenantMiddleware.
 """
 import logging
+
+import psycopg
 
 from django.db import OperationalError, connections
 from django.http import Http404, HttpResponse
@@ -22,7 +24,7 @@ from django_tenants.utils import get_public_schema_name
 from .context import current_db
 from .errors import error_response
 from .models import Tenant
-from .resolve_cache import resolve_cache
+from .resolver import resolve as resolve_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +54,11 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
                 detail="No workspace found for this address.",
                 template="tenants/errors/not_found.html",
             )
-        except OperationalError:
+        except (OperationalError, psycopg.OperationalError):
             # DB unreachable during resolution — branded 500 instead of a raw 500.
+            # psycopg.OperationalError is caught too: django-tenants runs `SET search_path`
+            # on a RAW psycopg cursor, so a pool/proxy borrow-timeout can escape UNWRAPPED
+            # (not as django.db.OperationalError) from the schema-set step outside get_tenant.
             logger.error("tenant resolution DB error: path=%s", request.path, exc_info=True)
             return error_response(
                 request, status=500, code="database_error",
@@ -96,45 +101,31 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
         return None
 
     def get_tenant(self, domain_model, hostname):
-        if not resolve_cache.enabled:
-            return self._resolve_tenant(domain_model, hostname)
-        # The cache is an optimization: ANY cache-layer failure (a non-redis backend
-        # rejecting nx=True, a corrupt/unpicklable entry, ...) must degrade to a plain
-        # DB resolve, never 500 this per-request path. DoesNotExist is a real answer
-        # ("no tenant for this host"), so it is propagated, not treated as a failure.
-        try:
-            return self._get_tenant_cached(domain_model, hostname)
-        except domain_model.DoesNotExist:
-            raise
-        except OperationalError:
-            raise   # DB down — surface for the 500 handler; don't retry a dead DB
-        except Exception:
-            logger.warning("tenant_resolve cache path failed for %r; falling back to DB",
-                           hostname, exc_info=True)
-            return self._resolve_tenant(domain_model, hostname)
-
-    def _get_tenant_cached(self, domain_model, hostname):
-        snap = resolve_cache.get_snapshot(hostname)
-        if snap is resolve_cache.NEG:
-            raise domain_model.DoesNotExist(hostname)   # cached miss — no DB hit
-        if snap is not resolve_cache.MISS:
-            return snap                                  # reconstructed Tenant (read_only)
-        try:
-            tenant = self._resolve_tenant(domain_model, hostname)
-        except domain_model.DoesNotExist:
-            resolve_cache.store_miss(hostname)
-            raise
-        resolve_cache.store(hostname, tenant)
-        return tenant
+        # All resolve policy (cache, gate, fill_cap, coalescing, fail-open) lives in the
+        # resolver service facade. The middleware only supplies the DB-resolver closure
+        # (_resolve_tenant — the authoritative lookup) and the "not found" exception.
+        return resolve_tenant(
+            hostname,
+            lambda: self._resolve_tenant(domain_model, hostname),
+            domain_model.DoesNotExist,
+        )
 
     @staticmethod
     def _resolve_tenant(domain_model, hostname):
-        tenant = (
-            domain_model.objects
-            .select_related("tenant__shard")
-            .get(domain=hostname)
-            .tenant
-        )
+        try:
+            tenant = (
+                domain_model.objects
+                .select_related("tenant__shard")
+                .get(domain=hostname)
+                .tenant
+            )
+        except psycopg.OperationalError as exc:
+            # django-tenants sets search_path on a RAW psycopg cursor, so a DB/pool error
+            # (e.g. a pool / RDS-Proxy borrow-timeout: psycopg ConnectionException) escapes
+            # UNWRAPPED here — NOT as django.db.OperationalError. Normalize it so get_tenant
+            # surfaces it as a DB outage (branded 5xx via process_request) instead of
+            # mislabeling it a cache failure and retrying a dead DB.
+            raise OperationalError(str(exc)) from exc
         # request.tenant is a read-only routing snapshot, uniformly — whether resolved
         # fresh (here) or rebuilt from cache. Refuse save()/delete() either way so
         # behavior never depends on cache state (miss vs hit).
