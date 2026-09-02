@@ -10,7 +10,6 @@ from django.conf import settings
 from django.db import connections
 from django_tenants.routers import TenantSyncRouter
 from django_tenants.utils import (
-    get_multi_type_database_field_name,
     get_public_schema_name,
     get_tenant_types,
     has_multi_type_tenants,
@@ -28,8 +27,19 @@ class TenantDatabaseRouter(TenantSyncRouter):
         if (self.app_in_list(label, settings.SHARED_APPS)
                 and not self.app_in_list(label, settings.TENANT_APPS)):
             return "default"
-        # Otherwise use the alias set by TenantShardRoutingMiddleware (or use_alias in a shell).
-        return current_db.get()
+        # Otherwise use the alias set by TenantShardRoutingMiddleware / tenant_context / use_alias.
+        alias = current_db.get()
+        if alias is None:                         # NO routing context established
+            if label in getattr(settings, "TENANT_STRICT_ROUTE_APPS", frozenset()):
+                raise RuntimeError(
+                    f"{model._meta.label}: tenant-model query with NO routing context "
+                    f"(current_db unset) — it would silently hit the DEFAULT database (wrong "
+                    f"shard). Establish a context: tenant_context(tenant) / use_alias(alias), run "
+                    f"the command via `manage.py tenant_command <cmd> --schema=<schema>`, or (on "
+                    f"the request path) ensure TenantShardRoutingMiddleware ran."
+                )
+            return "default"                      # quasi-shared (contenttypes/auth/admin) — benign
+        return alias
 
     def db_for_write(self, model, **hints):
         return self.db_for_read(model, **hints)

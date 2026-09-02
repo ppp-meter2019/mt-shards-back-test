@@ -1,50 +1,39 @@
-"""CeleryApp + prerun/postrun schema switch — multi-DB adaptation of
+"""CeleryApp + per-invocation schema switch — multi-DB adaptation of
 tenant_schemas_celery.app.
 
-Upstream sets the same schema on a fixed list of databases. We resolve the
-tenant's SHARD from the schema and enter our shard-aware tenant_context (which
-sets current_db -> the shard AND the schema on that shard's connection), then
-exit it after the task. The context manager is stored on the task instance,
-which is a singleton per prefork worker process — safe because one task runs
-at a time there.
+Each task enters its tenant's SHARD + schema inside TenantTask.__call__ (a with-block that
+sets current_db -> the shard AND the schema on that shard's connection); the context
+manager's finally restores BOTH when the task returns or raises. Doing it per invocation —
+not via task_prerun/postrun signals, which have no shared finally and stashed the context
+manager on the task singleton — makes restore crash-safe and pool-safe.
+
+Guardrail: refuse cooperative worker pools (gevent/eventlet). The current_db ContextVar
+routing assumes NON-cooperative concurrency (prefork/solo/threads — each task in its own
+process or thread-context); under a cooperative pool, greenlets share one context and can
+cross tenant schemas.
 """
 from celery import Celery
-from celery.signals import task_prerun, task_postrun
+from celery.signals import celeryd_init
+from django.core.exceptions import ImproperlyConfigured
 
-from .compat import get_public_schema_name, tenant_context
 from .task import headers_with_schema
 
-
-def _schema_from_request(task):
-    """Read _schema_name from the task message (headers, or merged request)."""
-    req = task.request
-    if req.headers and "_schema_name" in req.headers:    # Redis broker merges headers
-        return req.headers.get("_schema_name")
-    return req.get("_schema_name")
+_UNSAFE_POOLS = {"gevent", "eventlet"}
 
 
-def switch_schema(task, **kw):
-    """task_prerun: enter the tenant's shard + schema for the task's duration."""
-    schema = _schema_from_request(task) or get_public_schema_name()
-    if schema == get_public_schema_name():
-        task._tenant_cm = None                           # public/management → default.public
-        return
-    tenant = task.get_tenant_for_schema(schema)
-    cm = tenant_context(tenant)                          # shard-aware: current_db + shard schema
-    cm.__enter__()
-    task._tenant_cm = cm
-
-
-def restore_schema(task, **kw):
-    """task_postrun: leave the tenant context (restores current_db + shard conn)."""
-    cm = getattr(task, "_tenant_cm", None)
-    if cm is not None:
-        cm.__exit__(None, None, None)
-        task._tenant_cm = None
-
-
-task_prerun.connect(switch_schema, sender=None, dispatch_uid="tenants_switch_schema")
-task_postrun.connect(restore_schema, sender=None, dispatch_uid="tenants_restore_schema")
+@celeryd_init.connect
+def _guard_worker_pool(sender=None, instance=None, conf=None, options=None, **_):
+    """Fail LOUD at worker start if the pool is cooperative — silent tenant crossover is a
+    far worse outcome than a refused boot."""
+    pool = (options or {}).get("pool") or getattr(conf, "worker_pool", None) or "prefork"
+    if pool in _UNSAFE_POOLS:
+        raise ImproperlyConfigured(
+            f"Celery worker pool {pool!r} is unsafe for this project: tenant routing uses a "
+            f"`current_db` ContextVar + a per-task schema switch that require non-cooperative "
+            f"concurrency (prefork/solo/threads — each task in its own process or thread "
+            f"context). Under {pool}, greenlets share one context and can cross tenant "
+            f"schemas. Run with --pool=prefork (the project default)."
+        )
 
 
 class CeleryApp(Celery):

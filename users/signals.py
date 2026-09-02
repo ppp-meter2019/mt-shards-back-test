@@ -24,5 +24,10 @@ def stamp_tenant_schema(sender, request, user, **kwargs):
     bypasses auth.login() must set session["schema"] itself, or the guard will
     reject those sessions. See users/middleware.py.
     """
-    if request is not None and hasattr(request, "session"):
-        request.session["schema"] = connection.schema_name
+    # connection.schema_name is injected by the django_tenants backend (MT only);
+    # on the plain PostGIS backend (standalone) it does not exist. Read defensively
+    # so this login receiver is a no-op in standalone — there is no tenant to bind
+    # a session to, and SchemaBoundSessionMiddleware is not wired there either.
+    schema = getattr(connection, "schema_name", None)
+    if schema is not None and request is not None and hasattr(request, "session"):
+        request.session["schema"] = schema

@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import connection
 from rest_framework.permissions import SAFE_METHODS, BasePermission
 
@@ -5,8 +6,17 @@ from .models import User
 
 
 def _on_tenant(request) -> bool:
-    """True iff this request is being served by a tenant schema (not public)."""
-    return connection.schema_name != "public"
+    """True iff this request may access tenant business data.
+
+    MT: the request must be served by a tenant schema (not public).
+    Standalone: there is no public/tenant split — the single DB *is* the tenant —
+    so this is always satisfied. (connection.schema_name is injected by the
+    django_tenants backend and does NOT exist on the plain PostGIS backend, hence
+    the getattr guard rather than a bare attribute read.)
+    """
+    if not settings.USE_MULTITENANT:
+        return True
+    return getattr(connection, "schema_name", "public") != "public"
 
 
 class IsCompanyAdmin(BasePermission):

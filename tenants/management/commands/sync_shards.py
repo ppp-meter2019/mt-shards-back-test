@@ -1,12 +1,12 @@
 """Bootstrap helper: create Shard rows for aliases declared in settings.DATABASES."""
 
 from django.conf import settings
-from django.core.management.base import BaseCommand
+from commons.platform.commands import TenantCommand
 
 from tenants.models import Shard
 
 
-class Command(BaseCommand):
+class Command(TenantCommand):
     help = "Create Shard rows for any settings.DATABASES aliases that aren't yet registered."
 
     def add_arguments(self, parser):

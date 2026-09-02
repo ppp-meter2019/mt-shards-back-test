@@ -1,7 +1,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 
-from tenants.admin import public_admin_site
+from commons.platform.admin import management_site
 
 from .models import User
 
@@ -17,7 +17,10 @@ class UserAdmin(DjangoUserAdmin):
     list_filter = DjangoUserAdmin.list_filter + ("role",)
 
 
-# Each schema has its own auth_user table, so User must be manageable on
-# both admin sites.
+# Default site: the single admin in standalone; the per-tenant admin in multitenant
+# (each schema has its own auth_user table).
 admin.site.register(User, UserAdmin)
-public_admin_site.register(User, UserAdmin)
+# Management (public-host) site — multitenant only; None in standalone.
+_mgmt_site = management_site()
+if _mgmt_site is not None:
+    _mgmt_site.register(User, UserAdmin)

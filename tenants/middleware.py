@@ -16,7 +16,7 @@ import logging
 
 import psycopg
 
-from django.db import OperationalError, connections
+from django.db import InterfaceError, OperationalError, connections
 from django.http import Http404, HttpResponse
 from django_tenants.middleware.main import TenantMainMiddleware
 from django_tenants.utils import get_public_schema_name
@@ -54,11 +54,14 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
                 detail="No workspace found for this address.",
                 template="tenants/errors/not_found.html",
             )
-        except (OperationalError, psycopg.OperationalError):
+        except (OperationalError, InterfaceError,
+                psycopg.OperationalError, psycopg.InterfaceError):
             # DB unreachable during resolution — branded 500 instead of a raw 500.
-            # psycopg.OperationalError is caught too: django-tenants runs `SET search_path`
-            # on a RAW psycopg cursor, so a pool/proxy borrow-timeout can escape UNWRAPPED
-            # (not as django.db.OperationalError) from the schema-set step outside get_tenant.
+            # psycopg.* is caught too: django-tenants runs `SET search_path` on a RAW psycopg
+            # cursor, so a pool/proxy borrow-timeout can escape UNWRAPPED (not as a django.db.*
+            # error) from the schema-set step outside get_tenant. InterfaceError covers a
+            # closed/broken connection (a stale pool/proxy borrow) — psycopg raises it as a
+            # SIBLING of OperationalError (not a subclass), so it must be listed explicitly.
             logger.error("tenant resolution DB error: path=%s", request.path, exc_info=True)
             return error_response(
                 request, status=500, code="database_error",
@@ -119,12 +122,13 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
                 .get(domain=hostname)
                 .tenant
             )
-        except psycopg.OperationalError as exc:
+        except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
             # django-tenants sets search_path on a RAW psycopg cursor, so a DB/pool error
-            # (e.g. a pool / RDS-Proxy borrow-timeout: psycopg ConnectionException) escapes
-            # UNWRAPPED here — NOT as django.db.OperationalError. Normalize it so get_tenant
-            # surfaces it as a DB outage (branded 5xx via process_request) instead of
-            # mislabeling it a cache failure and retrying a dead DB.
+            # (a pool / RDS-Proxy borrow-timeout: psycopg ConnectionException; or a
+            # closed/broken connection: psycopg.InterfaceError) escapes UNWRAPPED here — NOT as
+            # a django.db.* error. Normalize it so get_tenant surfaces it as a DB outage
+            # (branded 5xx via process_request) instead of mislabeling it a cache failure and
+            # retrying a dead DB.
             raise OperationalError(str(exc)) from exc
         # request.tenant is a read-only routing snapshot, uniformly — whether resolved
         # fresh (here) or rebuilt from cache. Refuse save()/delete() either way so

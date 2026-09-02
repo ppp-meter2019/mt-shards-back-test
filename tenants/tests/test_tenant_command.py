@@ -1,0 +1,67 @@
+"""Shard-aware tenant_command override — runs the wrapped sub-command inside tenant_context,
+so its ORM routes to the tenant's SHARD (current_db), not the default DB. DB-free: tenant
+resolution is mocked and `connections` is faked (like test_context)."""
+import types
+from unittest import mock
+
+from django.test import SimpleTestCase
+
+from tenants.context import current_db
+
+
+class _FakeConn:
+    def __init__(self):
+        self.tenant = None
+
+    def set_tenant(self, t):
+        self.tenant = t
+
+    def set_schema(self, name):
+        pass
+
+    def set_schema_to_public(self):
+        self.tenant = None
+
+
+def _tenant(alias, schema="acme"):
+    return types.SimpleNamespace(shard=types.SimpleNamespace(alias=alias), schema_name=schema)
+
+
+class TenantCommandShardTests(SimpleTestCase):
+    def test_handle_runs_subcommand_on_the_shard(self):
+        from tenants.management.commands import tenant_command as tc
+        seen = {}
+        t = _tenant("shard_7")
+
+        def spy(name, *a, **kw):
+            seen["db"] = current_db.get()          # where the sub-command's ORM would route
+            seen["name"] = name
+
+        cmd = tc.Command()
+        with mock.patch.object(tc.Command, "get_tenant_from_options_or_interactive", return_value=t), \
+             mock.patch.object(tc, "call_command", side_effect=spy), \
+             mock.patch("tenants.context.connections", {"shard_7": _FakeConn()}):
+            cmd.handle(command_name=["seed_products"], command_options=[])
+
+        self.assertEqual(seen["name"], "seed_products")
+        self.assertEqual(seen["db"], "shard_7")        # routed to the tenant's shard, not default
+        self.assertIsNone(current_db.get())            # restored to unset after the command
+
+    def test_run_from_argv_wraps_in_tenant_context(self):
+        from tenants.management.commands import tenant_command as tc
+        seen = {}
+        t = _tenant("shard_9", schema="beta")
+
+        class _Klass:
+            def run_from_argv(self, args):
+                seen["db"] = current_db.get()
+
+        cmd = tc.Command()
+        with mock.patch.object(tc, "get_commands", return_value={"seed_products": "products"}), \
+             mock.patch.object(tc, "load_command_class", return_value=_Klass()), \
+             mock.patch.object(tc.Command, "get_tenant_from_options_or_interactive", return_value=t), \
+             mock.patch("tenants.context.connections", {"shard_9": _FakeConn()}):
+            cmd.run_from_argv(["manage.py", "tenant_command", "seed_products", "--schema=beta"])
+
+        self.assertEqual(seen["db"], "shard_9")
+        self.assertIsNone(current_db.get())

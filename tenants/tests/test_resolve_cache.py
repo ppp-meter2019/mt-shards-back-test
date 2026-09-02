@@ -114,6 +114,34 @@ class ResolveCacheTests(SimpleTestCase):
                 self.mw.get_tenant(FakeDomain, "known")
         self.assertEqual(calls["n"], 1)                      # surfaced once, NOT retried
 
+    def test_raw_psycopg_interface_error_normalized_not_retried(self):
+        # A closed/broken raw-cursor connection escapes as psycopg.InterfaceError — a SIBLING
+        # of psycopg.OperationalError, not a subclass — so it must be normalized on its own.
+        # Same contract: surfaced as a django DB outage, once, not retried.
+        import psycopg
+        from django.db import OperationalError
+
+        calls = {"n": 0}
+
+        class _Objects:
+            @classmethod
+            def select_related(cls, *a):
+                return cls
+
+            @classmethod
+            def get(cls, domain=None):
+                calls["n"] += 1
+                raise psycopg.InterfaceError("connection already closed")
+
+        class FakeDomain:
+            DoesNotExist = type("DoesNotExist", (Exception,), {})
+            objects = _Objects
+
+        with use_resolve_cache(FakeNxCache()):
+            with self.assertRaises(OperationalError):        # normalized, not raw psycopg
+                self.mw.get_tenant(FakeDomain, "known")
+        self.assertEqual(calls["n"], 1)                      # surfaced once, NOT retried
+
     def test_dump_load_round_trip_fidelity(self):
         r = TenantResolveCache.load(TenantResolveCache.dump(make_tenant()))
         self.assertEqual(r.schema_name, "alpha")
@@ -148,7 +176,8 @@ class SweepOrphansTests(SimpleTestCase):
             K("hold.com"): TOMBSTONE,                      # hold marker → leave
         })
         with mock.patch.object(rc, "iter_snapshot_hosts",
-                               return_value=iter(["keep.com", "gone.com", "neg.com", "hold.com"])):
+                               return_value=iter(["keep.com", "gone.com", "neg.com", "hold.com"])), \
+             mock.patch.object(rc, "iter_snapshot_schemas", return_value=iter([])):
             n = rc.sweep_orphans(valid_hosts={"keep.com"})
         self.assertEqual(n, 1)
         self.assertEqual(rc.cache.deleted, [K("gone.com")])   # only the orphan POSITIVE

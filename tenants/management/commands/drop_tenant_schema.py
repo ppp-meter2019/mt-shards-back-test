@@ -19,7 +19,9 @@ owns tenant schemas, so it may drop them).
 import re
 
 from django.conf import settings
-from django.core.management.base import BaseCommand, CommandError
+from django.core.management.base import CommandError
+
+from commons.platform.commands import TenantCommand
 from django.db import connections
 from django_tenants.utils import get_public_schema_name
 
@@ -28,7 +30,7 @@ from tenants.models import Tenant
 _SCHEMA_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
-class Command(BaseCommand):
+class Command(TenantCommand):
     help = "Drop an orphaned tenant schema on a given shard."
 
     def add_arguments(self, parser):

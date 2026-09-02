@@ -28,6 +28,7 @@ class TenantResolveCache:
     # get_snapshot() result sentinels (distinct from the string markers in the cache)
     MISS = object()
     NEG = object()
+    HOLD = object()   # get_schema_snapshot only: an active invalidation tombstone (worker → DB)
 
     # Logical sub-namespace for per-host snapshot keys: physical key is
     # `<KEY_PREFIX>:<version>:host-snap:<host>` (e.g. tres:1:host-snap:<host>). Keeping
@@ -36,6 +37,11 @@ class TenantResolveCache:
     # prefix) or via the raw client (the gate's treg:* keys) is structurally excluded, so it
     # can never be mistaken for a host and swept. All host↔key mapping goes through _snap_key().
     _SNAP_PREFIX = "host-snap:"
+    # Parallel sub-namespace for SCHEMA-keyed snapshots (`schema-snap:<schema>`), the stable
+    # per-tenant routing key used by the worker path. Same VALUE as a host snapshot (dump/load);
+    # only the KEY differs. Kept in lockstep with host-snap by every tenant-scoped mutation
+    # (see _keys_for + the forget_* family). Structurally distinct from the gate's `treg:*`.
+    _SCHEMA_PREFIX = "schema-snap:"
 
     def __init__(self, cache=None):
         self._cache = cache            # DI for tests; else resolved lazily
@@ -144,6 +150,18 @@ class TenantResolveCache:
         maps a hostname to its cache key; callers pass/receive bare hostnames."""
         return f"{self._SNAP_PREFIX}{hostname}"
 
+    def _schema_snap_key(self, schema):
+        """Logical cache key for a SCHEMA snapshot (schema → 'schema-snap:<schema>')."""
+        return f"{self._SCHEMA_PREFIX}{schema}"
+
+    def _keys_for(self, tenant):
+        """ALL snapshot keys a tenant owns: one host-snap per domain + its single schema-snap.
+        The single source of truth for a tenant's cache identity — every tenant-scoped mutation
+        flows through this so the two namespaces cannot drift."""
+        keys = [self._snap_key(h) for h in tenant.domains.values_list("domain", flat=True)]
+        keys.append(self._schema_snap_key(tenant.schema_name))
+        return keys
+
     # ---- value classification (single source: what a raw cached value is) ----
     class _Kind:
         POSITIVE = "positive"   # a real snapshot payload (dict)
@@ -174,26 +192,42 @@ class TenantResolveCache:
             return self.NEG
         return self.MISS                          # MISS / HOLD / UNKNOWN → treat as a miss
 
+    def get_schema_snapshot(self, schema):
+        """Worker-path read (schema-keyed). POSITIVE reconstructed Tenant | HOLD (an active
+        invalidation tombstone) | MISS (absent OR Redis-down). HOLD is kept DISTINCT from MISS
+        so the worker bypasses its stale local cache on a fresh invalidation and re-resolves
+        from the DB. No NEG: schema-snap is positive-only (a trusted internal schema is never
+        negative-cached)."""
+        cached = self.cache.get(self._schema_snap_key(schema))
+        kind = self._classify(cached)
+        if kind is self._Kind.POSITIVE:
+            return self.load(cached)
+        if kind is self._Kind.HOLD:
+            return self.HOLD
+        return self.MISS                          # absent / Redis-down / (corrupt) → miss
+
     def _ttl_for(self, tenant, warm):
         """Positive-snapshot TTL for a tenant: ttl_by_status under WARM, else flat _pos_ttl."""
         return self.ttl_for_status(tenant.status) if warm else self._pos_ttl
 
     def put(self, hostname, tenant):
-        """Single-item resolve-path writer (nx): write only if absent, so a hold marker
-        (tombstone) is never overwritten and a slow resolver can't resurrect stale data.
-        Returns True if it wrote. TTL: ttl_by_status under WARM (ACTIVE→None=no expiry),
-        else flat _pos_ttl; a no-op when positive caching is off (legacy _pos_ttl=0, WARM
-        off). The reconcile path uses put_many() (batched force-overwrite)."""
+        """Resolve-path fill (nx) — the FRONT's warmer. Writes BOTH the host-snap AND the
+        tenant's schema-snap (lockstep with the forget_* invalidation), so any front resolve
+        also warms the worker's schema-keyed cache — including re-warming a just-recovered
+        cache. The WORKER never writes here (it is a pure consumer); the shared cache's only
+        writers are this resolve path and reconcile (put_many / put_schema_many).
+
+        nx: a hold (tombstone) is never overwritten and a slow resolver can't resurrect stale
+        data. TTL: ttl_by_status under WARM (ACTIVE→None=no expiry) else flat _pos_ttl; a no-op
+        when positive caching is off (legacy _pos_ttl=0, WARM off)."""
         warm = self.warm_enabled
         if not warm and not self._pos_ttl:
             return False
-        self.cache.set(self._snap_key(hostname), self.dump(tenant),
-                       self._ttl_for(tenant, warm), nx=True)
+        ttl = self._ttl_for(tenant, warm)
+        payload = self.dump(tenant)
+        self.cache.set(self._snap_key(hostname), payload, ttl, nx=True)
+        self.cache.set(self._schema_snap_key(tenant.schema_name), payload, ttl, nx=True)
         return True
-
-    def store(self, hostname, tenant):
-        """Resolve-path fill (nx). Thin alias over put() — kept for existing callers."""
-        self.put(hostname, tenant)
 
     def put_many(self, items):
         """Batched FORCE-write of positive snapshots — the reconcile path. `items` is an
@@ -218,19 +252,36 @@ class TenantResolveCache:
             n += len(batch)
         return n
 
+    def put_schema_many(self, tenants):
+        """Batched FORCE-write of schema-snap positives — the reconcile path's schema-keyed
+        sibling of put_many(). `tenants` is an iterable of Tenant (deduped by schema upstream).
+        Groups by TTL, one set_many each; returns the count written. No-op when positive
+        caching is off."""
+        warm = self.warm_enabled
+        if not warm and not self._pos_ttl:
+            return 0
+        by_ttl = {}
+        for t in tenants:
+            by_ttl.setdefault(self._ttl_for(t, warm), {})[self._schema_snap_key(t.schema_name)] = self.dump(t)
+        n = 0
+        for ttl, batch in by_ttl.items():
+            self.cache.set_many(batch, ttl)
+            n += len(batch)
+        return n
+
     def store_miss(self, hostname):
         if self._neg_ttl:
             self.cache.set(self._snap_key(hostname), NEGATIVE, self._neg_ttl, nx=True)
 
-    # ---- invalidation ----
-    def forget_hosts(self, hostnames, *, raise_on_error=False):
-        self._ensure_alive(raise_on_error)   # checked first — honored even for an empty target
-        hostnames = [h for h in hostnames if h]
-        if not hostnames:
+    # ---- invalidation (host-snap AND schema-snap kept in lockstep) ----
+    def _tombstone_keys(self, keys):
+        """The ONE low-level invalidation primitive: deferred (on_commit) TOMBSTONE — or
+        delete when hold is disabled — of an explicit key list. `keys` may freely mix host-snap
+        and schema-snap keys, so both namespaces drop together. Returns the key count."""
+        keys = [k for k in keys if k]
+        if not keys:
             return 0
         cache, hold = self.cache, self._hold
-
-        keys = [self._snap_key(h) for h in hostnames]
 
         def _invalidate():
             if hold:
@@ -239,44 +290,61 @@ class TenantResolveCache:
                 cache.delete_many(keys)                              # hold disabled
 
         transaction.on_commit(_invalidate)
-        return len(hostnames)
+        return len(keys)
+
+    def forget_hosts(self, hostnames, *, schemas=None, raise_on_error=False):
+        """Invalidate hosts AND the schema-snap of their tenants. `schemas` are dropped
+        explicitly (reliable — the caller knew the tenant). For bare-host callers that pass no
+        schema (Domain signals, the tenant-delete cascade) the schema is derived BEST-EFFORT
+        from each host's cached snapshot; a cold/absent host snapshot leaves its schema-snap to
+        the Tenant post_delete receiver (delete) or the reconcile orphan-sweep."""
+        self._ensure_alive(raise_on_error)   # checked first — honored even for an empty target
+        hostnames = [h for h in hostnames if h]
+        schemas = {s for s in (schemas or ()) if s}
+        host_keys = [self._snap_key(h) for h in hostnames]
+        if hostnames:                                            # best-effort schema derive
+            for v in self.cache.get_many(host_keys).values():
+                if self._classify(v) is self._Kind.POSITIVE:
+                    schemas.add(v["tenant"]["schema_name"])
+        return self._tombstone_keys(host_keys + [self._schema_snap_key(s) for s in schemas])
 
     def forget_host(self, hostname, *, raise_on_error=False):
         return self.forget_hosts([hostname], raise_on_error=raise_on_error)
 
     def forget_tenant(self, tenant, *, raise_on_error=False):
-        return self.forget_hosts(tenant.domains.values_list("domain", flat=True),
-                          raise_on_error=raise_on_error)
+        # Tenant known → drop its FULL key set (_keys_for): every domain's host-snap + its
+        # schema-snap. Schema is reliable here — no cache-derive needed.
+        self._ensure_alive(raise_on_error)
+        return self._tombstone_keys(self._keys_for(tenant))
 
     def forget_tenants(self, tenants, *, raise_on_error=False):
         from tenants.models import Domain
-        return self.forget_hosts(
-            Domain.objects.filter(tenant__in=tenants).values_list("domain", flat=True),
-            raise_on_error=raise_on_error,
-        )
+        tenants = list(tenants)
+        schemas = {t.schema_name for t in tenants}
+        hosts = Domain.objects.filter(tenant__in=tenants).values_list("domain", flat=True)
+        return self.forget_hosts(hosts, schemas=schemas, raise_on_error=raise_on_error)
 
     def forget_ids(self, ids, *, raise_on_error=False):
-        from tenants.models import Domain
-        return self.forget_hosts(
-            Domain.objects.filter(tenant_id__in=ids).values_list("domain", flat=True),
-            raise_on_error=raise_on_error,
-        )
+        # Schema from Tenant (covers a tenant with ZERO domains); hosts from Domain.
+        from tenants.models import Domain, Tenant
+        schemas = set(Tenant.objects.filter(id__in=ids).values_list("schema_name", flat=True))
+        hosts = Domain.objects.filter(tenant_id__in=ids).values_list("domain", flat=True)
+        return self.forget_hosts(hosts, schemas=schemas, raise_on_error=raise_on_error)
 
     def forget_schemas(self, schemas, *, raise_on_error=False):
         # Identify tenants by schema_name (the real identifier) — NOT by the human
-        # company_name, which is a display label only.
+        # company_name, which is a display label only. schemas are KNOWN → the schema-snap drop
+        # is reliable; hosts are looked up to also drop their host-snaps.
         from tenants.models import Domain
-        return self.forget_hosts(
-            Domain.objects.filter(tenant__schema_name__in=schemas).values_list("domain", flat=True),
-            raise_on_error=raise_on_error,
-        )
+        schemas = set(schemas)
+        hosts = Domain.objects.filter(tenant__schema_name__in=schemas).values_list("domain", flat=True)
+        return self.forget_hosts(hosts, schemas=schemas, raise_on_error=raise_on_error)
 
     def forget_all(self, *, raise_on_error=False):
-        """Delete every tenant_resolve snapshot / negative / tombstone via prefix-scoped
-        delete_pattern over `<prefix>:<version>:host-snap:*` (NOT flushdb) — the host-snapshot
-        sub-namespace only. The gate's structural keys live under the DISTINCT `treg:*`
-        prefix, and any future service key under another logical prefix is outside `host-snap:*`,
-        so they are NOT in this namespace and SURVIVE — including any in-flight reconcile lock.
+        """Delete every snapshot — BOTH `host-snap:*` and `schema-snap:*` — via prefix-scoped
+        delete_pattern (NOT flushdb). The gate's structural keys live under the DISTINCT `treg:*`
+        prefix, and any future service key under another logical prefix is outside both snapshot
+        sub-namespaces, so they SURVIVE — including any in-flight reconcile lock.
 
         ⚠ Under the GATE stage this alone is DANGEROUS: `treg:hosts` survives, so every
         subsequent miss is an UNCAPPED member cold-fill → a thundering herd on `default`
@@ -285,8 +353,9 @@ class TenantResolveCache:
         no herd, no gap). The invalidate_resolve_cache --all command already routes to
         reconcile when WARM is on. See deploy/resolve_gate_design.md."""
         self._ensure_alive(raise_on_error)
-        # scoped to the host-snapshot sub-namespace `<prefix>:<version>:host-snap:*` — NOT flushdb
-        return self.cache.delete_pattern(f"{self._SNAP_PREFIX}*") or 0
+        n = self.cache.delete_pattern(f"{self._SNAP_PREFIX}*") or 0
+        n += self.cache.delete_pattern(f"{self._SCHEMA_PREFIX}*") or 0
+        return n
 
     # ---- snapshot-namespace introspection (owns the django_redis key layout) ----
     def _snapshot_key_prefix(self):
@@ -305,34 +374,49 @@ class TenantResolveCache:
             key = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
             yield key[len(physical):]
 
+    def iter_snapshot_schemas(self):
+        """Yield the logical schema_name of every schema-snap key currently in the cache, via
+        SCAN of the `schema-snap:` sub-namespace ONLY. Sibling of iter_snapshot_hosts()."""
+        c = self.get_redis_raw_client()
+        physical = self._snapshot_key_prefix() + self._SCHEMA_PREFIX   # e.g. tres:1:schema-snap:
+        for raw in c.scan_iter(match=f"{physical}*", count=1000):
+            key = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+            yield key[len(physical):]
+
     _SWEEP_BATCH = 500
 
-    def sweep_orphans(self, valid_hosts):
-        """Delete orphan POSITIVE snapshots — hosts cached as a positive snapshot but no
-        longer in `valid_hosts` (the DB). A positive HIT bypasses the gate/SET, so a
-        lingering (possibly no-TTL) orphan would be served forever. Negatives/tombstones
-        are left to self-expire (they don't serve a tenant). Returns the count deleted.
+    def sweep_orphans(self, valid_hosts, valid_schemas=frozenset()):
+        """Delete orphan POSITIVE snapshots in BOTH namespaces: a host-snap whose host is no
+        longer in `valid_hosts`, and a schema-snap whose schema is not in `valid_schemas` (the
+        DB truth). A positive HIT bypasses the gate/SET, so a lingering (possibly no-TTL) orphan
+        would be served forever. Negatives/tombstones self-expire (they serve no tenant).
+        Returns the total deleted. Batched (get_many/delete_many) — O(N / batch) round-trips.
 
-        Reads candidate values in batches (get_many) instead of one GET per key, so a sweep
-        over a large key space is O(N / batch) round-trips, not O(N)."""
+        NB: `valid_schemas` must be ALL tenant schemas (incl. domainless tenants), NOT only
+        schemas-with-domains — otherwise a valid domainless tenant's lazily-filled schema-snap
+        would be swept every reconcile."""
+        return (self._sweep_namespace(self.iter_snapshot_hosts(), valid_hosts, self._snap_key)
+                + self._sweep_namespace(self.iter_snapshot_schemas(), valid_schemas, self._schema_snap_key))
+
+    def _sweep_namespace(self, logical_iter, valid, key_fn):
         swept, batch = 0, []
-        for host in self.iter_snapshot_hosts():
-            if host in valid_hosts:
+        for name in logical_iter:
+            if name in valid:
                 continue
-            batch.append(host)
+            batch.append(name)
             if len(batch) >= self._SWEEP_BATCH:
-                swept += self._sweep_batch(batch)
+                swept += self._sweep_batch(batch, key_fn)
                 batch = []
-        return swept + self._sweep_batch(batch)
+        return swept + self._sweep_batch(batch, key_fn)
 
-    def _sweep_batch(self, hosts):
-        if not hosts:
+    def _sweep_batch(self, names, key_fn):
+        if not names:
             return 0
-        found = self.cache.get_many([self._snap_key(h) for h in hosts])   # 1 RT; present only
-        orphans = [k for k, v in found.items()                            # positives only
+        found = self.cache.get_many([key_fn(n) for n in names])   # 1 RT; present only
+        orphans = [k for k, v in found.items()                    # positives only
                    if self._classify(v) is self._Kind.POSITIVE]
         if orphans:
-            self.cache.delete_many(orphans)                              # 1 RT
+            self.cache.delete_many(orphans)                       # 1 RT
         return len(orphans)
 
     # ---- warm-up ----

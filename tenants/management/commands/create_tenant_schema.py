@@ -5,14 +5,16 @@ the schema automatically for tenants in status=NEW. Keep this around for DBA
 workflows such as restoring a schema from pg_dump before migrating.
 """
 
-from django.core.management.base import BaseCommand, CommandError
+from django.core.management.base import CommandError
+
+from commons.platform.commands import TenantCommand
 from django.db import connections
 from django_tenants.utils import get_public_schema_name, schema_exists
 
 from tenants.models import Tenant
 
 
-class Command(BaseCommand):
+class Command(TenantCommand):
     help = "Create the PostgreSQL schema for a tenant in its assigned shard."
 
     def add_arguments(self, parser):

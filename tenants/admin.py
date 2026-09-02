@@ -16,10 +16,6 @@ from django.contrib.admin import AdminSite
 from django.contrib.auth.admin import GroupAdmin
 from django.contrib.auth.models import Group
 from django.db.models.deletion import ProtectedError
-from django_celery_beat.admin import PeriodicTaskAdmin
-from django_celery_beat.models import (
-    ClockedSchedule, CrontabSchedule, IntervalSchedule, PeriodicTask, SolarSchedule,
-)
 from django_tenants.admin import TenantAdminMixin
 from django_tenants.utils import get_public_schema_name
 
@@ -233,24 +229,3 @@ public_admin_site.register(Tenant, TenantAdmin)
 public_admin_site.register(Domain, DomainAdmin)
 public_admin_site.register(ReservedHostRule, ReservedHostRuleAdmin)
 public_admin_site.register(Group, GroupAdmin)
-
-
-# ---------------------------------------------------------------------------
-# django-celery-beat on the PUBLIC admin site.
-#
-# django_celery_beat auto-registers its models on the DEFAULT admin site, which we
-# mount per-TENANT (urls_tenant) — so each company-admin already manages that
-# tenant's schedules there. The public host uses our own AdminSite, which doesn't
-# get those auto-registrations, so we add them here to manage the PUBLIC-schema
-# (global) periodic tasks. Edits fire the schedule signals -> beat reloads.
-# ---------------------------------------------------------------------------
-from django_celery_beat.admin import PeriodicTaskAdmin
-from django_celery_beat.models import (
-    ClockedSchedule, CrontabSchedule, IntervalSchedule, PeriodicTask, SolarSchedule,
-)
-
-public_admin_site.register(PeriodicTask, PeriodicTaskAdmin)
-public_admin_site.register(IntervalSchedule)
-public_admin_site.register(CrontabSchedule)
-public_admin_site.register(SolarSchedule)
-public_admin_site.register(ClockedSchedule)

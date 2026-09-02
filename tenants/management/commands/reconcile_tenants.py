@@ -12,14 +12,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 from django.conf import settings
-from django.core.management.base import BaseCommand
+from commons.platform.commands import TenantCommand
 from django.db import connection, connections
 from django.db.migrations.loader import MigrationLoader
 from django.db.utils import ConnectionDoesNotExist
 from django.utils import timezone
 from django_tenants.utils import schema_exists
 
-from tenants.celery.change_marker import bump_schema
 from tenants.models import Tenant
 from tenants.resolver import resolve_cache
 
@@ -33,7 +32,7 @@ class Decision:
     error: str = ""
 
 
-class Command(BaseCommand):
+class Command(TenantCommand):
     help = "Reconcile Tenant.status with actual migration state on each shard."
 
     def add_arguments(self, parser):
@@ -198,7 +197,7 @@ class Command(BaseCommand):
             update_fields["last_error"] = reason
         Tenant.objects.filter(pk=tenant.pk).update(**update_fields)
         resolve_cache.forget_tenant(tenant)   # .update() bypasses post_save
-        bump_schema(tenant.schema_name)       # nudge beat: ACTIVE-membership may have changed
+        # No beat nudge: the fanout dispatcher reads the ACTIVE set fresh each tick.
 
     # ------------------------------------------------------------------
     # Migration introspection

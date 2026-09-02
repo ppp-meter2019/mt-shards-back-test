@@ -1,6 +1,9 @@
 # Production overrides — never commit, always copy from settings_local.py.example
 tenants_back/settings_local.py
 
+# Run-mode selector (multi-tenant vs standalone) — copy from settings_mode.py.example
+tenants_back/settings_mode.py
+
 # Python
 __pycache__/
 *.py[cod]

@@ -16,6 +16,7 @@
 import random
 from decimal import Decimal
 
+from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
 
@@ -62,15 +63,22 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **opts):
-        # Захист: якщо команду запустили напряму (без tenant_command),
-        # search_path лишиться на public — а в public нема `products_product`.
-        # Видамо чітку помилку замість підступного `ProgrammingError`.
-        if connection.schema_name == "public":
-            raise CommandError(
-                "Цю команду треба запускати через "
-                "`python manage.py tenant_command seed_products` "
-                "(інакше товари впадуть у public-схему, де немає products_product)."
-            )
+        # Мітка схеми для логів. connection.schema_name інжектить бекенд
+        # django_tenants (лише MT); на звичайному PostGIS-бекенді (standalone)
+        # його немає — тож читаємо захисно.
+        schema = getattr(connection, "schema_name", "default")
+
+        if settings.USE_MULTITENANT:
+            # Захист: якщо команду запустили напряму (без tenant_command),
+            # search_path лишиться на public — а в public нема `products_product`.
+            # Видамо чітку помилку замість підступного `ProgrammingError`.
+            if schema == "public":
+                raise CommandError(
+                    "Цю команду треба запускати через "
+                    "`python manage.py tenant_command seed_products` "
+                    "(інакше товари впадуть у public-схему, де немає products_product)."
+                )
+        # Standalone: одна БД — сіємо напряму (`python manage.py seed_products`).
 
         count = opts["count"]
         if count < 1:
@@ -81,7 +89,7 @@ class Command(BaseCommand):
             if deleted:
                 self.stdout.write(
                     self.style.WARNING(
-                        f"[{connection.schema_name}] видалено {deleted} наявний товар(и) до сівби."
+                        f"[{schema}] видалено {deleted} наявний товар(и) до сівби."
                     )
                 )
 
@@ -97,7 +105,7 @@ class Command(BaseCommand):
                 created += 1
 
         already = count - created
-        msg = f"[{connection.schema_name}] додано {created} новий товар(ів)"
+        msg = f"[{schema}] додано {created} новий товар(ів)"
         if already:
             msg += f", {already} вже існували"
         msg += "."

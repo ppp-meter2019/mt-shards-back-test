@@ -1,27 +1,31 @@
-"""Tenant background tasks (first consumer of the shard-aware Celery layer).
+"""Tenant provisioning / housekeeping tasks.
 
-provision_tenant runs on the `service` queue (it's a management/housekeeping
-operation, not a business task). It is the async equivalent of
-`migrate_schemas --tenant --schema_name=<schema>`:
-create the schema on the tenant's shard, migrate it, flip NEW->ACTIVE/FAILED.
+provision_tenant runs on the `service` queue (it's a management/housekeeping operation,
+not a business task). It is the async equivalent of
+`migrate_schemas --tenant --schema_name=<schema>`: create the schema on the tenant's
+shard, migrate it, flip NEW->ACTIVE/FAILED.
 
 Re-provisioning guard: provisioning only runs on a NEW tenant. Any other status
-(PENDING in progress, ACTIVE/DEACTIVATED already provisioned, FAILED needs a
-reset via reconcile_tenants) is skipped — you cannot re-provision an
-already-provisioned tenant. The real concurrency guard is migrate_schemas'
-atomic NEW->PENDING claim (UPDATE ... WHERE status='new'); this status check is
-a cheap early-out, and the view rejects ineligible statuses up front.
+(PENDING in progress, ACTIVE/DEACTIVATED already provisioned, FAILED needs a reset via
+reconcile_tenants) is skipped. The real concurrency guard is migrate_schemas' atomic
+NEW->PENDING claim (UPDATE ... WHERE status='new'); this status check is a cheap early-out.
+
+The generic fan-out scheduler infrastructure (fanout_dispatch / sub_dispatch / the tz
+due-check) lives in tenants/celery/dispatch.py — imported at the bottom of THIS module so
+Celery autodiscover (which imports `<app>.tasks`) registers those tasks too.
 """
 from celery import Task, shared_task
 from celery.utils.log import get_task_logger
 from django.core.management import call_command
+
+from commons.platform.beat import task_queue
 
 from .models import Tenant
 
 logger = get_task_logger(__name__)
 
 
-@shared_task(bind=True, acks_late=True, max_retries=0)
+@shared_task(bind=True, queue=task_queue("service"), acks_late=True, max_retries=0)
 def provision_tenant(self, tenant_id):
     tenant = Tenant.objects.select_related("shard").get(pk=tenant_id)
 
@@ -43,7 +47,7 @@ def provision_tenant(self, tenant_id):
     return {"schema": tenant.schema_name, "status": tenant.status, "skipped": False}
 
 
-@shared_task(acks_late=True, max_retries=0)
+@shared_task(queue=task_queue("service"), acks_late=True, max_retries=0)
 def drop_tenant_schema_task(database, schema):
     """Drop an orphaned tenant schema on `database` (shard alias).
 
@@ -64,3 +68,10 @@ def drop_tenant_schema_task(database, schema):
 def reconcile_host_registry_task():
     from tenants.resolver import host_registry
     return {"reconciled": host_registry.run_locked()}
+
+
+# Register the fan-out dispatch tasks (fanout_dispatch / sub_dispatch). They live in a
+# dedicated module for cohesion; importing it here means Celery autodiscover (which imports
+# `tenants.tasks`) also registers them. Import LAST — dispatch imports tenants.models, so it
+# must run after the app registry is ready (autodiscover fires post django.setup()).
+from tenants.celery import dispatch  # noqa: E402,F401

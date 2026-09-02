@@ -14,18 +14,36 @@ tenant_context    same names. The upstream versions switch ONLY the schema on
                   the request path had. These versions wire BOTH axes and
                   restore both on exit.
 
+All three are @contextmanager GENERATORS: the saved state (previous tenant +
+current_db token) lives in the generator FRAME's locals, not on an instance, so
+they are reentrancy / reuse / thread safe (nested `with`s and decorator reuse
+each get their own frame) and the restore logic lives in ONE place (_switch).
+Usable as `with ...:` and as `@decorator` (contextlib recreates the CM per call).
+
 Import rule: project code imports these from `tenants.context`, never from
 `django_tenants.utils`. TenantsConfig.ready() additionally monkeypatches the
 upstream module so late importers get these versions too.
 """
 
-from contextlib import ContextDecorator, contextmanager
+from contextlib import contextmanager
 from contextvars import ContextVar
 
 from django.db import connections
 from django_tenants.utils import get_public_schema_name
 
-current_db: ContextVar[str] = ContextVar("current_db", default="default")
+# default=None is the SENTINEL for "no routing context established" (distinct from an
+# explicit alias of "default"). Only middleware / use_alias / _switch set a real alias; when
+# it is None the router can tell a genuine tenant query has no context and refuse (strict
+# guard) instead of silently routing to the default DB (wrong shard). Readers that just want
+# "an alias, default if unset" use active_alias().
+current_db: ContextVar = ContextVar("current_db", default=None)
+
+
+def active_alias():
+    """Effective DB alias for readers that only need 'an alias, default if no routing context'
+    (compat, diagnostics). The ROUTER reads current_db RAW to detect the unset (None) state for
+    its strict guard — it must NOT use this."""
+    return current_db.get() or "default"
 
 
 @contextmanager
@@ -41,83 +59,73 @@ def use_alias(alias: str):
         current_db.reset(token)
 
 
-class tenant_context(ContextDecorator):
-    """Drop-in replacement for django_tenants.utils.tenant_context.
+@contextmanager
+def _switch(database, apply_to):
+    """Shared reentrancy-safe core of tenant_context / schema_context.
 
-    Wires BOTH axes of multi-DB multi-tenancy:
-      axis 1: current_db -> the tenant's shard (read by TenantDatabaseRouter);
-      axis 2: the tenant schema on THAT shard's connection.
-
-    Also fixes an upstream restore quirk: upstream saves the previous tenant of
-    the DEFAULT connection but restores it onto the target one; we save/restore
-    the target connection's own previous state.
+    axis 1: current_db -> `database` (read by TenantDatabaseRouter);
+    axis 2: the schema on THAT shard's connection, applied by `apply_to(connection)`.
+    Restores BOTH on exit (return OR exception). `token` and `prev_tenant` are FRAME
+    locals — fresh per entry — so overlapping/nested/reused entries never clobber each
+    other. Fixes an upstream quirk too: we save/restore the TARGET connection's own
+    previous tenant (upstream saved the default connection's and restored it onto the
+    target). `apply_to` runs INSIDE the try, so a failing schema-set still resets the token.
     """
-
-    def __init__(self, tenant, database=None):
-        self.tenant = tenant
-        self.database = database or tenant.shard.alias
-
-    def __enter__(self):
-        self.connection = connections[self.database]
-        self._prev_tenant = self.connection.tenant        # previous of THIS connection
-        self._token = current_db.set(self.database)       # axis 1: router
-        self.connection.set_tenant(self.tenant)           # axis 2: schema on the shard conn
-        return self
-
-    def __exit__(self, *exc):
-        if self._prev_tenant is None:
-            self.connection.set_schema_to_public()
+    connection = connections[database]
+    prev_tenant = connection.tenant          # previous of THIS connection
+    token = current_db.set(database)         # axis 1: router
+    try:
+        apply_to(connection)                 # axis 2: schema on the shard connection
+        yield
+    finally:
+        if prev_tenant is None:
+            connection.set_schema_to_public()
         else:
-            self.connection.set_tenant(self._prev_tenant)
-        current_db.reset(self._token)
-        return False
+            connection.set_tenant(prev_tenant)
+        current_db.reset(token)
 
 
-class schema_context(ContextDecorator):
-    """Drop-in replacement for django_tenants.utils.schema_context.
+@contextmanager
+def tenant_context(tenant, database=None):
+    """Drop-in replacement for django_tenants' tenant_context (shard-aware).
 
-    Resolves WHICH database to target from the tenant registry
-    (schema_name -> Tenant.shard.alias) unless `database=` is given explicitly.
-    `public` short-circuits to 'default' without a lookup. Prefer
-    tenant_context(tenant) when you already hold the Tenant object - it skips
-    the registry query.
+    Wires BOTH axes: current_db -> the tenant's shard, and the tenant schema on that
+    shard's connection. `database=` overrides the shard alias when needed.
     """
+    with _switch(database or tenant.shard.alias, lambda conn: conn.set_tenant(tenant)):
+        yield
 
-    def __init__(self, schema_name, database=None):
-        self.schema_name = schema_name
-        self.database = database
 
-    def _resolve_database(self):
-        if self.database:
-            return self.database
-        if self.schema_name == get_public_schema_name():
-            return "default"
-        from tenants.models import Tenant          # lazy: no app-registry cycles
-        try:
-            return (
-                Tenant.objects.select_related("shard")
-                .get(schema_name=self.schema_name)
-                .shard.alias
-            )
-        except Tenant.DoesNotExist:
-            raise Tenant.DoesNotExist(
-                f"schema_context({self.schema_name!r}): no Tenant with this "
-                f"schema_name. Pass database=<alias> explicitly for "
-                f"non-registered schemas (DBA/restore flows)."
-            )
+@contextmanager
+def schema_context(schema_name, database=None):
+    """Drop-in replacement for django_tenants' schema_context (shard-aware).
 
-    def __enter__(self):
-        self.database = self._resolve_database()
-        self.connection = connections[self.database]
-        self._prev_tenant = self.connection.tenant
-        self._token = current_db.set(self.database)
-        self.connection.set_schema(self.schema_name)
-        return self
+    Resolves WHICH database to target from the tenant registry (schema_name ->
+    Tenant.shard.alias) unless `database=` is given; `public` short-circuits to 'default'
+    without a lookup. Prefer tenant_context(tenant) when you already hold the Tenant
+    object - it skips the registry query.
+    """
+    with _switch(_resolve_database(schema_name, database),
+                 lambda conn: conn.set_schema(schema_name)):
+        yield
 
-    def __exit__(self, *exc):
-        if self._prev_tenant is None:
-            self.connection.set_schema_to_public()
-        else:
-            self.connection.set_tenant(self._prev_tenant)
-        current_db.reset(self._token)
-        return False
+
+def _resolve_database(schema_name, database):
+    """WHICH database a schema lives on: explicit `database` wins; `public` -> 'default';
+    else the tenant registry (schema_name -> Tenant.shard.alias)."""
+    if database:
+        return database
+    if schema_name == get_public_schema_name():
+        return "default"
+    from tenants.models import Tenant          # lazy: no app-registry cycles
+    try:
+        return (
+            Tenant.objects.select_related("shard")
+            .get(schema_name=schema_name)
+            .shard.alias
+        )
+    except Tenant.DoesNotExist:
+        raise Tenant.DoesNotExist(
+            f"schema_context({schema_name!r}): no Tenant with this schema_name. "
+            f"Pass database=<alias> explicitly for non-registered schemas (DBA/restore flows)."
+        )

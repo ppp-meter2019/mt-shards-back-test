@@ -12,12 +12,14 @@ GATE-AWARE — a single entry point so an operator can't run the wrong warm:
 Fails loudly (CommandError) if Redis is unreachable — even under IGNORE_EXCEPTIONS,
 so a "warm" that silently did nothing can't pass for success.
 """
-from django.core.management.base import BaseCommand, CommandError
+from django.core.management.base import CommandError
+
+from commons.platform.commands import TenantCommand
 
 from tenants.resolver import CacheUnavailable, flags, resolve_cache
 
 
-class Command(BaseCommand):
+class Command(TenantCommand):
     help = "Preload / rebuild the tenant-resolution cache (reconcile when the gate is on)."
 
     def add_arguments(self, parser):

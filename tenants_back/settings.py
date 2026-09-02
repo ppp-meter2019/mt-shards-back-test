@@ -4,8 +4,6 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
-from kombu import Queue
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.environ.get(
@@ -13,6 +11,24 @@ SECRET_KEY = os.environ.get(
     "django-insecure-3!1c9_e7icl-bz4bf$_1c5k_^vo43bm1ia66uce$zeyf^6(vvn",
 )
 DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
+
+# Multi-tenant (django-tenants + shards) vs standalone (single default DB, no schemas).
+# Resolved HERE, at import time, because it gates INSTALLED_APPS / DB backend+routers /
+# middleware / admin below — so it CANNOT come from settings_local (imported last) or
+# from the DB. Precedence, so the mode can be set WITHOUT an env var AND without editing
+# this file:
+#   1. env  USE_MULTITENANT=0/1                (CI / containers)
+#   2. settings_mode.py -> USE_MULTITENANT     (gitignored local file; see the .example)
+#   3. default False                           (STANDALONE is the default — the larger
+#                                               host project's mode; multi-tenant is the
+#                                               opt-in layer. THIS dev repo ships a local
+#                                               settings_mode.py with True so day-to-day
+#                                               work + tests stay multi-tenant.)
+# Single source of truth (settings-load-safe; also used by commons.platform.beat.scoped_schedule
+# which runs while the host builds CELERY_BEAT_SCHEDULE).
+from commons.platform.mode import use_multitenant  # noqa: E402
+
+USE_MULTITENANT = use_multitenant()
 
 ALLOWED_HOSTS = [
     h.strip() for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",") if h.strip()
@@ -41,12 +57,10 @@ AWS_RDS_CA = os.environ.get(
 # ---------------------------------------------------------------------------
 # Apps
 # ---------------------------------------------------------------------------
-# IMPORTANT: 'tenants' MUST come BEFORE 'django_tenants' so our management
-# commands (notably migrate_schemas) override the upstream versions.
-SHARED_APPS = [
-    "tenants",
-    "django_tenants",
-
+# Building blocks shared by BOTH modes — single source of truth so the two
+# INSTALLED_APPS branches below cannot silently drift. Add a shared app HERE, not
+# in a branch.
+_DJANGO_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.auth",
     # PostGIS: GIS field types + GIS ORM. No tables of its own here, but the
@@ -57,27 +71,15 @@ SHARED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "django.contrib.admin",
+]
 
+_THIRD_PARTY_APPS = [
     "rest_framework",
     "rest_framework_simplejwt",
     "corsheaders",
-
-    # Celery beat schedules live per-schema (public + each tenant), so this is
-    # in BOTH SHARED_APPS and TENANT_APPS. See tenants.celery.db_scheduler.
-    "django_celery_beat",
-
-    "users",
 ]
 
-TENANT_APPS = [
-    "django.contrib.contenttypes",
-    "django.contrib.auth",
-    "django.contrib.admin",
-
-    "django_celery_beat",
-
-    "users",
-
+_BUSINESS_APPS = [
     "customers",
     "drivers",
     "cars",
@@ -86,85 +88,41 @@ TENANT_APPS = [
     "routes",
 ]
 
-# django-tenants requires INSTALLED_APPS to be the de-duplicated union.
-INSTALLED_APPS = list(SHARED_APPS) + [a for a in TENANT_APPS if a not in SHARED_APPS]
+# Standalone base (the larger host project's mode): one default DB, no schemas — NO
+# 'tenants' / 'django_tenants'. Multi-tenant REASSEMBLES these blocks into a
+# SHARED_APPS+TENANT_APPS union (incl. tenants + django_tenants) in settings_multitenant.py.
+INSTALLED_APPS = [*_DJANGO_APPS, *_THIRD_PARTY_APPS, "users", *_BUSINESS_APPS]
 
 
 # ---------------------------------------------------------------------------
-# django-tenants
-# ---------------------------------------------------------------------------
-TENANT_MODEL        = "tenants.Tenant"
-TENANT_DOMAIN_MODEL = "tenants.Domain"
-PUBLIC_SCHEMA_NAME  = "public"
-
-PUBLIC_SCHEMA_URLCONF = "tenants_back.urls_public"
-ROOT_URLCONF          = "tenants_back.urls_tenant"
-
-# Our router inherits TenantSyncRouter and adds multi-DB awareness.
-# NOTE: django-tenants validates DATABASE_ROUTERS by a LITERAL string check
-# ('django_tenants.routers.TenantSyncRouter' in DATABASE_ROUTERS), not by
-# isinstance/subclass — so subclassing alone fails with
-# "DATABASE_ROUTERS setting must contain 'django_tenants.routers.TenantSyncRouter'.".
-# We list our router FIRST (it fully overrides db_for_read/write + allow_migrate,
-# so it always decides); the upstream name is a no-op fallback that only
-# satisfies that check.
-DATABASE_ROUTERS = [
-    "tenants.routers.TenantDatabaseRouter",
-    "django_tenants.routers.TenantSyncRouter",
-]
-
-# PostGIS backend (required for GIS models in tenant apps such as orders).
-ORIGINAL_BACKEND = "django.contrib.gis.db.backends.postgis"
-
-# Platform base domains, for reference / future base-scoped rules. NOT read on the
-# request path — tenant resolution is by full Host. Reserved-host enforcement lives
-# entirely in tenants.ReservedHostRule (seeded in migration 0004): the service
-# subdomains (www/api/admin/...) are reserved GLOBALLY, and the apexes below are
-# reserved as EXACT rules. Kept here so the set of bases has one documented home.
-TENANT_BASE_DOMAINS = ("routegenie.com", "isi-technology.com")
-
-
-# ---------------------------------------------------------------------------
-# Worker model: this project runs a SYNC server — Gunicorn `sync` (prefork)
-# workers over WSGI. This is the simplest, most robust model for our sync code
-# + django-tenants (one request per process; connections are per-process; the
-# tenant schema is set/reset per request). Concurrency = number of worker
-# processes. CPU-heavy work belongs in Celery (phase 2), not the web tier.
+# URL routing / DB routers (standalone base).
 #
-# The async path (UvicornWorker / ASGI) is intentionally NOT used: with our
-# required sync tenant/shard middleware it gives no concurrency win and can even
-# regress vs prefork. See README "Architecture trade-offs" before switching.
+# Standalone ships a minimal ROOT_URLCONF stub (tenants_back/urls_standalone.py) so the
+# app boots and CI can run; at merge the host project supplies its own. No tenant router;
+# the plain PostGIS backend (DATABASES below) is the DB engine. Multi-tenant overrides
+# ROOT_URLCONF + DATABASE_ROUTERS and adds TENANT_MODEL / PUBLIC_SCHEMA_* / ORIGINAL_BACKEND
+# / TENANT_BASE_DOMAINS in settings_multitenant.py.
+# ---------------------------------------------------------------------------
+ROOT_URLCONF     = "tenants_back.urls_standalone"
+DATABASE_ROUTERS = []
+
+
+# ---------------------------------------------------------------------------
+# Worker model: SYNC Gunicorn `sync` (prefork) over WSGI (the async/ASGI path is
+# intentionally unused — see README "Architecture trade-offs").
 #
-# Middleware order matters (both are SYNC — the shard schema must be set on the
-# same connection/thread the ORM later uses):
-# 1. ShardAwareTenantMiddleware    -> resolves tenant (+shard) from Host, sets
-#                                     request.tenant and the schema on `default`.
-# 2. TenantShardRoutingMiddleware  -> sets current_db (router -> shard DB) and the
-#                                     tenant schema on the SHARD connection, and
-#                                     resets both on the way out.
-# 3. DiagnosticsHeadersMiddleware  -> stamps response with host/pid/alias (MVP
-#                                     demo). Inside (2) so current_db is still live.
+# Middleware — STANDALONE base (stock session; no tenant/shard middleware, nothing to
+# bind a session to on a single DB). Multi-tenant inserts ShardAwareTenantMiddleware +
+# TenantShardRoutingMiddleware (+ diagnostics) after CORS and the SchemaBoundSession
+# guard after Auth — see settings_multitenant.py for the full ordered list and rationale.
 # ---------------------------------------------------------------------------
 MIDDLEWARE = [
-    # CORS is OUTERMOST on purpose. It is DB-independent (only reads the Origin
-    # header and adds response headers), so wrapping everything is safe and does
-    # NOT violate the "tenant/shard set before any DB access" rule below — the
-    # tenant middlewares still precede every DB-touching middleware.
-    # Being outermost lets CorsMiddleware (a) answer preflight OPTIONS before
-    # tenant resolution, and (b) add CORS headers on the way out even to the
-    # tenant middleware's SHORT-CIRCUITED responses (e.g. the deactivated-tenant
-    # 403) — without this the browser blocks that cross-origin 403 ("Failed to
-    # fetch") and never sees the message.
     "corsheaders.middleware.CorsMiddleware",
-    "tenants.middleware.ShardAwareTenantMiddleware",
-    "tenants.middleware.TenantShardRoutingMiddleware",
-    "tenants.middleware_diagnostics.DiagnosticsHeadersMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "users.middleware.SchemaBoundSessionMiddleware",  # tenant-bind session auth (after Auth)
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -203,7 +161,9 @@ ASGI_APPLICATION = None
 # ---------------------------------------------------------------------------
 DATABASES = {
     "default": {
-        "ENGINE":             "django_tenants.postgresql_backend",
+        # Standalone base: plain PostGIS. Multi-tenant overrides ENGINE to the
+        # django-tenants backend (+ ORIGINAL_BACKEND) in settings_multitenant.py.
+        "ENGINE":             "django.contrib.gis.db.backends.postgis",
         "NAME":               "tenants_back",
         "USER":               "postgres",
         "PASSWORD":           "postgres",
@@ -267,10 +227,11 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 REST_FRAMEWORK = {
+    # Standalone base: stock JWT (no tenants to bind to). Multi-tenant overrides
+    # DEFAULT_AUTHENTICATION_CLASSES with SchemaBoundJWTAuthentication (rejects a token
+    # whose `schema` claim != the request's tenant) in settings_multitenant.py.
     "DEFAULT_AUTHENTICATION_CLASSES": (
-        # Schema-bound: rejects a token whose `schema` claim != the request's
-        # tenant, so a token cannot be reused across tenants (CRITICAL #2).
-        "users.authentication.SchemaBoundJWTAuthentication",
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
@@ -305,132 +266,13 @@ CACHES = {
     },
 }
 
-# Dedicated cache alias for Celery-beat coordination keys (beat:last_change:<schema>).
-# These are CROSS-TENANT markers: written in a tenant's context but read by beat
-# outside any tenant context, so they must NOT carry the per-tenant key prefix used
-# for app data. Same Redis by default; override BEAT_REDIS_URL / LOCATION if needed.
-#
-# OPTIONS is a COPY of default's, NOT a shared reference: when the app-data caches
-# gain a tenant KEY_FUNCTION, add it to CACHES["default"]["OPTIONS"] ONLY — never
-# here. A tenant prefix on this alias would split beat's writer (tenant context)
-# and reader (public context) onto different keys and silently break change-detection.
-CACHES["beat"] = {
-    "BACKEND":    CACHES["default"]["BACKEND"],
-    "LOCATION":   os.environ.get("BEAT_REDIS_URL", CACHES["default"]["LOCATION"]),
-    "KEY_PREFIX": "beat",
-    "OPTIONS":    dict(CACHES["default"].get("OPTIONS", {})),
-}
-
-# ---------------------------------------------------------------------------
-# Tenant-resolution cache (host -> Tenant+shard). Read by ShardAwareTenantMiddleware
-# on EVERY request BEFORE the tenant is known, to remove the per-request Domain
-# lookup from the shared `default` DB — so a worker serving cache-hit traffic stops
-# touching `default` and its connection idles out (fewer connections to `default`).
-#
-# This MUST be a SEPARATE Redis INSTANCE (not just another alias on `default`),
-# because it needs a different maxmemory-policy than the app/session cache.
-#
-#   *** Required config on this instance (ElastiCache parameter group): ***
-#     maxmemory-policy = volatile-ttl
-#       Every entry here is written WITH a TTL (positive AND negative). Under memory
-#       pressure Redis then evicts the NEAREST-to-expiry first — i.e. the short-TTL
-#       negative (miss) entries — protecting the long-TTL positives, and KEEPS
-#       accepting writes (unlike noeviction, which would start failing them).
-#       NEVER write a key here without a TTL (no cache.set(..., timeout=None)):
-#       a persistent key is not an eviction candidate and breaks this guarantee.
-#     A dedicated instance also keeps this namespace tenant-agnostic: resolution
-#     runs in the PUBLIC context (tenant not resolved yet), so keys must carry only
-#     a static KEY_PREFIX ("tres") and NEVER a per-tenant KEY_FUNCTION — same as the
-#     `beat` alias (which likewise uses a static prefix, no per-tenant key function).
-#
-# Failure mode: IGNORE_EXCEPTIONS + short timeouts => a slow/down instance degrades
-# to a `default` DB lookup (fail-open) — today's behavior. Correctness never depends
-# on this cache being up.
-#
-# Production: point LOCATION at the dedicated instance in settings_local.py.
-# ---------------------------------------------------------------------------
-CACHES["tenant_resolve"] = {
-    "BACKEND":  "django_redis.cache.RedisCache",
-    "LOCATION": "redis://127.0.0.1:6379/2",   # dev default; prod -> settings_local.py
-    "KEY_PREFIX": "tres",
-    "OPTIONS": {
-        "CLIENT_CLASS": "django_redis.client.DefaultClient",
-        "IGNORE_EXCEPTIONS": True,             # Redis down/slow => miss => DB (fail-open)
-        "SOCKET_CONNECT_TIMEOUT": 1,
-        "SOCKET_TIMEOUT": 1,
-    },
-}
-
-# ---------------------------------------------------------------------------
-# Resolver settings — two namespaced dicts over in-code DEFAULTS (tenants/resolver/config.py).
-# Override per key here (or in settings_local.py); unspecified keys fall back to DEFAULTS.
-# ---------------------------------------------------------------------------
-# TENANT_RESOLVE — resolution-cache tuning (always relevant).
-#   POSITIVE_CACHE_SECONDS: positive (success) TTL. Long backstop; correctness is kept by
-#     explicit invalidation (Tenant/Domain signals). Only self-heals entries an invalidation
-#     missed (e.g. a QuerySet.update()/migration status/shard change — no post_save). 0
-#     disables positive caching. Do NOT make it unbounded.
-#   MISS_CACHE_SECONDS: negative (miss) TTL. Short — bounds memory a flood of unknown hosts
-#     can occupy. A new domain is made resolvable immediately by invalidating its negative on
-#     creation, so this is only a safety bound. 0 disables negative caching.
-#   HOLD_SECONDS: invalidation writes a short "hold" (tombstone) instead of deleting; while it
-#     lives, resolve goes DB-direct and an nx populate cannot overwrite it (closes the
-#     read-then-write race). 0 => plain delete (race open). Shortest-TTL key → volatile-ttl
-#     evicts it first.
-#   WARM_TTL_BY_STATUS: positive TTL by tenant status, used ONLY under WARM. None => no expiry
-#     (kept warm by reconcile + orphan-sweep). Statuses absent here fall back to
-#     POSITIVE_CACHE_SECONDS.
-#   FILLCAP_PER_SEC / FILLCAP_LOCAL_PER_SEC: fill_cap rate-limits DB resolves ONLY on the
-#     flag-absent branch (cold / flush / warm-in-progress). Global (Redis fixed-window) with a
-#     per-pod bucket fallback. Member cold-fills and non-member rejects do NOT consume it.
-TENANT_RESOLVE = {
-    "POSITIVE_CACHE_SECONDS": 3600,
-    "MISS_CACHE_SECONDS": 60,
-    "HOLD_SECONDS": 5,
-    "WARM_TTL_BY_STATUS": {
-        "active": None, "deactivated": 3600, "failed": 1800, "new": 120, "pending": 120,
-    },
-    "FILLCAP_PER_SEC": 20,
-    "FILLCAP_LOCAL_PER_SEC": 5,
-}
-
-# TENANT_REGISTRY — anti-DoS host gate, two-stage rollout. Defaults OFF (byte-for-byte
-# today's behavior); enable per environment in settings_local.py. Full design:
-# deploy/resolve_gate_design.md.
-#   WARM_ENABLED (Stage 1, write side): maintain the `tres:hosts` SET (SADD/SREM + dead-man
-#     switch), run reconcile, write positives with WARM_TTL_BY_STATUS. No read impact.
-#   GATE_ENABLED (Stage 2, read side): on a positive-cache MISS, consult `tres:hosts` and
-#     reject unknown (non-member) hosts WITHOUT a DB hit. Requires WARM (fail-safe: GATE
-#     without WARM is treated as OFF; the tenants.E001 check flags the misconfig).
-#   HOSTS_ARM_SECONDS: dead-man TTL armed on domain add/delete/rename — if the follow-up
-#     reconcile never runs, the key expires and the gate fails open.
-#   RECONCILE_SECONDS: daily safety reconcile (catches signal-bypassing drift). NB: consumed
-#     by the ops beat schedule, not read by code.
-#   WARM_LOCK_SECONDS: `tres:warming` single-writer lock TTL. INVARIANT: must comfortably
-#     exceed the WORST-CASE reconcile (full DB scan × up to 3 dirty-recheck rebuilds); if it
-#     expires mid-reconcile, a second writer can overlap. ~sub-second at ~700 tenants → 120s
-#     is ample; raise it if domain count / DB latency grows.
-#   WARM_PENDING_SECONDS: reconcile-trigger enqueue-coalescing window (`tres:warm_pending`,
-#     self-expiring NX). Also the worst-case re-enqueue delay if a broker publish was lost.
-TENANT_REGISTRY = {
-    "WARM_ENABLED": False,
-    "GATE_ENABLED": False,
-    "HOSTS_ARM_SECONDS": 300,
-    "RECONCILE_SECONDS": 86400,
-    "WARM_LOCK_SECONDS": 120,
-    "WARM_PENDING_SECONDS": 10,
-}
+# Multi-tenant adds a dedicated `tenant_resolve` cache (host->Tenant+shard) and the
+# TENANT_RESOLVE / TENANT_REGISTRY resolver-config dicts — see settings_multitenant.py.
 
 # API path prefixes — request-handling code that treats API traffic as stateless/JSON:
 # the session guard (users.middleware) and error content negotiation (tenants.errors).
 # Single source of truth so the two stay in sync.
 API_PATH_PREFIXES = ("/api/v1/", "/open_api/api/v1/")
-
-# Celery-beat change-detection: beat polls every max_interval; keep the per-tenant
-# Redis change-markers alive for k×max_interval (k>=3) so a running beat always
-# observes a marker before it expires, and deleted-tenant markers self-clean.
-DJANGO_CELERY_BEAT_MAX_LOOP_INTERVAL = int(os.environ.get("BEAT_MAX_LOOP_INTERVAL", "5"))
-BEAT_MARKER_TTL_SECONDS = DJANGO_CELERY_BEAT_MAX_LOOP_INTERVAL * 3
 
 SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"
 SESSION_CACHE_ALIAS = "default"
@@ -484,31 +326,57 @@ CELERY_ACCEPT_CONTENT  = ["json"]
 CELERY_TIMEZONE        = TIME_ZONE
 CELERY_TASK_ACKS_LATE  = True            # don't lose a task if a worker dies mid-run
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1    # fair dispatch for long tasks
-# Three queues:
-#   fast    - short, latency-sensitive tasks (default)
-#   slow    - long-running tasks (provisioning, migrations, bulk jobs)
-#   service - maintenance / housekeeping (reconcile, cleanup, beat-driven)
-# Run workers per queue, e.g.  celery -A tenants_back worker -Q fast
-#                              celery -A tenants_back worker -Q slow
-#                              celery -A tenants_back worker -Q service
-CELERY_TASK_QUEUES = (
-    Queue("fast"),
-    Queue("slow"),
-    Queue("service"),
-)
-CELERY_TASK_DEFAULT_QUEUE = "fast"
-CELERY_TASK_ROUTES = {
-    "tenants.tasks.provision_tenant": {"queue": "service"},
-    "tenants.tasks.drop_tenant_schema_task": {"queue": "service"},
-}
-# schema -> Tenant(+shard) lookup cache, per worker process. 0 = no cache
-# (always fresh; safe if a tenant is ever moved to another shard). Override in
-# settings_local.py (e.g. 10) when shard assignments are stable.
-CELERY_TASK_TENANT_CACHE_SECONDS = int(
-    os.environ.get("CELERY_TASK_TENANT_CACHE_SECONDS", "0")
-)
-# Tenant-aware DB-backed beat (fans periodic tasks out per tenant schema).
-CELERY_BEAT_SCHEDULER = "tenants.celery.db_scheduler:TenantAwareDatabaseScheduler"
+# Shared beat schedule — the host project's / business periodic tasks go HERE (they run in
+# BOTH modes). Multi-tenant AUGMENTS this dict (adds its own infra entries) rather than
+# replacing it — see settings_multitenant.py.
+#
+# WRAP EVERY ENTRY with commons.platform.beat.scoped_schedule so its SCOPE is explicit (the tenants.E003
+# system check enforces this under multi-tenant). Importing scoped_schedule here is safe — no
+# circular import; scoped_schedule never reads django.conf.settings (it resolves the mode via
+# commons.platform.mode.use_multitenant).
+#
+# CHOOSING scope — pick by the task's DATA, NOT by the run mode; the SAME value is correct
+# for both modes (in standalone every scope simply collapses to "run once"):
+#   scope="tenants" — task operates on ONE tenant's data (per-tenant business logic).
+#                     standalone: runs ONCE (the single DB). multi-tenant: FANNED OUT to
+#                     every ACTIVE tenant. → use this for standalone business tasks too, so
+#                     they fan out automatically once multi-tenant is enabled.
+#   scope="public"  — global / cross-tenant / infra / public-schema task.
+#                     standalone: runs ONCE. multi-tenant: runs ONCE in the public schema.
+#
+#   from commons.platform.beat import scoped_schedule
+#   from celery.schedules import crontab
+#
+#   CELERY_BEAT_SCHEDULE = {
+#       # INTERVAL, per-tenant — every 30s. standalone: once; MT: fanned out to all tenants.
+#       "push-updates": scoped_schedule({"task": "apps.x.tasks.push", "schedule": 30.0}, scope="tenants"),
+#
+#       # CALENDAR, per-tenant — 08:00 in EACH tenant's LOCAL timezone (crontab + tenants =>
+#       # tz-aware fanout). fanout_period / grace apply ONLY to this case:
+#       #   fanout_period (default 60s) — how often beat polls to catch each tenant's local
+#       #       time; the PRECISION / how close to 08:00 local it fires. Smaller = more precise,
+#       #       more ticks. Must be <= the schedule's granularity (e.g. <=60s for minute crons).
+#       #   grace (default TENANT_BEAT["TZ_GRACE_SECONDS"]=300s) — max LATENESS: if a run was
+#       #       missed (beat down) it still fires within `grace`, else it is SKIPPED to the next
+#       #       occurrence (never fired late / never N times). Must be >= fanout_period (check
+#       #       tenants.E002). Set smaller for interdependent/time-sensitive tasks.
+#       "daily-report": scoped_schedule({"task": "apps.x.tasks.daily", "schedule": crontab(minute=0, hour=8)},
+#                              scope="tenants", fanout_period=60, grace=300),
+#
+#       # GLOBAL, once — cross-tenant housekeeping (public schema under MT). fanout_period /
+#       # grace are IGNORED for public + for interval entries.
+#       "cleanup":      scoped_schedule({"task": "apps.x.tasks.cleanup", "schedule": crontab(minute=0, hour=3)},
+#                              scope="public"),
+#   }
+CELERY_BEAT_SCHEDULE = {}
+
+# Standalone base: no custom queues (Celery's single default "celery" queue, which the
+# host project's existing workers already consume) and stock beat (default
+# PersistentScheduler / host's choice). Multi-tenant adds the fast/slow/service/fanout
+# queues, TENANT_BEAT knobs, CELERY_TASK_TENANT_CACHE_SECONDS, RedBeat
+# (CELERY_BEAT_SCHEDULER + CELERY_REDBEAT_*) — see settings_multitenant.py.
+# Task-level queues come from commons.platform.beat.task_queue(), which returns None in
+# standalone → the default queue (so the fallback cannot leak).
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +389,16 @@ CELERY_BEAT_SCHEDULER = "tenants.celery.db_scheduler:TenantAwareDatabaseSchedule
 # ---------------------------------------------------------------------------
 AWS_S3_COORDINATES_BUCKET = os.environ.get("AWS_S3_COORDINATES_BUCKET", "")
 AWS_S3_REGION = os.environ.get("AWS_S3_REGION", "") or None
+
+
+# ---------------------------------------------------------------------------
+# Multi-tenant layer — reassembles/overrides the standalone base above (INSTALLED_APPS
+# union, django_tenants backend+routers, tenant middleware, schema-bound auth,
+# tenant_resolve cache, resolver config, Celery queues/beat/RedBeat). Loaded ONLY when
+# USE_MULTITENANT, and BEFORE settings_local so production overrides still win over both.
+# ---------------------------------------------------------------------------
+if USE_MULTITENANT:
+    from .settings_multitenant import *  # noqa: F401,F403
 
 
 # ---------------------------------------------------------------------------

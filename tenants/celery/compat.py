@@ -9,18 +9,19 @@ from `default`.
 from django.db import connections
 from django_tenants.utils import get_public_schema_name, get_tenant_model
 
-from tenants.context import current_db, schema_context, tenant_context  # shard-aware
+from tenants.context import active_alias, schema_context, tenant_context, use_alias  # shard-aware
 
 __all__ = [
     "get_public_schema_name", "get_tenant_model",
-    "schema_context", "tenant_context", "current_schema_name",
+    "schema_context", "tenant_context", "use_alias", "current_schema_name",
 ]
 
 
 def current_schema_name():
-    """Schema set on the connection of the CURRENT shard (current_db)."""
-    alias = current_db.get()
-    try:
-        return connections[alias].schema_name or get_public_schema_name()
-    except Exception:
-        return get_public_schema_name()
+    """Schema on the connection of the CURRENT shard (active_alias → default if unset).
+
+    Fails LOUD on an unexpected error (a bad alias / connection state = a bug): silently
+    returning public would mis-stamp the outgoing task and dispatch a tenant task to
+    default.public. The legit 'schema unset' case is the `or public` below, NOT a swallowed
+    exception. MT-only (standalone runs a plain Celery app that never imports this)."""
+    return connections[active_alias()].schema_name or get_public_schema_name()

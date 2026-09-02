@@ -9,13 +9,17 @@ Example:
         --password rootpass
 """
 
-from django.core.management.base import BaseCommand, CommandError
+from django.core.management.base import CommandError
+from django_tenants.utils import get_public_schema_name
 
+from commons.platform.commands import TenantCommand
+
+from tenants.context import schema_context
 from tenants.models import Domain, Shard, Tenant
 from users.models import User
 
 
-class Command(BaseCommand):
+class Command(TenantCommand):
     help = "Create the public tenant + a tenant-admin user."
 
     def add_arguments(self, parser):
@@ -48,20 +52,25 @@ class Command(BaseCommand):
             defaults={"tenant": tenant, "is_primary": True},
         )
 
-        user, created = User.objects.get_or_create(
-            username=opts["username"],
-            defaults={
-                "email": opts["email"],
-                "role": User.Role.TENANT_ADMIN,
-                "is_staff": True,
-                "is_superuser": True,
-            },
-        )
-        user.role = User.Role.TENANT_ADMIN
-        user.is_staff = True
-        user.is_superuser = True
-        user.set_password(opts["password"])
-        user.save()
+        # The admin lives in the PUBLIC schema on the default connection. Establish that
+        # context explicitly (current_db -> "default", schema -> public) so the INSERT is
+        # routed deterministically — and so it survives `users` being in TENANT_STRICT_ROUTE_APPS
+        # (an unset context would otherwise raise in the strict router).
+        with schema_context(get_public_schema_name()):
+            user, created = User.objects.get_or_create(
+                username=opts["username"],
+                defaults={
+                    "email": opts["email"],
+                    "role": User.Role.TENANT_ADMIN,
+                    "is_staff": True,
+                    "is_superuser": True,
+                },
+            )
+            user.role = User.Role.TENANT_ADMIN
+            user.is_staff = True
+            user.is_superuser = True
+            user.set_password(opts["password"])
+            user.save()
         self.stdout.write(
             self.style.SUCCESS(
                 f"Tenant-admin '{user.username}' ready on host '{opts['domain']}'."

@@ -46,32 +46,21 @@ def invalidate_domain_deleted(sender, instance, **kwargs):
     transaction.on_commit(_apply)
 
 
-def _bump_beat(schema_name):
-    from .celery.change_marker import bump_schema
-    transaction.on_commit(lambda: bump_schema(schema_name))
-
-
 @receiver(post_save, sender=Tenant)
-def invalidate_tenant(sender, instance, created, **kwargs):
-    # Always drop the tenant's cached resolve snapshots (cheap, any save).
+def invalidate_tenant(sender, instance, **kwargs):
+    # Drop the tenant's cached resolve snapshots on any save (cheap). No beat nudge:
+    # the fanout dispatcher reads the ACTIVE-tenant set fresh on every tick, so schedule
+    # membership needs no signal (see deploy/celery_fanout_design.md). Tenant delete: the
+    # Domain post_delete cascade forgets the HOST snapshots; invalidate_tenant_deleted (below)
+    # drops the SCHEMA snapshot, which has no host to derive from once the domains are gone.
     resolve_cache.forget_tenant(instance)
-    # Nudge beat ONLY on an actual STATUS change via a .save() path (admin, shell, a
-    # command using obj.save()). `created` => new tenant (NEW, not schedulable) → skip.
-    # A company_name/description edit leaves status unchanged → skip (a full beat reload
-    # is expensive). `_loaded_status` is stamped by Tenant.from_db.
-    # NOTE: QuerySet.update() bypasses signals entirely — those code paths bump
-    # explicitly (migrate_schemas / reconcile / the activate-deactivate API); a raw
-    # manual `.update(status=...)` in a shell is recovered with `resync_beat_schedules`.
-    prev = getattr(instance, "_loaded_status", None)
-    if not created and prev is not None and prev != instance.status:
-        _bump_beat(instance.schema_name)
-    instance._loaded_status = instance.status   # so a later save() doesn't re-bump
 
 
 @receiver(post_delete, sender=Tenant)
-def beat_forget_deleted_tenant(sender, instance, **kwargs):
-    # Tenant removed (admin / shell / API delete, all via .delete()). Only an ACTIVE
-    # tenant was in beat's schedule, so only then does beat need to reload; deleting a
-    # NEW/PENDING/DEACTIVATED/FAILED one changes nothing there → skip the costly reload.
-    if instance.status == Tenant.Status.ACTIVE:
-        _bump_beat(instance.schema_name)
+def invalidate_tenant_deleted(sender, instance, **kwargs):
+    # Deterministic schema-snap cleanup on delete. The host snapshots are dropped by the Domain
+    # post_delete cascade (dependents first), but by the time this fires the tenant's domains
+    # are gone — so the schema-snap can't be derived from any host. Drop it explicitly by
+    # schema_name (which survives on the instance). Closes the cold-cache delete gap without
+    # relying on the reconcile orphan-sweep. See deploy/celery_fanout_design.md (schema-snap).
+    resolve_cache.forget_schemas([instance.schema_name])

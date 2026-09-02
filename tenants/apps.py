@@ -6,27 +6,21 @@ class TenantsConfig(AppConfig):
     name = "tenants"
 
     def ready(self):
-        # Safety net: make late importers of the django-tenants context helpers
-        # get our shard-aware versions (which wire current_db + the schema on
-        # the SHARD connection, not just the default one).
+        # Safety net for THIRD-PARTY / django_tenants code that pulls the context helpers out of
+        # django_tenants.utils (e.g. django_tenants' own `collectstatic_schemas` command) — such
+        # LATE importers (command modules load after ready()) then get our shard-aware versions
+        # instead of the single-DB originals.
         #
-        # NOTE: `from django_tenants.utils import schema_context` binds at
-        # import time - modules imported BEFORE ready() keep the original.
-        # That's why project code must import from `tenants.context` directly
-        # (the import rule); this patch only covers third-party/legacy paths
-        # that import after startup.
+        # PARTIAL by nature: a module that imported those helpers BEFORE ready() keeps the
+        # original. That is why PROJECT code must import them from `tenants.context`, never rely
+        # on this patch — enforced statically by scripts/ci_guard_context_import.sh. (This aliased
+        # assignment form is invisible to that guard, which is correct: this is the sole patch site.)
         import django_tenants.utils as dt_utils
 
         from .context import schema_context, tenant_context
 
         dt_utils.schema_context = schema_context
         dt_utils.tenant_context = tenant_context
-
-        # Wire the Redis change-marker signals for the tenant-aware beat scheduler
-        # (one marker per tenant instead of polling every schema each tick).
-        from .celery.change_marker import connect_beat_change_signals
-
-        connect_beat_change_signals()
 
         # Register tenant-resolution cache invalidation signals.
         from . import signals  # noqa: F401

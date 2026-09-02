@@ -78,18 +78,18 @@ class HostRegistry:
     def _apply_membership(op, hostname):
         c = resolve_cache.get_redis_raw_client()
         if op == "sadd":
-            # Guard без Lua: не створюємо SET інкрементно — лише reconcile (RENAME) може.
-            # EXISTS→SADD не атомарно, але розійтись вони можуть ЛИШЕ через паралельний
-            # reconcile, який або RENAME-ить свіжий повний SET (наш SADD додасть реальний
-            # член), або (тільки на порожній БД) видаляє його — що неможливо, поки ми САМЕ
-            # додаємо домен. Катастрофічний сценарій (брокер ліг, reconcile нема) має
-            # EXISTS=False стабільно → ми коректно пропускаємо. Залишкова гонка
-            # самолікується dirty-recheck-ом.
+            # Lua-free guard: never build the SET incrementally — only reconcile (via RENAME)
+            # may create it. EXISTS→SADD is not atomic, but the two can only diverge under a
+            # concurrent reconcile, which either RENAMEs a fresh full SET into place (our SADD
+            # then adds a real member) or (empty DB only) deletes it — impossible while WE are
+            # the one adding a domain. The catastrophic case (broker down, no reconcile) sees
+            # EXISTS=False steadily → we correctly skip. Any residual race self-heals via the
+            # dirty-recheck.
             if c.exists(HOSTS_KEY):
                 c.sadd(HOSTS_KEY, hostname)
         else:
-            c.srem(HOSTS_KEY, hostname)          # безумовний no-op на відсутньому
-        pipe = c.pipeline()                       # dirty-bump: pipeline, не транзакція
+            c.srem(HOSTS_KEY, hostname)          # unconditional; no-op on a missing member
+        pipe = c.pipeline()                       # dirty-bump: pipeline, not a transaction
         pipe.incr(DIRTY_KEY)
         pipe.expire(DIRTY_KEY, _DIRTY_TTL_SECONDS, nx=True)
         pipe.execute()
@@ -182,6 +182,7 @@ class HostRegistry:
         drops stale positives; re-run if a mutation landed mid-build (dirty-recheck)."""
         if not self.warm_enabled or not resolve_cache.redis_alive():
             return 0
+        from tenants.models import Tenant
         c = resolve_cache.get_redis_raw_client()
         n, db_hosts = 0, set()
         for _ in range(3):                           # bounded re-runs on concurrent mutations
@@ -189,7 +190,11 @@ class HostRegistry:
             n, db_hosts = self._rebuild_once(c)
             if c.get(DIRTY_KEY) == before:
                 break
-        resolve_cache.sweep_orphans(db_hosts)        # ONCE, after the SET is final (cache owns layout)
+        # valid_schemas = ALL tenant schemas (incl. domainless tenants, which _rebuild_once —
+        # Domain-driven — does not enumerate), so the schema-snap sweep never drops a valid
+        # tenant's lazily-filled entry.
+        db_schemas = set(Tenant.objects.values_list("schema_name", flat=True))
+        resolve_cache.sweep_orphans(db_hosts, db_schemas)   # ONCE, after the SET is final
         return n
 
     _REBUILD_CHUNK = 2000
@@ -206,6 +211,8 @@ class HostRegistry:
                 return
             c.sadd(HOSTS_NEW_KEY, *(dm.domain for dm in batch))                 # 1 round-trip
             n += resolve_cache.put_many((dm.domain, dm.tenant) for dm in batch)  # ≤ #distinct-TTL
+            # schema-snap sibling (worker cache): one entry per DISTINCT tenant in the batch.
+            resolve_cache.put_schema_many({dm.tenant.schema_name: dm.tenant for dm in batch}.values())
             batch.clear()
 
         chunk = HostRegistry._REBUILD_CHUNK

@@ -12,12 +12,14 @@ unchanged, those hosts re-fill), so they are safe under the gate as-is.
 
 Fails loudly (CommandError) if Redis is unreachable, even under IGNORE_EXCEPTIONS.
 """
-from django.core.management.base import BaseCommand, CommandError
+from django.core.management.base import CommandError
+
+from commons.platform.commands import TenantCommand
 
 from tenants.resolver import CacheUnavailable, flags, resolve_cache
 
 
-class Command(BaseCommand):
+class Command(TenantCommand):
     help = "Invalidate tenant-resolution cache entries (by id, by schema_name, or all)."
 
     def add_arguments(self, parser):

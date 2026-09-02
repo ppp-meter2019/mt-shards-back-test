@@ -2,7 +2,7 @@
 namespace via registry_cfg (config.py); both the cache (write side) and the registry
 (gate side) go through these.
 
-NB: the tenants.E001 system check (tenants/checks.py) deliberately reads the RAW
+NB: the tenants.E001 system check (tenants/checks/gate.py) deliberately reads the RAW
 TENANT_REGISTRY dict, NOT gate_enabled() — it must see a GATE-on/WARM-off misconfig that
 the fail-safe below hides.
 """

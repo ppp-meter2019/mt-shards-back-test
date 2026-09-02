@@ -12,7 +12,9 @@ Example:
 
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
-from django.core.management.base import BaseCommand, CommandError
+from django.core.management.base import CommandError
+
+from commons.platform.commands import TenantCommand
 
 from tenants.context import tenant_context
 from tenants.models import Domain, Shard, Tenant
@@ -24,7 +26,7 @@ from tenants.validators import (
 from users.models import User
 
 
-class Command(BaseCommand):
+class Command(TenantCommand):
     help = "Create a tenant + its primary domain + a company-admin user."
 
     def add_arguments(self, parser):

@@ -1,0 +1,17 @@
+# Run-mode selector.
+#
+# Copy this file to `settings_mode.py` (same directory) to choose the mode WITHOUT an
+# environment variable and WITHOUT editing settings.py. settings_mode.py is gitignored.
+#
+# Precedence (see settings.py):
+#   1. env  USE_MULTITENANT=0/1   overrides this file (handy for CI / containers)
+#   2. this file (settings_mode.py)
+#   3. default False   (standalone — the host project's mode)
+#
+# Keep this file TRIVIAL — it is imported very early, before settings helpers exist,
+# so it must NOT reference anything from settings.py.
+#
+#   True  -> multi-tenant: django-tenants + shards, per-tenant schemas
+#   False -> standalone:   a single default DB, no tenant schemas (the host project)
+
+USE_MULTITENANT = True

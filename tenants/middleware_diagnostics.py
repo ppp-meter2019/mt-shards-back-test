@@ -26,7 +26,7 @@ import threading
 
 from asgiref.sync import iscoroutinefunction, markcoroutinefunction
 
-from .context import current_db
+from .context import active_alias
 
 
 # Resolved once at import time - hostname doesn't change for the life of a
@@ -68,10 +68,7 @@ class DiagnosticsHeadersMiddleware:
         response["X-Served-By"]  = _HOSTNAME
         response["X-Worker-Pid"] = str(os.getpid())
         response["X-Thread-Id"]  = str(threading.get_ident())
-        try:
-            response["X-DB-Alias"] = current_db.get()
-        except LookupError:
-            response["X-DB-Alias"] = "default"
+        response["X-DB-Alias"] = active_alias()   # None (unset) → "default"
 
         # Merge into any Access-Control-Expose-Headers already set by CORS
         # so the browser can read these in split-origin dev.

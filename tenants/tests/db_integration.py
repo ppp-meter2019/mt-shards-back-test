@@ -12,14 +12,16 @@ queries against live rules, candidate_q()'s SUPERSET/equivalence with matches() 
 real rows (including a non-normalized mixed-case domain), and the model.clean()
 enforcement paths used by admin.
 """
+from datetime import timedelta
 from unittest import mock
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 import tenants.resolver as rc
-from tenants.models import Domain, ReservedHostRule, Shard, Tenant
+from tenants.models import Domain, ReservedHostRule, Shard, TaskRun, Tenant
 from tenants.serializers import TenantSerializer
 from tenants.validators import validate_tenant_domain, validate_tenant_schema_name
 from tenants.views import BaseDomainsView
@@ -213,26 +215,30 @@ class TenantUpdateDBTests(TestCase):
         self.assertTrue(s.is_valid(), s.errors)
 
 
-class BeatSchemaFilterDBTests(TestCase):
-    """beat schedules ONLY ACTIVE tenants — NEW/PENDING/FAILED/DEACTIVATED are skipped
-    (their schemas may be unprovisioned/half-migrated, which would crash the scheduler)."""
+class FanoutTargetsDBTests(TestCase):
+    """The fanout enumeration helpers: interval targets = ACTIVE non-public tenants;
+    calendar targets = those that ALSO have a configured timezone (NULL tz skipped)."""
 
-    def test_only_active_tenants_returned(self):
-        from django_tenants.utils import get_public_schema_name
-        from tenants.celery.db_scheduler import TenantAwareDatabaseScheduler
+    def test_active_target_and_tz_filtering(self):
+        from commons.platform.tenancy import active_target_schemas, active_tenants_with_tz
 
-        Shard.objects.create(alias="default", name="Default", is_default=True, is_active=True)
+        d = Shard.objects.create(alias="default", name="Default", is_default=True, is_active=True)
         s1 = Shard.objects.create(alias="tenant_1", name="T1", is_default=False, is_active=True)
-        Tenant.objects.create(schema_name="act", company_name="Act", shard=s1, status=Tenant.Status.ACTIVE)
-        Tenant.objects.create(schema_name="newt", company_name="Newt", shard=s1, status=Tenant.Status.NEW)
-        Tenant.objects.create(schema_name="deact", company_name="Deact", shard=s1, status=Tenant.Status.DEACTIVATED)
-        Tenant.objects.create(schema_name="failt", company_name="Failt", shard=s1, status=Tenant.Status.FAILED)
+        Tenant.objects.create(schema_name="public", company_name="Public", shard=d,
+                              status=Tenant.Status.ACTIVE, timezone="UTC")
+        Tenant.objects.create(schema_name="act", company_name="Act", shard=s1,
+                              status=Tenant.Status.ACTIVE, timezone="Europe/Kyiv")
+        Tenant.objects.create(schema_name="act2", company_name="Act2", shard=s1,
+                              status=Tenant.Status.ACTIVE)                      # NULL tz
+        Tenant.objects.create(schema_name="newt", company_name="Newt", shard=s1,
+                              status=Tenant.Status.NEW)
+        Tenant.objects.create(schema_name="deact", company_name="Deact", shard=s1,
+                              status=Tenant.Status.DEACTIVATED)
 
-        # self is unused by the method; call unbound to avoid constructing a scheduler.
-        names = TenantAwareDatabaseScheduler.get_tenant_schema_names(None, [get_public_schema_name()])
-        self.assertIn("act", names)
-        for excluded in ("newt", "deact", "failt"):
-            self.assertNotIn(excluded, names)
+        # interval: all ACTIVE tenants, excluding public; NULL tz still included
+        self.assertEqual(set(active_target_schemas("tenants")), {"act", "act2"})
+        # calendar: only ACTIVE tenants WITH a tz (act2 NULL-tz + public excluded)
+        self.assertEqual({s for s, _ in active_tenants_with_tz()}, {"act"})
 
 
 class BaseDomainsEndpointDBTests(TestCase):
@@ -252,3 +258,29 @@ class BaseDomainsEndpointDBTests(TestCase):
         req = APIRequestFactory().get("/api/base-domains/")
         resp = BaseDomainsView.as_view()(req)
         self.assertIn(resp.status_code, (401, 403))
+
+
+class TaskRunTests(TestCase):
+    """Durable per-(task, schema) watermark: bulk upsert + load_map round-trip."""
+
+    def test_mark_ran_upserts_and_load_map_reads(self):
+        t1 = timezone.now().replace(microsecond=0)
+        TaskRun.mark_ran("app.daily", ["a", "b"], t1)
+        self.assertEqual(set(TaskRun.load_map("app.daily")), {"a", "b"})
+
+        t2 = t1 + timedelta(hours=1)
+        TaskRun.mark_ran("app.daily", ["a"], t2)          # upsert 'a', leave 'b'
+        m = TaskRun.load_map("app.daily")
+        self.assertEqual(m["a"], t2)
+        self.assertEqual(m["b"], t1)
+
+    def test_mark_ran_parses_iso_string(self):
+        t = timezone.now().replace(microsecond=0)
+        TaskRun.mark_ran("app.weekly", ["c"], t.isoformat())   # run_ts as ISO string
+        self.assertEqual(TaskRun.load_map("app.weekly")["c"], t)
+
+    def test_load_map_is_scoped_per_task(self):
+        now = timezone.now()
+        TaskRun.mark_ran("task.x", ["a"], now)
+        TaskRun.mark_ran("task.y", ["b"], now)
+        self.assertEqual(set(TaskRun.load_map("task.x")), {"a"})

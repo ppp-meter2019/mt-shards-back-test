@@ -116,6 +116,17 @@ class Shard(models.Model):
         return super().delete(*args, **kwargs)
 
 
+def _validate_timezone(value):
+    """Validate an IANA timezone name; NULL/empty is allowed (the 'unset' sentinel)."""
+    if not value:
+        return
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValidationError({"timezone": f"{value!r} is not a valid IANA timezone."})
+
+
 class Tenant(TenantMixin):
     """A business tenant. Owns one PostgreSQL schema on one Shard.
 
@@ -147,6 +158,13 @@ class Tenant(TenantMixin):
     status_changed_at = models.DateTimeField(auto_now=True)
     last_error        = models.TextField(blank=True)
     created_on        = models.DateField(auto_now_add=True)
+    # IANA timezone for per-tenant CALENDAR (crontab) tasks. NULL = no-op sentinel set
+    # at creation; the real value is pushed onto this public row by an in-schema settings
+    # singleton (arrives at merge) via sync_tenant_timezone(). While NULL, calendar tasks
+    # are NOT scheduled for this tenant (interval tasks are unaffected). See
+    # deploy/celery_fanout_design.md §3.
+    timezone          = models.CharField(
+        max_length=64, null=True, blank=True, default=None, validators=[_validate_timezone])
 
     # Schema lifecycle is fully managed by our management commands.
     auto_create_schema = False
@@ -157,16 +175,6 @@ class Tenant(TenantMixin):
 
     def __str__(self):
         return self.company_name
-
-    @classmethod
-    def from_db(cls, db, field_names, values):
-        # Remember the status as loaded, so the post_save signal can bump beat ONLY on
-        # an actual status change (any .save() path: admin, shell, a command using
-        # obj.save()) — and NOT on a company_name/description edit.
-        instance = super().from_db(db, field_names, values)
-        if "status" in field_names:          # don't force a query on .only()/.defer() loads
-            instance._loaded_status = instance.status
-        return instance
 
     @property
     def db_alias(self) -> str:
@@ -347,3 +355,56 @@ class ReservedHostRule(models.Model):
         if self.match_type == self.MatchType.SUFFIX:
             return f"Hosts under '{self.value}' are reserved."
         return f"Host '{self.value}' is reserved."
+
+
+class TaskRun(models.Model):
+    """Durable per-(task, tenant-schema) last-run watermark for CALENDAR (tz) fanout.
+
+    Lives in default.public (SHARED). Makes per-tenant due-ness level-triggered: a missed
+    tick self-heals within `grace`, and re-firing the same occurrence is deduped. Only
+    calendar tasks write here; interval / public tasks do not. See
+    deploy/celery_fanout_design.md §3.
+    """
+    schema      = models.CharField(max_length=63)
+    task        = models.CharField(max_length=255)
+    last_run_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["schema", "task"], name="tenants_taskrun_unique"),
+        ]
+        indexes = [models.Index(fields=["task"], name="tenants_taskrun_task_idx")]
+
+    def __str__(self):
+        return f"{self.task}@{self.schema} last={self.last_run_at:%Y-%m-%d %H:%M:%SZ}"
+
+    @classmethod
+    def load_map(cls, task):
+        """{schema: last_run_at} for a task — one query, read at the start of each tick."""
+        return dict(cls.objects.filter(task=task).values_list("schema", "last_run_at"))
+
+    @classmethod
+    def mark_ran(cls, task, schemas, run_ts):
+        """Bulk-upsert last_run_at=run_ts for the given schemas (after successful send)."""
+        if not schemas:
+            return
+        if isinstance(run_ts, str):
+            from django.utils.dateparse import parse_datetime
+            run_ts = parse_datetime(run_ts)
+        cls.objects.bulk_create(
+            [cls(schema=s, task=task, last_run_at=run_ts) for s in schemas],
+            update_conflicts=True,
+            unique_fields=["schema", "task"],
+            update_fields=["last_run_at"],
+        )
+
+
+def sync_tenant_timezone(schema_name, tz):
+    """Set a tenant's IANA timezone on its PUBLIC Tenant row (default.public).
+
+    The single writer of Tenant.timezone — intended for the in-schema settings singleton's
+    save hook (arrives at project merge). Uses .update() (no signals); the fanout dispatcher
+    reads tz fresh each tick, so there is no cache to invalidate. Returns rows updated (0 if
+    the schema is unknown). Pass tz=None to reset a tenant back to the 'unset' sentinel.
+    """
+    return Tenant.objects.filter(schema_name=schema_name).update(timezone=tz)

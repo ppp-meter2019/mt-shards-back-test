@@ -122,8 +122,8 @@ class StoreTtlByStatusTests(SimpleTestCase):
     def test_active_no_ttl_deactivated_ttl(self):
         from tenants.models import Tenant
         rc = TenantResolveCache(cache=self._RecCache())
-        rc.store("h1", make_tenant(status=Tenant.Status.ACTIVE))
-        rc.store("h2", make_tenant(status=Tenant.Status.DEACTIVATED))
+        rc.put("h1", make_tenant(status=Tenant.Status.ACTIVE))
+        rc.put("h2", make_tenant(status=Tenant.Status.DEACTIVATED))
         by_key = {k: (ttl, nx) for k, ttl, nx in rc.cache.calls}
         self.assertEqual(by_key[rc._snap_key("h1")], (None, True))   # ACTIVE → no expiry, nx
         self.assertEqual(by_key[rc._snap_key("h2")], (3600, True))   # DEACTIVATED → 1h
@@ -131,7 +131,7 @@ class StoreTtlByStatusTests(SimpleTestCase):
     @override_settings(TENANT_REGISTRY={"WARM_ENABLED": False}, TENANT_RESOLVE={"POSITIVE_CACHE_SECONDS": 3600})
     def test_legacy_flat_ttl_when_warm_off(self):
         rc = TenantResolveCache(cache=self._RecCache())
-        rc.store("h", make_tenant())
+        rc.put("h", make_tenant())
         self.assertEqual(rc.cache.calls[0][1], 3600)    # flat _pos_ttl
 
 
@@ -500,3 +500,67 @@ class ConfigNamespaceTests(SimpleTestCase):
         from tenants.resolver.config import resolve_cfg
         dup = copy.deepcopy(resolve_cfg)             # exercises __deepcopy__/reduce probes
         self.assertEqual(dup.HOLD_SECONDS, resolve_cfg.HOLD_SECONDS)
+
+
+class ResolveFailOpenRoutingTests(SimpleTestCase):
+    """service.resolve() exception policy: not_found / OperationalError propagate; RedisError
+    (infra) fails open QUIETLY; any other error (a bug) still fails open but LOUD. Fail-open is
+    safe because db_resolver() returns the correct tenant. (enabled is True by default:
+    POSITIVE_CACHE_SECONDS=3600, so resolve() enters the cache path.)"""
+    class NotFound(Exception):
+        pass
+
+    def _run(self, exc):
+        from tenants.resolver import service
+        sent = object()
+        with mock.patch.object(service, "_via_cache", side_effect=exc), \
+             mock.patch.object(service, "_log_cache_fail") as fail, \
+             mock.patch.object(service, "_log_cache_bug") as bug:
+            result = service.resolve("h", lambda: sent, self.NotFound)
+        return result, sent, fail, bug
+
+    def test_not_found_propagates(self):
+        from tenants.resolver import service
+        with mock.patch.object(service, "_via_cache", side_effect=self.NotFound):
+            with self.assertRaises(self.NotFound):
+                service.resolve("h", lambda: None, self.NotFound)
+
+    def test_operational_error_propagates(self):
+        from django.db import OperationalError
+        from tenants.resolver import service
+        with mock.patch.object(service, "_via_cache", side_effect=OperationalError):
+            with self.assertRaises(OperationalError):
+                service.resolve("h", lambda: None, self.NotFound)
+
+    def test_redis_error_fails_open_quietly(self):
+        from redis.exceptions import RedisError
+        result, sent, fail, bug = self._run(RedisError("down"))
+        self.assertIs(result, sent)          # fail-open to DB
+        fail.assert_called_once()            # infra → WARNING path
+        bug.assert_not_called()
+
+    def test_unexpected_bug_fails_open_loudly(self):
+        result, sent, fail, bug = self._run(TypeError("boom"))
+        self.assertIs(result, sent)          # still fail-open (DB is correct)
+        bug.assert_called_once()             # bug → ERROR path
+        fail.assert_not_called()
+
+
+class BugLogThrottleTests(SimpleTestCase):
+    """_log_cache_bug throttles like _log_cache_fail but at ERROR level, with its OWN counter
+    so a bug is never masked by infra-warning noise."""
+    def setUp(self):
+        from tenants.resolver import service
+        self.svc = service
+        self.svc._bug_last = 0.0
+        self.svc._bug_suppressed = 0
+        self.addCleanup(setattr, self.svc, "_bug_last", 0.0)
+        self.addCleanup(setattr, self.svc, "_bug_suppressed", 0)
+
+    def test_first_logs_error_then_suppresses(self):
+        with mock.patch.object(self.svc.time, "monotonic", return_value=2000.0), \
+                mock.patch.object(self.svc.logger, "error") as err:
+            for _ in range(3):
+                self.svc._log_cache_bug("h")
+        self.assertEqual(err.call_count, 1)
+        self.assertEqual(self.svc._bug_suppressed, 2)
