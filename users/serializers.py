@@ -39,6 +39,9 @@ class PublicTokenObtainPairSerializer(_BaseTokenObtainPairSerializer):
 
     def validate(self, attrs):
         data = super().validate(attrs)
+        # Literal "public", not get_public_schema_name(): this module must import cleanly
+        # in STANDALONE, where django_tenants is NOT installed (audited standalone-safe
+        # file — see the ALLOW list in scripts/ci_guard_schema_name.sh).
         if connection.schema_name != "public":
             raise serializers.ValidationError(
                 "Tenant administrators must log in on the management host."
@@ -55,7 +58,7 @@ class TenantTokenObtainPairSerializer(_BaseTokenObtainPairSerializer):
 
     def validate(self, attrs):
         data = super().validate(attrs)
-        if connection.schema_name == "public":
+        if connection.schema_name == "public":      # literal: see the note above
             raise serializers.ValidationError(
                 "This endpoint is only available on tenant subdomains."
             )

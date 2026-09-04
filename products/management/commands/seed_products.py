@@ -72,6 +72,9 @@ class Command(BaseCommand):
             # Захист: якщо команду запустили напряму (без tenant_command),
             # search_path лишиться на public — а в public нема `products_product`.
             # Видамо чітку помилку замість підступного `ProgrammingError`.
+            # Літерал "public", а не get_public_schema_name(): цей модуль має
+            # імпортуватися і в STANDALONE, де django_tenants НЕ встановлений
+            # (аудитований standalone-safe файл — див. ALLOW у ci_guard_schema_name.sh).
             if schema == "public":
                 raise CommandError(
                     "Цю команду треба запускати через "

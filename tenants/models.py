@@ -20,6 +20,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.deletion import ProtectedError
+from django.utils import timezone
 from django_tenants.models import DomainMixin, TenantMixin
 from django_tenants.utils import get_public_schema_name
 
@@ -155,7 +156,12 @@ class Tenant(TenantMixin):
     )
     status            = models.CharField(max_length=16, choices=Status.choices, default=Status.NEW)
     previous_status   = models.CharField(max_length=16, choices=Status.choices, default=Status.NEW)
-    status_changed_at = models.DateTimeField(auto_now=True)
+    # When the STATUS last moved — not when the row was last touched. auto_now would mean
+    # the latter: it fires on every .save() (an admin edit of `description` would shift it)
+    # and never on QuerySet.update() (where every status writer lives). The value is now
+    # maintained by save() below for .save() paths, and set explicitly by the .update()
+    # callers (migrate_schemas, reconcile_tenants, TenantViewSet._transition).
+    status_changed_at = models.DateTimeField(default=timezone.now)
     last_error        = models.TextField(blank=True)
     created_on        = models.DateField(auto_now_add=True)
     # IANA timezone for per-tenant CALENDAR (crontab) tasks. NULL = no-op sentinel set
@@ -199,12 +205,35 @@ class Tenant(TenantMixin):
                 from .validators import validate_tenant_schema_name
                 validate_tenant_schema_name(self.schema_name)
 
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        """Snapshot the status as loaded, so save() can tell a real transition from any
+        other edit. Guarded on field_names because a deferred load (.only()/.defer())
+        would otherwise trigger a refetch right here."""
+        obj = super().from_db(db, field_names, values)
+        if "status" in field_names:
+            obj._loaded_status = obj.status
+        return obj
+
     def save(self, *args, **kwargs):
         if self.read_only:
             raise ReadOnlyInstanceError(
                 "This Tenant is a read-only request snapshot (tenants.middleware); "
                 "re-fetch it via Tenant.objects.get(pk=...) before saving."
             )
+        # status_changed_at tracks the STATUS, not the row — so stamp it here iff the status
+        # actually moved. This keeps every .save() path correct (the admin status change
+        # included) without each caller remembering, and stops an unrelated edit
+        # (description, company_name, timezone) from shifting it the way auto_now did.
+        # QuerySet.update() cannot be intercepted here, so those callers set it explicitly.
+        # No _loaded_status (a deferred load) => stamp: a MISSED transition is worse than a
+        # spurious timestamp. update_fields is keyword-only in Django 5.x, so kwargs is the
+        # whole story; it must be extended or the new value would not be written at all
+        # (e.g. scripts/resolve_cache_bench.py does save(update_fields=["status"])).
+        if self._state.adding or self.status != getattr(self, "_loaded_status", None):
+            self.status_changed_at = timezone.now()
+            if (update_fields := kwargs.get("update_fields")) is not None:
+                kwargs["update_fields"] = {*update_fields, "status_changed_at"}
         return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
@@ -240,6 +269,28 @@ class Domain(DomainMixin):
         if self.tenant_id and self.tenant.schema_name == get_public_schema_name():
             return
         self.domain = validate_tenant_domain(self.domain)
+
+    def save(self, *args, **kwargs):
+        """Canonicalize the hostname on EVERY save path, then defer to DomainMixin.
+
+        clean() is not enough: it only runs under full_clean() (admin form, explicit
+        calls), while .create()/.save() from operator-trusted commands, data migrations
+        and legacy imports bypass it by design. A non-canonical value (upper case,
+        trailing FQDN dot, copy-pasted whitespace) is stored verbatim and can then never
+        match an incoming Host - request.get_host() returns the RAW header and the
+        column compares case-sensitively - so the tenant is silently unreachable.
+
+        Normalization is NOT validation: this deliberately does not apply the
+        reserved-host rules, so the public tenant's exemption in clean() still holds.
+        NB: bulk_create() and QuerySet.update() bypass save() entirely. get_or_create()
+        DOES reach save() on the create branch, but its lookup half matches on the RAW
+        kwarg - so a non-canonical value would miss the existing row, then collide with
+        it on the unique index. Callers on that path must normalize the lookup value
+        themselves (see bootstrap_public).
+        """
+        from .validators import normalize_host
+        self.domain = normalize_host(self.domain)
+        return super().save(*args, **kwargs)
 
 
 class ReservedHostRule(models.Model):

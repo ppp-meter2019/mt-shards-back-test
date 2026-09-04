@@ -10,8 +10,9 @@ WHERE TO RUN
     tenant_resolve Redis (db2) AND the staging `default` Postgres, with the app
     code + a STAGING settings_local.py importable. Do NOT run load ON a gunicorn
     host (it steals CPU from the workers and skews numbers); use a sibling box.
-    The tenant_resolve Redis / `default` DB are VPC-private (settings.py:330) — the
-    script cannot run "from the internet".
+    The tenant_resolve Redis / `default` DB are VPC-private (their endpoints come from
+    CACHES["tenant_resolve"] / DATABASES in settings_local.py) — the script cannot run
+    "from the internet".
 
 SAFETY (built for staging)
     * Creates ephemeral rows only under the `bench_` schema-name / `.loadtest.local`
@@ -233,7 +234,7 @@ def cleanup_bench_data():
     # (tenants.signals) which writes a fresh hold/tombstone marker per host. Sweeping
     # the cache AFTER therefore also removes those signal-written markers — sweeping
     # first would leave exactly `known` tombstones behind (they self-expire in
-    # TENANT_RESOLVE_HOLD_SECONDS, but we clean fully).
+    # TENANT_RESOLVE["HOLD_SECONDS"], but we clean fully).
     dn, _ = Domain.objects.filter(domain__endswith=BENCH_DOMAIN_SUFFIX).delete()
     tn, _ = Tenant.objects.filter(schema_name__startswith=BENCH_SCHEMA_PREFIX).delete()
     sn = 0

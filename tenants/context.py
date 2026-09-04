@@ -40,10 +40,22 @@ current_db: ContextVar = ContextVar("current_db", default=None)
 
 
 def active_alias():
-    """Effective DB alias for readers that only need 'an alias, default if no routing context'
-    (compat, diagnostics). The ROUTER reads current_db RAW to detect the unset (None) state for
-    its strict guard — it must NOT use this."""
+    """EFFECTIVE alias, for readers that only need somewhere to look: the bound alias, or
+    "default" when no routing context is established (compat, diagnostics). It COALESCES the
+    unset state — do not use it where that distinction matters; use bound_alias()."""
     return current_db.get() or "default"
+
+
+def bound_alias():
+    """The alias explicitly BOUND to this context, or None when none is established.
+
+    That None is load-bearing and must not be collapsed: it is what lets TenantDatabaseRouter
+    tell a genuinely context-free query (a bug — the strict guard raises) from one deliberately
+    routed to "default". The router is the only intended caller; every other reader wants
+    active_alias(). Both exist so that nothing outside this module has to touch the ContextVar
+    itself — enforced by scripts/ci_guard_routing_axis.sh.
+    """
+    return current_db.get()
 
 
 @contextmanager

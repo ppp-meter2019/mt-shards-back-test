@@ -7,7 +7,7 @@ what a downstream Athena / Kinesis-Firehose pipeline (Jira IT-21374) expects,
 so objects can be scanned by tenant + day without listing the whole bucket.
 
 Runtime: this project runs SYNC Gunicorn prefork workers over WSGI (see the
-"Worker model" note in settings.py); boto3 is blocking, which is exactly right
+"Worker model" note in settings_base.py); boto3 is blocking, which is exactly right
 here. Call this straight from a DRF view or a Celery task. Do NOT add an async
 wrapper - the async/ASGI path is intentionally unused.
 

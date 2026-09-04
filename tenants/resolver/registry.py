@@ -1,6 +1,6 @@
 """Host-existence gate + reconcile for tenant resolution. See deploy/resolve_gate_design.md.
 
-`tres:hosts` (Redis SET, tenant_resolve db) holds every valid hostname; its EXISTENCE is
+`treg:hosts` (Redis SET, tenant_resolve db) holds every valid hostname; its EXISTENCE is
 the consistency flag. Consulted on a positive-cache MISS:
   MEMBER    → known host → resolve from DB (cold-fill)
   NONMEMBER → unknown host → reject WITHOUT a DB hit
@@ -16,7 +16,7 @@ never overlap under a SCAN/`delete_pattern`, and are visually unambiguous:
   treg:warm_pending enqueue-coalescing marker (self-expiring; set-only, never deleted)
 
 Maintained by Domain signals (SADD/SREM + arm) and the reconcile task (force-rebuild).
-Everything is gated by TENANT_REGISTRY_WARM_ENABLED / _GATE_ENABLED — a no-op until on.
+Everything is gated by TENANT_REGISTRY["WARM_ENABLED"] / ["GATE_ENABLED"] — a no-op until on.
 """
 import logging
 
@@ -53,7 +53,7 @@ class HostRegistry:
     @property
     def gate_enabled(self):
         # Fail-safe (GATE effective only with WARM) lives in flags.gate_enabled(): WARM is
-        # the write side that builds tres:hosts; GATE-without-WARM would make every resolve
+        # the write side that builds treg:hosts; GATE-without-WARM would make every resolve
         # UNKNOWN -> fail-open + fill_cap-throttle legit traffic, so it is treated as OFF in
         # every process even if the tenants.E001 deploy check was skipped.
         return flags.gate_enabled()
@@ -124,7 +124,7 @@ class HostRegistry:
     # ---- on-demand warm trigger ----
     def trigger_warm(self):
         """Enqueue a reconcile, coalescing bursts via a short SELF-EXPIRING NX marker
-        (`tres:warm_pending`). One-sided lifecycle: only set-with-expiry here, never
+        (`treg:warm_pending`). One-sided lifecycle: only set-with-expiry here, never
         deleted elsewhere — so a lost broker publish self-heals when the marker expires,
         and no other writer can clear a marker it didn't set. Best-effort. Correctness of
         mid-run mutations is handled by the reconcile dirty-recheck, not this marker."""
@@ -144,7 +144,7 @@ class HostRegistry:
 
     # ---- single-writer entry point (used by the celery task / mgmt command) ----
     def run_locked(self):
-        """Acquire the tres:warming lock, reconcile, release. Returns the number of
+        """Acquire the treg:warming lock, reconcile, release. Returns the number of
         positives written, or None if another writer holds the lock (or WARM is off).
 
         Uses redis-py's Lock: a unique token + fenced release (release() deletes only if
@@ -167,18 +167,18 @@ class HostRegistry:
                 # Lock expired mid-reconcile (slower than lock_ttl) → not ours to release.
                 # Safe to ignore: a later writer may now hold it; we must not touch theirs.
                 logger.warning("host_registry: warm lock expired before release", exc_info=True)
-            # NB: tres:warm_pending is intentionally NOT cleared here — it self-expires
+            # NB: treg:warm_pending is intentionally NOT cleared here — it self-expires
             # (see trigger_warm). Clearing it would let this run wipe a marker a LATER
             # trigger set, and the marker never gated correctness (dirty-recheck does).
 
     # ---- reconcile (force-rebuild; the warm task body, single writer) ----
     def reconcile(self):
-        """Force-rebuild `tres:hosts` + positive snapshots from the DB. The caller holds
-        the tres:warming lock. Positive snapshots are FORCE-overwritten in place with fresh
+        """Force-rebuild `treg:hosts` + positive snapshots from the DB. The caller holds
+        the treg:warming lock. Positive snapshots are FORCE-overwritten in place with fresh
         data (ttl_by_status) via put_many — the 5s hold is NOT respected here (reconcile is
         the authoritative single writer that just read the DB; the hold only guards the
         resolve-path nx race, and mid-build races are caught by dirty-recheck + orphan-sweep).
-        The SET is built in tres:hosts:new and swapped in with an atomic RENAME; orphan-sweep
+        The SET is built in treg:hosts:new and swapped in with an atomic RENAME; orphan-sweep
         drops stale positives; re-run if a mutation landed mid-build (dirty-recheck)."""
         if not self.warm_enabled or not resolve_cache.redis_alive():
             return 0

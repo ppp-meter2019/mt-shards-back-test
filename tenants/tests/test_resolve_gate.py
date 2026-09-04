@@ -7,7 +7,9 @@ from django.test import SimpleTestCase, override_settings
 from redis.exceptions import RedisError
 
 import tenants.middleware as mw
-from tenants.resolver import TenantResolveCache, resolve_cache, fill_cap
+from tenants.resolver import (
+    ResolveDeferred, TenantResolveCache, resolve_cache, fill_cap,
+)
 from tenants.resolver import (
     DIRTY_KEY, WARM_LOCK_KEY, WARM_PENDING_KEY, HostRegistry, host_registry,
 )
@@ -94,13 +96,26 @@ class GateMiddlewareTests(SimpleTestCase):
         self.assertEqual(got.schema_name, "alpha")
         self.assertEqual(dm.db_calls["n"], 1)
 
-    def test_unknown_without_budget_rejects_no_db(self):
+    def test_unknown_without_budget_defers_no_db(self):
+        """Flag-absent + budget spent => ResolveDeferred, NOT DoesNotExist.
+
+        The gate never established that the host is unknown (that is what UNKNOWN means),
+        it declined to look. Raising the caller's not_found here would surface a 404 —
+        telling a legitimate tenant's users their workspace is gone — instead of the
+        retryable 503 the middleware maps ResolveDeferred to."""
         dm = make_domain_model(make_tenant())
-        with use_resolve_cache(FakeNxCache()), self._check(HostRegistry.UNKNOWN), \
+        fake = FakeNxCache()
+        with use_resolve_cache(fake), self._check(HostRegistry.UNKNOWN), \
                 mock.patch.object(fill_cap, "allow", lambda: False):
-            with self.assertRaises(dm.DoesNotExist):
+            with self.assertRaises(ResolveDeferred):
                 self.mw.get_tenant(dm, "known")
-        self.assertEqual(dm.db_calls["n"], 0)
+        self.assertEqual(dm.db_calls["n"], 0)        # declined WITHOUT touching the DB
+        self.assertNotIn("known", fake.store)        # and WITHOUT writing a negative
+
+    def test_deferred_is_not_a_not_found(self):
+        """A deferral must never be mistakable for 'no such tenant' by an except clause."""
+        dm = make_domain_model(make_tenant())
+        self.assertFalse(issubclass(ResolveDeferred, dm.DoesNotExist))
 
 
 class StoreTtlByStatusTests(SimpleTestCase):
@@ -162,6 +177,26 @@ class PutManyTests(SimpleTestCase):
         by_ttl = {ttl: keys for keys, ttl in rc.cache.calls}
         self.assertEqual(by_ttl[None], {rc._snap_key("h1"), rc._snap_key("h3")})  # ACTIVE → no expiry
         self.assertEqual(by_ttl[3600], {rc._snap_key("h2")})                      # DEACTIVATED → 1h
+        self.assertEqual(len(rc.cache.calls), 2)        # exactly one set_many per TTL
+
+    @override_settings(
+        TENANT_REGISTRY={"WARM_ENABLED": True},
+        TENANT_RESOLVE={"WARM_TTL_BY_STATUS": {"active": None, "deactivated": 3600}},
+    )
+    def test_schema_side_groups_by_ttl_too(self):
+        """The schema-keyed sibling must group by TTL identically — both wrappers share
+        _put_many_by_ttl, and without this the shared core is only guarded on the host side."""
+        from tenants.models import Tenant
+        rc = TenantResolveCache(cache=self._ManyCache())
+        n = rc.put_schema_many([
+            make_tenant(schema_name="s1", status=Tenant.Status.ACTIVE),
+            make_tenant(schema_name="s2", status=Tenant.Status.DEACTIVATED),
+            make_tenant(schema_name="s3", status=Tenant.Status.ACTIVE),
+        ])
+        self.assertEqual(n, 3)
+        by_ttl = {ttl: keys for keys, ttl in rc.cache.calls}
+        self.assertEqual(by_ttl[None], {rc._schema_snap_key("s1"), rc._schema_snap_key("s3")})
+        self.assertEqual(by_ttl[3600], {rc._schema_snap_key("s2")})
         self.assertEqual(len(rc.cache.calls), 2)        # exactly one set_many per TTL
 
 

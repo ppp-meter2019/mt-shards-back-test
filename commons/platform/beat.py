@@ -28,9 +28,11 @@ from commons.platform.mode import use_multitenant, bootstrap_float
 
 # Canonical name of the fan-out dispatcher task — the contract between the PRODUCER
 # (scoped_schedule below, which emits it into the beat entry's "task") and the DEFINER
-# (tenants.celery.dispatch, which registers it via @shared_task(name=...)). They live on
-# opposite sides of the one-way commons<-tenants layer boundary and can't share the Celery
-# registration, so this single string is the shared source of truth; `tenants` imports it UP.
+# (tenants.celery.dispatch, which registers it via @shared_task(name=...)). A STRING, not the
+# task object, because this module is in the LOAD-TIME half of commons.platform: scoped_schedule
+# runs while settings.py is still executing, when the app registry does not exist and nothing
+# can be imported from `tenants` or looked up. See the module docstring of commons/platform
+# for that rule; `tenants` imports this name UP.
 # In standalone it is just an unused constant (scoped_schedule is identity there). The whole
 # wiring is enforced live by the tenants.E005 system check.
 FANOUT_TASK_NAME = "tenants.tasks.fanout_dispatch"

@@ -4,7 +4,8 @@
 (reading that during settings.py execution would cache an incomplete settings object).
 It mirrors the bootstrap precedence used in settings.py: env → settings_mode.py → default.
 
-Used by settings.py (to set USE_MULTITENANT) AND by helpers that may run at settings
+Used by settings_base.py (to set USE_MULTITENANT), by the settings.py dispatcher (to pick
+its branch) AND by helpers that may run at settings
 load — notably commons.platform.beat.scoped_schedule, which the host project calls while building
 CELERY_BEAT_SCHEDULE. Runtime-only helpers (task_queue, beat_conf) may read
 settings.* directly; this is for the bootstrap flag only.

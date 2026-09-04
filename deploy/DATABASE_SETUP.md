@@ -116,7 +116,7 @@ All production connections use `sslmode=verify-full` against the **vendored**
 AWS RDS CA bundle, so no certificate is fetched at deploy time:
 
 - Bundle path: `deploy/certs/aws-rds-global-bundle.pem` (committed to the repo).
-- `settings.py` exposes it as `AWS_RDS_CA` (overridable via the `AWS_RDS_CA`
+- `settings_base.py` exposes it as `AWS_RDS_CA` (overridable via the `AWS_RDS_CA`
   env var).
 - `_aurora_db_options()` builds the per-cluster `OPTIONS`:
   `{"connect_timeout": 5, "sslmode": "verify-full", "sslrootcert": AWS_RDS_CA}`.
@@ -132,7 +132,7 @@ curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
 
 ## 5. Django settings wiring
 
-### 5a. Dev default (`settings.py`)
+### 5a. Dev default (`settings_base.py`)
 
 Only the `default` alias is defined, pointing at a local Postgres. No TLS, no
 shards. This is what `runserver` and tests use.

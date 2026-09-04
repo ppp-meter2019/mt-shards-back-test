@@ -54,9 +54,9 @@ base, selected by a single boot-time flag `USE_MULTITENANT`.
 
 ## 1. Mode resolver — DONE (Phase 1)
 
-`settings.py`, evaluated at import time (it gates INSTALLED_APPS / DB backend /
+`settings_base.py`, evaluated at import time (it gates INSTALLED_APPS / DB backend /
 middleware, so it cannot come from `settings_local` imported last, nor from the
-DB):
+DB). The dispatcher `settings.py` calls the same resolver to pick its branch:
 
 ```python
 if "USE_MULTITENANT" in os.environ:
@@ -83,15 +83,34 @@ else:
 - `users/admin.py` rewired onto `management_site()` — the only real cross-app
   `tenants` import outside the app, now removed.
 
-## 3. Settings split — Phase 2 (refactored to a file)
+## 3. Settings split — Phase 2 (three files + a dispatcher)
 
-`settings.py` is now the **standalone/shared base** (no scattered `if USE_MULTITENANT`).
-All multi-tenant config lives in **`tenants_back/settings_multitenant.py`**, loaded at the
-BOTTOM of `settings.py` — `if USE_MULTITENANT: from .settings_multitenant import *` —
-BEFORE `settings_local` (so production overrides still win over both). The MT file imports
-the base building blocks (`_DJANGO_APPS`/`_THIRD_PARTY_APPS`/`_BUSINESS_APPS`) and the
-objects it augments (`DATABASES`/`CACHES`/`REST_FRAMEWORK`/`CELERY_BROKER_URL`), then
-reassembles the union INSTALLED_APPS + overrides the rest. The mode flag resolves via
+| File | Role |
+|---|---|
+| `settings_base.py` | the **standalone/shared base** — complete on its own, no scattered `if USE_MULTITENANT` |
+| `settings_multitenant.py` | the MT overlay; **star-imports the base itself**, then augments it |
+| `settings.py` | a ~40-line **dispatcher**: picks one branch, then applies `settings_local` |
+| `settings_local.py` | production overrides, applied LAST so they win over base AND overlay |
+
+`DJANGO_SETTINGS_MODULE` stays `tenants_back.settings` everywhere (manage.py, wsgi, asgi,
+celery, `bin/gunicorn_start.sh`, `scripts/`) — the mode is chosen inside the dispatcher, not
+by pointing Django at a different module, so a deployment switches modes with an env var and
+no config edits.
+
+The dependency runs **base <- overlay**, one way. An earlier layout had `settings.py` BE the
+base with the overlay importing names back out of it; that worked only while every imported
+name happened to be defined above the overlay's import line, and reordering the base broke
+boot with `cannot import name X from partially initialized module`. The overlay now gets the
+base blocks (`_DJANGO_APPS`/`_THIRD_PARTY_APPS`/`_BUSINESS_APPS`) and the objects it augments
+(`DATABASES`/`CACHES`/`REST_FRAMEWORK`/`CELERY_BROKER_URL`) from a plain forward
+`from .settings_base import *`, then reassembles the union INSTALLED_APPS + overrides the rest.
+
+> **Trap.** `import *` skips underscore-prefixed names, so the dispatcher must RE-EXPORT
+> `_aurora_db_options` / `_proxy_db_options` explicitly — a deployed `settings_local.py`
+> imports them from `.settings`. Without that line it raises ImportError, which the
+> dispatcher's `except` swallows into a SILENT boot on dev defaults (DEBUG=True,
+> ALLOWED_HOSTS=["*"], the insecure SECRET_KEY). Pinned by
+> `test_settings_invariants.SettingsLocalContractTests`. The mode flag resolves via
 `commons/platform/mode.py::use_multitenant()` (settings-load-safe — does NOT read
 `django.conf.settings`, which would cache incomplete settings). Verified behavior-preserving:
 resolved settings are byte-identical before/after the split in both modes.
@@ -107,14 +126,13 @@ The base vs MT mapping (each was previously an inline `if USE_MULTITENANT: … e
 | `ROOT_URLCONF` | `urls_tenant` (+ `PUBLIC_SCHEMA_URLCONF`) | `tenants_back.urls_standalone` (stub; host project overrides) |
 | `MIDDLEWARE` | + 2 tenant middlewares + diagnostics + `SchemaBoundSessionMiddleware` | base only, stock `SessionMiddleware` |
 | DRF auth | `SchemaBoundJWTAuthentication` | `rest_framework_simplejwt…JWTAuthentication` |
-| `CACHES` beat / tenant_resolve | defined | omitted (only `default`) |
+| `CACHES` `tenant_resolve` / `beat_lock` | defined | omitted (only `default`) |
 | `TENANT_RESOLVE` / `TENANT_REGISTRY` / `TENANT_BASE_DOMAINS` | defined | omitted |
-| `CELERY_BEAT_SCHEDULER` | `TenantAwareDatabaseScheduler` | stock `DatabaseScheduler` (Celery redesign is separate) |
+| `CELERY_BEAT_SCHEDULER` | `redbeat.RedBeatScheduler` (+ `CELERY_REDBEAT_*`) | unset — Celery's default `PersistentScheduler` (or the host project's own) |
 
 Shared (above the branch): `SECRET_KEY`, `AUTH_USER_MODEL`, DRF permissions,
 `SIMPLE_JWT`, `CACHES["default"]`, i18n/static, TLS helpers, generic Celery.
-`API_PATH_PREFIXES` and the beat-marker TTL constants are harmless plain values
-and stay shared (no tenant reference).
+`API_PATH_PREFIXES` is a harmless plain value and stays shared (no tenant reference).
 
 ## 3.1 Configuration tiers (which knob lives where, and why)
 

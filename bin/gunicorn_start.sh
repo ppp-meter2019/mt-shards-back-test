@@ -13,9 +13,9 @@ DJANGO_WSGI_MODULE=tenants_back.wsgi                              # WSGI module 
 # NOTE: this project runs SYNC prefork workers (WSGI). Concurrency = NUM_WORKERS
 # processes; rule of thumb 2*cores + 1. CPU-heavy work goes to Celery, not here.
 # To explore the async path (UvicornWorker/ASGI) you must change WORKER_CLASS +
-# DJANGO_WSGI_MODULE→asgi here, flip WSGI/ASGI_APPLICATION in settings.py, AND
+# DJANGO_WSGI_MODULE→asgi here, flip WSGI/ASGI_APPLICATION in settings_base.py, AND
 # the tenant/shard middleware would need rework — see the "Worker model" block
-# in tenants_back/settings.py and README "Architecture trade-offs".
+# in tenants_back/settings_base.py and README "Architecture trade-offs".
 
 set -e
 

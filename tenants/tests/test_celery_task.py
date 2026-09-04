@@ -8,7 +8,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.test import SimpleTestCase
 
 from tenants_back.celery import app
-from tenants.context import active_alias, current_db, use_alias
+from tenants.context import active_alias, bound_alias, use_alias
 
 
 @app.task(bind=True, name="tests.tenanttask_probe")
@@ -38,11 +38,10 @@ class TenantTaskCallTests(SimpleTestCase):
         """A tenant-scoped message enters tenant_context(tenant) for the task body."""
         @contextmanager
         def fake_tenant_context(tenant):
-            tok = current_db.set("shard_acme")
-            try:
+            # use_alias, not a raw current_db.set/reset: it IS the sanctioned axis-1 door and
+            # gives the same set/restore, so the double stays honest to the real code path.
+            with use_alias("shard_acme"):
                 yield
-            finally:
-                current_db.reset(tok)
 
         with mock.patch("tenants.celery.task.TenantTask.get_tenant_for_schema",
                         return_value=object()), \
@@ -58,7 +57,7 @@ class TenantTaskCallTests(SimpleTestCase):
 
         r = _boom.apply(headers={"_schema_name": "public"})
         self.assertTrue(r.failed())
-        self.assertIsNone(current_db.get())               # not stuck on a leaked alias (unset)
+        self.assertIsNone(bound_alias())               # not stuck on a leaked alias (unset)
 
 
 class CeleryPoolGuardrailTests(SimpleTestCase):

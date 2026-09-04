@@ -21,11 +21,11 @@ RESOLVE_DEFAULTS = {
     "FILLCAP_LOCAL_PER_SEC": 5,         # per-pod fallback when the global counter is down
 }
 REGISTRY_DEFAULTS = {
-    "WARM_ENABLED": False,              # write side: maintain tres:hosts + ttl_by_status
+    "WARM_ENABLED": False,              # write side: maintain treg:hosts + ttl_by_status
     "GATE_ENABLED": False,              # read side: hard-reject non-members (requires WARM)
     "HOSTS_ARM_SECONDS": 300,           # dead-man TTL armed on domain mutations
     "RECONCILE_SECONDS": 86400,         # daily safety reconcile — consumed by the ops beat schedule, NOT by code
-    "WARM_LOCK_SECONDS": 120,           # tres:warming single-writer lock TTL
+    "WARM_LOCK_SECONDS": 120,           # treg:warming single-writer lock TTL
     "WARM_PENDING_SECONDS": 10,         # reconcile enqueue-coalescing window
 }
 

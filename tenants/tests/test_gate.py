@@ -9,7 +9,7 @@ from django.test import RequestFactory, SimpleTestCase
 
 import tenants.middleware as mw
 from tenants.models import Tenant
-from tenants.resolver import resolve_cache
+from tenants.resolver import ResolveDeferred, resolve_cache
 
 S = Tenant.Status
 
@@ -127,6 +127,21 @@ class TenantResolutionErrorTests(SimpleTestCase):
         r = self._run(OperationalError("db down"), "/", accept="text/html")
         self.assertEqual(r.status_code, 500)
         self.assertIn("text/html", r["Content-Type"])
+
+    def test_resolve_deferred_503_json(self):
+        """Load-shed => retryable 503, never 404: the resolver declined to look, so
+        'no workspace at this address' would be a claim it never established."""
+        r = self._run(ResolveDeferred("known"), "/api/v1/x")
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r["Content-Type"], "application/json")
+        self.assertEqual(r["Retry-After"], "5")
+        self.assertEqual(r["Cache-Control"], "no-store")
+
+    def test_resolve_deferred_503_html(self):
+        r = self._run(ResolveDeferred("known"), "/", accept="text/html")
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("text/html", r["Content-Type"])
+        self.assertEqual(r["Retry-After"], "5")
 
     def test_get_tenant_reraises_operational_error(self):
         m = mw.ShardAwareTenantMiddleware(lambda r: None)

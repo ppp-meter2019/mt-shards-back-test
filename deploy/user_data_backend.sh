@@ -16,7 +16,7 @@
 #
 # Note: the AWS RDS CA bundle is vendored in the repo at
 # `deploy/certs/aws-rds-global-bundle.pem`, so we do NOT download it here.
-# `settings.py` defaults AWS_RDS_CA to that vendored path.
+# `settings_base.py` defaults AWS_RDS_CA to that vendored path.
 
 set -e
 

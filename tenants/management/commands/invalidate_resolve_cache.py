@@ -4,8 +4,8 @@
     manage.py invalidate_resolve_cache --schemas alpha beta # by Tenant.schema_name
     manage.py invalidate_resolve_cache --all                # everything (prefix-scoped)
 
---all is GATE-AWARE: with TENANT_REGISTRY_WARM_ENABLED on, a bare forget_all would leave
-the `tres:hosts` SET behind → every miss becomes an uncapped member cold-fill (a herd on
+--all is GATE-AWARE: with TENANT_REGISTRY["WARM_ENABLED"] on, a bare forget_all would leave
+the `treg:hosts` SET behind → every miss becomes an uncapped member cold-fill (a herd on
 `default`). So under WARM it refreshes via reconcile (force-overwrite in place + RENAME —
 no herd, no gap) instead. --ids/--schemas only tombstone specific hosts (the SET is
 unchanged, those hosts re-fill), so they are safe under the gate as-is.
@@ -35,7 +35,7 @@ class Command(TenantCommand):
             if opts["all"]:
                 if flags.warm_enabled():
                     # Gate-aware: refresh via reconcile (no herd) rather than a bare wipe
-                    # that would leave tres:hosts and stampede `default` with cold-fills.
+                    # that would leave treg:hosts and stampede `default` with cold-fills.
                     from tenants.resolver import host_registry
                     n = host_registry.run_locked()
                     msg = ("another writer holds the reconcile lock; skipped"

@@ -21,7 +21,7 @@ umask = 0o007
 workers = int(os.environ.get("GUNICORN_WORKERS", multiprocessing.cpu_count() * 2 + 1))
 # sync (prefork) — project default: one request per process, concurrency =
 # `workers`. (A `gthread` variant trades memory for in-process I/O concurrency;
-# the async UvicornWorker path needs middleware rework — see settings.py.)
+# the async UvicornWorker path needs middleware rework — see settings_base.py.)
 worker_class = "sync"
 timeout = 60
 graceful_timeout = 30

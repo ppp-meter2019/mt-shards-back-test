@@ -16,6 +16,9 @@ def _on_tenant(request) -> bool:
     """
     if not settings.USE_MULTITENANT:
         return True
+    # Literal "public", not get_public_schema_name(): this module must import cleanly in
+    # STANDALONE, where django_tenants is NOT installed (audited standalone-safe file —
+    # see the ALLOW list in scripts/ci_guard_schema_name.sh).
     return getattr(connection, "schema_name", "public") != "public"
 
 

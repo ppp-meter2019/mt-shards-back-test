@@ -175,8 +175,11 @@ class TenantAdmin(TenantAdminMixin, admin.ModelAdmin):
             ro.append("schema_name")
         return ro
 
-    # No save_model beat-bump here: the Tenant post_save signal covers every .save()
-    # path (admin included), bumping only on an actual status change.
+    # No save_model override needed: the Tenant post_save signal (tenants/signals.py)
+    # invalidates the resolve snapshots on EVERY .save(), admin included — it does not
+    # check whether the status moved, because invalidating is cheap and a stale routing
+    # snapshot is not. Beat needs no signal at all: the fanout dispatcher reads the
+    # ACTIVE-tenant set fresh each tick. (status_changed_at is stamped by Tenant.save().)
 
     def delete_model(self, request, obj):
         try:

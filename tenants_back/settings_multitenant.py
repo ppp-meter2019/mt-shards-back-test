@@ -15,17 +15,13 @@ from celery.schedules import crontab
 from kombu import Queue
 
 from commons.platform.beat import scoped_schedule
-from .settings import (  # building blocks + base objects to reassemble / augment
-    _DJANGO_APPS,
-    _THIRD_PARTY_APPS,
-    _BUSINESS_APPS,
-    CACHES,
-    MIDDLEWARE,
-    DATABASES,
-    REST_FRAMEWORK,
-    CELERY_BROKER_URL,
-    CELERY_BEAT_SCHEDULE,
-)
+# FORWARD import — settings_base never imports this module, so there is no cycle and no
+# ordering contract: the base is fully executed before the first line below runs. The star
+# brings in every base setting this file augments (CACHES, MIDDLEWARE, DATABASES,
+# REST_FRAMEWORK, CELERY_BROKER_URL, CELERY_BEAT_SCHEDULE, ...); the second import is only
+# for the underscore-prefixed app blocks, which `import *` deliberately skips.
+from .settings_base import *  # noqa: F401,F403
+from .settings_base import _DJANGO_APPS, _THIRD_PARTY_APPS, _BUSINESS_APPS
 
 # ---------------------------------------------------------------------------
 # Apps — reassemble the SHARED_APPS + TENANT_APPS union (django-tenants requires the
@@ -160,11 +156,21 @@ REST_FRAMEWORK = {**REST_FRAMEWORK, "DEFAULT_AUTHENTICATION_CLASSES": (
 # EVERY request BEFORE the tenant is known, to remove the per-request Domain lookup from
 # the shared `default` DB.
 #
-# MUST be a SEPARATE Redis INSTANCE (not just another alias on `default`) with
-# maxmemory-policy = volatile-ttl: every entry is written WITH a TTL (positive AND
-# negative), so under memory pressure Redis evicts the nearest-to-expiry (short-TTL miss
-# entries) first, protecting positives and never refusing writes. NEVER write a key here
-# without a TTL. Resolution runs in the PUBLIC context, so keys carry only a static
+# MUST be a SEPARATE Redis INSTANCE (not just another alias on `default`), maxmemory-policy
+# = volatile-ttl. What that buys differs BY STAGE, so both are spelled out:
+#   WARM off — every entry carries a TTL (positive 3600s, miss 60s, hold 5s). Under memory
+#     pressure Redis evicts the nearest-to-expiry (the short-TTL misses) first, protecting
+#     positives, and never has to refuse a write.
+#   WARM on  — ACTIVE positives are written with NO expiry (TENANT_RESOLVE
+#     ["WARM_TTL_BY_STATUS"]), and the gate's `treg:hosts` SET has none either. volatile-ttl
+#     never evicts a key that has no TTL — which is precisely what we want here (the registry
+#     survives memory pressure; only the disposable TTL-bearing entries absorb it). The
+#     trade-off: the "never refuses a write" property is GONE — once maxmemory is reached and
+#     only no-TTL keys remain, writes fail with OOM. So SIZE maxmemory for the domain count
+#     and alert on used_memory: ~250 B per entry (a snapshot pickles to ~134 B, plus key and
+#     overhead), one entry per Domain plus one per Tenant → ~50 MiB at 100k domains. The set
+#     of no-TTL keys never shrinks on its own; reconcile's orphan-sweep is what bounds it.
+# Resolution runs in the PUBLIC context, so keys carry only a static
 # KEY_PREFIX ("tres"), never a per-tenant KEY_FUNCTION. IGNORE_EXCEPTIONS + short timeouts
 # => a slow/down instance degrades to a `default` DB lookup (fail-open). Point LOCATION at
 # the dedicated instance in settings_local.py.
@@ -227,7 +233,7 @@ TENANT_RESOLVE = {
 }
 
 # TENANT_REGISTRY — anti-DoS host gate, two-stage rollout. Defaults OFF. WARM_ENABLED
-# (write side: maintain the `tres:hosts` SET + reconcile); GATE_ENABLED (read side: reject
+# (write side: maintain the `treg:hosts` SET + reconcile); GATE_ENABLED (read side: reject
 # unknown hosts on a cache miss without a DB hit; requires WARM — the tenants.E001 check
 # flags GATE-without-WARM). HOSTS_ARM_SECONDS/RECONCILE_SECONDS/WARM_LOCK_SECONDS/
 # WARM_PENDING_SECONDS tune the dead-man switch, daily reconcile, writer lock, and enqueue

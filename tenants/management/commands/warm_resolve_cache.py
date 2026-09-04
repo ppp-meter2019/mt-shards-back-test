@@ -4,8 +4,8 @@
     manage.py warm_resolve_cache --force    # hard reload: overwrite every entry
 
 GATE-AWARE — a single entry point so an operator can't run the wrong warm:
-  * TENANT_REGISTRY_WARM_ENABLED on  → runs the registry RECONCILE (force-overwrite by
-    ttl_by_status, skip holds, build the `tres:hosts` SET, orphan-sweep, single-writer
+  * TENANT_REGISTRY["WARM_ENABLED"] on → runs the registry RECONCILE (force-overwrite by
+    ttl_by_status, skip holds, build the `treg:hosts` SET, orphan-sweep, single-writer
     lock). --force is implied; the flag is ignored.
   * off → legacy positive-cache warm (flat TTL, no SET) — today's behavior.
 
@@ -25,8 +25,9 @@ class Command(TenantCommand):
     def add_arguments(self, parser):
         parser.add_argument(
             "--force", action="store_true",
-            help="Hard reload (overwrite all); default fills only absent entries. "
-                 "Ignored when TENANT_REGISTRY_WARM_ENABLED (reconcile always force-overwrites).",
+            help='Hard reload (overwrite all); default fills only absent entries. '
+                 'Ignored when TENANT_REGISTRY["WARM_ENABLED"] is on (reconcile always '
+                 'force-overwrites).',
         )
 
     def handle(self, *args, **opts):

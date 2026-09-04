@@ -9,6 +9,7 @@ from django.db.models import Count, F
 from django.db.models.deletion import ProtectedError
 from django.db.utils import ConnectionDoesNotExist
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from django_tenants.utils import get_public_schema_name
@@ -237,7 +238,11 @@ class TenantViewSet(viewsets.ModelViewSet):
             "1", "true", "yes", "on",
         )
         alias, schema = instance.shard.alias, instance.schema_name
-        instance.delete()   # Tenant post_delete signal nudges beat to drop it
+        # post_delete → tenants.signals.invalidate_tenant_deleted, which drops the
+        # tenant's schema-snap from the resolve cache (the host snaps go with the
+        # Domain cascade). Beat is NOT involved: the fanout dispatcher reads the
+        # ACTIVE-tenant set fresh on every tick.
+        instance.delete()
         if drop:
             from .tasks import drop_tenant_schema_task
             drop_tenant_schema_task.delay(alias, schema)
@@ -484,6 +489,11 @@ class TenantViewSet(viewsets.ModelViewSet):
         updated = Tenant.objects.filter(pk=tenant.pk, status=from_status).update(
             previous_status=F("status"),
             status=to_status,
+            # .update() bypasses Tenant.save(), which is what stamps this on the .save()
+            # paths — so set it here, as every other status writer does (migrate_schemas,
+            # reconcile_tenants). Without it a deactivation would leave the field showing
+            # when the row was last EDITED, which the console renders as the status age.
+            status_changed_at=timezone.now(),
         )
         if not updated:
             return Response(

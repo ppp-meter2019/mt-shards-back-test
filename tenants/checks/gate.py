@@ -22,7 +22,7 @@ def gate_requires_warm(app_configs, **kwargs):
         return [Error(
             "TENANT_REGISTRY['GATE_ENABLED'] is on but ['WARM_ENABLED'] is off.",
             hint=(
-                "The gate reads the tres:hosts SET that only the WARM write side "
+                "The gate reads the treg:hosts SET that only the WARM write side "
                 "builds/maintains (signals + reconcile). With WARM off the SET is "
                 "never created, so the gate can never hard-reject. As a safety net "
                 "host_registry.gate_enabled treats this combination as OFF — meaning "

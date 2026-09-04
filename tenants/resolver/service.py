@@ -26,6 +26,21 @@ _fail_last = 0.0
 _fail_suppressed = 0
 _bug_last = 0.0
 _bug_suppressed = 0
+_shed_last = 0.0
+_shed_suppressed = 0
+
+
+class ResolveDeferred(Exception):
+    """Resolution was DECLINED to shed load, not answered.
+
+    Raised on the gate's flag-absent (UNKNOWN) branch when fill_cap is exhausted: the host
+    registry is unavailable, so a member cannot be told from a stranger, and the DB budget
+    for that ambiguity is spent. The host may be perfectly valid - so this must NOT surface
+    as "no such tenant". The caller maps it to a retryable 503.
+
+    Deliberately NOT a subclass of the caller's not_found: "does not exist" and "declined to
+    look" are different answers, and only one of them is a fact about the host.
+    """
 
 
 def _log_cache_fail(hostname):
@@ -58,20 +73,47 @@ def _log_cache_bug(hostname):
         _bug_suppressed += 1
 
 
+def _log_shed(hostname):
+    """Load-shed on the flag-absent branch. Sustained shedding means the registry SET is
+    missing (or its Redis is down) under real traffic - an operational signal, not a
+    per-request event, so it is rate-limited like the two helpers above. No exc_info: there
+    is no exception here, this is a decision."""
+    global _shed_last, _shed_suppressed
+    now = time.monotonic()
+    if now - _shed_last >= _FAIL_LOG_EVERY:
+        extra = f" ({_shed_suppressed} similar suppressed)" if _shed_suppressed else ""
+        logger.warning("tenant resolve DEFERRED (registry flag absent, fill_cap exhausted; "
+                       "e.g. %r) -> retryable 503%s", hostname, extra)
+        _shed_last, _shed_suppressed = now, 0
+    else:
+        _shed_suppressed += 1
+
+
 def resolve(hostname, db_resolver, not_found):
     """Resolve a Host to a Tenant. ``db_resolver()`` is the authoritative DB lookup
     (returns a Tenant or raises ``not_found``). Returns the Tenant, or raises
-    ``not_found`` (unknown host) / ``OperationalError`` (DB down). A cache-layer failure
-    degrades to a plain DB resolve (fail-open) — the cache is only ever an optimization and
-    the DB resolve is the correct answer. EXPECTED infra failures (RedisError) log quietly;
-    UNEXPECTED errors (a bug in the cache/gate path) still fail open but log LOUD (ERROR) so
-    they don't hide behind 'it just got slower'."""
+    ``not_found`` (unknown host) / ``ResolveDeferred`` (declined to look — load-shed) /
+    ``OperationalError`` (DB down). A cache-layer FAILURE degrades to a plain DB resolve
+    (fail-open) — the cache is only ever an optimization and the DB resolve is the correct
+    answer. A ``ResolveDeferred`` is the one deliberate NON-degrade: shedding load is the
+    point, so it must reach the caller instead of falling through to the DB. EXPECTED infra
+    failures (RedisError) log quietly; UNEXPECTED errors (a bug in the cache/gate path)
+    still fail open but log LOUD (ERROR) so they don't hide behind 'it just got slower'."""
+    # Skip the whole cache/gate machinery only when NEITHER is in play. The two terms are
+    # NOT independent: gate_enabled ⇒ warm_enabled ⇒ enabled (flags.gate_enabled requires
+    # WARM; cache.enabled counts WARM), so the second one can never decide the outcome — it
+    # is kept as a readable statement of that intent, not as defence-in-depth. Both links of
+    # the implication are pinned by tests (test_resolve_gate: GATE⇒WARM, WARM⇒enabled), so
+    # neither can be broken silently.
     if not resolve_cache.enabled and not host_registry.gate_enabled:
-        return db_resolver()                        # cache AND gate off → direct DB (today's behavior)
+        return db_resolver()                        # nothing in play → direct DB (today's behavior)
     try:
         return _via_cache(hostname, db_resolver, not_found)
     except not_found:
         raise                                       # real "no tenant for this host"
+    except ResolveDeferred:
+        raise                                       # deliberate load-shed — must NOT fall
+                                                    # through to the DB in the branches below
     except OperationalError:
         raise                                       # DB down — surface; don't retry a dead DB
     except RedisError:
@@ -96,7 +138,11 @@ def _via_cache(hostname, db_resolver, not_found):
         if verdict is host_registry.UNKNOWN:        # SET absent / Redis error → fail-open under cap
             host_registry.trigger_warm()
             if not fill_cap.allow():
-                raise not_found(hostname)
+                # NOT not_found: we never established that this host is unknown, we declined
+                # to look. Surfacing it as 404 would tell a legitimate tenant's users their
+                # workspace is gone. The caller turns this into a retryable 503.
+                _log_shed(hostname)
+                raise ResolveDeferred(hostname)
     # MEMBER, or UNKNOWN within budget → resolve (coalesced across concurrent callers)
     return single_flight(hostname, lambda: _fill(hostname, db_resolver, not_found))
 

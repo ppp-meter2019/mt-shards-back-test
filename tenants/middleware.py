@@ -6,7 +6,9 @@ must be set on the same connection/thread the ORM later uses):
   A. ShardAwareTenantMiddleware - resolves the tenant from the Host (+ its shard in one
      query), sets request.tenant + the schema on the DEFAULT connection, gates on
      status, and delegates host->Tenant caching to tenants.resolver. The cache is
-     an optimization: any cache-layer failure degrades to a plain DB resolve.
+     an optimization: any cache-layer failure degrades to a plain DB resolve. The one
+     exception is ResolveDeferred (the gate shedding load when the host registry is
+     unavailable and the DB budget is spent) -> retryable 503, never 404.
 
   B. TenantShardRoutingMiddleware - reads request.tenant, points the router at the
      shard (current_db) and sets/reset the tenant schema on the SHARD connection.
@@ -21,10 +23,10 @@ from django.http import Http404, HttpResponse
 from django_tenants.middleware.main import TenantMainMiddleware
 from django_tenants.utils import get_public_schema_name
 
-from .context import current_db
+from .context import tenant_context, use_alias
 from .errors import error_response
 from .models import Tenant
-from .resolver import resolve as resolve_tenant
+from .resolver import ResolveDeferred, resolve as resolve_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,20 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
                 request, status=404, code="tenant_not_found",
                 detail="No workspace found for this address.",
                 template="tenants/errors/not_found.html",
+            )
+        except ResolveDeferred:
+            # The gate DECLINED to resolve: the host registry was unavailable AND the DB
+            # budget for that ambiguity was spent (resolver.service). We do NOT know the
+            # host is unknown, so a 404 would be a claim we never established — and it
+            # would tell a legitimate tenant's users their workspace is gone. 503 + a short
+            # Retry-After is the honest answer and lets clients back off. Nothing was
+            # negative-cached (the reject happens before _fill), so the next attempt is a
+            # clean one — hence seconds, not minutes. Logged (rate-limited) in the resolver.
+            return error_response(
+                request, status=503, code="tenant_resolve_deferred",
+                detail="Temporarily unable to resolve this workspace. Please retry.",
+                template="tenants/errors/database_error.html",
+                retry_after=5,
             )
         except (OperationalError, InterfaceError,
                 psycopg.OperationalError, psycopg.InterfaceError):
@@ -140,7 +156,14 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
 
 class TenantShardRoutingMiddleware:
     """Routes the ORM to the tenant's shard and sets that shard connection's schema,
-    resetting both on the way out."""
+    resetting both on the way out.
+
+    Both axes are wired by tenants.context — the ONE implementation of the enter/exit dance,
+    shared with TenantTask and tenant_command. This class used to hand-roll it and had
+    drifted: the schema was set BEFORE the try, so an alias missing from settings.DATABASES
+    left current_db set for the life of the thread. The one thing NOT delegated is the exit
+    reset — see the finally in __call__.
+    """
 
     sync_capable = True
     async_capable = False
@@ -150,14 +173,30 @@ class TenantShardRoutingMiddleware:
 
     def __call__(self, request):
         tenant = getattr(request, "tenant", None)
-        alias = tenant.shard.alias if tenant is not None else "default"
-        token = current_db.set(alias)                     # axis 1: router -> shard DB
-        switched = alias != "default"
-        if switched:
-            connections[alias].set_tenant(tenant)         # axis 2: search_path on the shard conn
+        if tenant is None or tenant.shard.alias == "default":
+            # Public tenant, or no tenant at all: the schema on `default` was already set by
+            # ShardAwareTenantMiddleware, which also re-resets it to public at the START of
+            # every request (django_tenants middleware/main.py:35) — so there is nothing to
+            # set and nothing to reset here. Pin only the router axis, and pin it EXPLICITLY
+            # rather than inheriting whatever this thread last left in current_db.
+            with use_alias("default"):
+                return self.get_response(request)
+
+        alias = tenant.shard.alias
+        # Resolve the connection FIRST: an alias missing from settings.DATABASES (a Shard row
+        # whose alias was dropped) raises HERE, before either axis is touched — no half-entered
+        # state to leak — and it cannot be masked by the finally below.
+        conn = connections[alias]
         try:
-            return self.get_response(request)
+            with tenant_context(tenant):        # axis 1 + axis 2, restore-safe, one impl
+                return self.get_response(request)
         finally:
-            if switched:
-                connections[alias].set_schema_to_public()  # reset - prevents cross-tenant leak
-            current_db.reset(token)
+            # Deliberately NOT delegated to tenant_context. _switch restores the connection's
+            # PREVIOUS tenant — the right contract for a nestable helper, and on this path it
+            # happens to be public anyway. Here we want the STRONGER, unconditional guarantee:
+            # whatever was there, this shard connection ends on `public`. On a shard that
+            # schema holds ONLY the postgis extension (routers.allow_migrate keeps every app
+            # table out of it), so a stray query on this connection between requests fails
+            # loudly with "relation does not exist" instead of silently reading another
+            # tenant's rows.
+            conn.set_schema_to_public()

@@ -15,7 +15,7 @@ from django_tenants.utils import (
     has_multi_type_tenants,
 )
 
-from .context import current_db
+from .context import bound_alias
 
 
 class TenantDatabaseRouter(TenantSyncRouter):
@@ -28,7 +28,7 @@ class TenantDatabaseRouter(TenantSyncRouter):
                 and not self.app_in_list(label, settings.TENANT_APPS)):
             return "default"
         # Otherwise use the alias set by TenantShardRoutingMiddleware / tenant_context / use_alias.
-        alias = current_db.get()
+        alias = bound_alias()                  # raw: None == no routing context
         if alias is None:                         # NO routing context established
             if label in getattr(settings, "TENANT_STRICT_ROUTE_APPS", frozenset()):
                 raise RuntimeError(

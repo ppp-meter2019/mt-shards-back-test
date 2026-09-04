@@ -24,6 +24,10 @@ cd "$(dirname "$0")/.."
 MARKER='connection\.schema_name|getattr\([[:space:]]*connection[[:space:]]*,[[:space:]]*['\''"]schema_name['\''"]'
 
 # Audited, standalone-safe readers (each MT-gated or getattr-guarded / not wired).
+# These files also compare against the LITERAL "public" rather than calling
+# get_public_schema_name(): importing it would pull in django_tenants, which is not
+# installed in standalone. That is deliberate — do not 'fix' it. Anything added here
+# must carry the same note at its comparison site.
 ALLOW='^(users/authentication\.py|users/middleware\.py|users/serializers\.py|users/signals\.py|users/permissions\.py|products/management/commands/seed_products\.py)$'
 
 # Collect files with a REAL (non-#-comment) marker read, outside tenants/.

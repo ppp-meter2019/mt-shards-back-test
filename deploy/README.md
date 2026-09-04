@@ -273,7 +273,7 @@ sudo -u ubuntu venv/bin/python manage.py bootstrap_tenant \
 ## 9. Celery (фонові задачі)
 
 Фонові задачі (провіжн тенанта, періодичні job-и) виконує Celery. Брокер —
-**окремий** Redis (`CELERY_BROKER_URL`, дефолт у `settings.py`, оверайд у
+**окремий** Redis (`CELERY_BROKER_URL`, дефолт у `settings_base.py`, оверайд у
 `settings_local.py`). Стан провіжну тримає `Tenant.status`, тож result backend
 не використовується.
 
@@ -281,11 +281,12 @@ sudo -u ubuntu venv/bin/python manage.py bootstrap_tenant \
 
 ```bash
 cd /home/ubuntu/mt-shards-back-test && source venv/bin/activate
-pip install -r requirements.txt          # celery[redis] + django-celery-beat
-# django_celery_beat у SHARED і TENANT apps → мігруємо і public, і тенантів:
-python manage.py migrate_schemas --shared --database=default
-python manage.py migrate_schemas --tenant
+pip install -r requirements.txt          # celery[redis] + croniter + celery-redbeat
 ```
+Beat-шар **не додає таблиць у БД**: розклад — це dict у налаштуваннях
+(`CELERY_BEAT_SCHEDULE`), а RedBeat тримає стан у Redis. Окремих міграцій під
+Celery запускати не треба — звичайні міграції описані в §3.4 і §7.
+
 (Без celery застосунок не стартує — `tenants_back/__init__.py` імпортує app.)
 
 ### 9.2 Черги

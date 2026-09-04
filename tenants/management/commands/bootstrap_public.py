@@ -9,6 +9,7 @@ Example:
         --password rootpass
 """
 
+from django.core.exceptions import ValidationError
 from django.core.management.base import CommandError
 from django_tenants.utils import get_public_schema_name
 
@@ -16,6 +17,7 @@ from commons.platform.commands import TenantCommand
 
 from tenants.context import schema_context
 from tenants.models import Domain, Shard, Tenant
+from tenants.validators import validate_hostname
 from users.models import User
 
 
@@ -47,8 +49,20 @@ class Command(TenantCommand):
         )
         if created:
             self.stdout.write(self.style.SUCCESS("Created public tenant."))
+        # Normalize + format-check BEFORE the row is written. get_or_create bypasses
+        # full_clean(), and Domain.clean() exempts the public tenant anyway, so without
+        # this a stray case / trailing dot / copy-pasted space would be stored verbatim
+        # and never match an incoming Host (request.get_host() returns the raw header;
+        # the column compares case-sensitively) - an unreachable management host with a
+        # success message. validate_hostname only checks FORMAT: the deliberate
+        # reserved-host exemption for the public tenant (see Domain.clean) is preserved.
+        try:
+            domain = validate_hostname(opts["domain"])
+        except ValidationError as exc:
+            raise CommandError(f"--domain: {'; '.join(exc.messages)}")
+
         Domain.objects.get_or_create(
-            domain=opts["domain"],
+            domain=domain,
             defaults={"tenant": tenant, "is_primary": True},
         )
 
@@ -73,6 +87,6 @@ class Command(TenantCommand):
             user.save()
         self.stdout.write(
             self.style.SUCCESS(
-                f"Tenant-admin '{user.username}' ready on host '{opts['domain']}'."
+                f"Tenant-admin '{user.username}' ready on host '{domain}'."
             )
         )

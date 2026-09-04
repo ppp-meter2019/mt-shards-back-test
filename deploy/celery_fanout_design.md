@@ -458,7 +458,7 @@ New dependency: `croniter` (universal requirements; used only by the MT tz path)
   is invisible — no unknown-key error); `scope_of(entry)=getattr(entry,"scope",None)`. The
   check flags any `CELERY_BEAT_SCHEDULE` entry that bypassed `scoped_schedule` (scope_of is
   None) so per-tenant tasks aren't silently left un-fanned-out. Base
-  `settings.py` carries a worked `scoped_schedule` example; `CELERY_BEAT_SCHEDULE` is a shared `{}`
+  `settings_base.py` carries a worked `scoped_schedule` example; `CELERY_BEAT_SCHEDULE` is a shared `{}`
   the MT layer augments (never replaces).
 - `fanout_dispatch`: interval → all ACTIVE; cron → due subset (mock tz + TaskRun);
   overlap-lock; two entries same task / different args don't collide.

@@ -249,7 +249,7 @@ CACHES["default"]["LOCATION"] = "redis://tenants-app.xxx.cache.amazonaws.com:637
 ```
 
 `maxmemory-policy` is configured on the cluster's **parameter group**, not in
-application code. The dev default in `settings.py` is a localhost Redis.
+application code. The dev default in `settings_base.py` is a localhost Redis.
 
 ## Health checks under load (known consideration)
 
@@ -301,7 +301,7 @@ require several consecutive failures (`UnhealthyThresholdCount`), reasonable
 keeping the proxied sync view, also raise the `proxy_read_timeout` on the
 `/api/health/` nginx location above its current `5s`.
 
-See the *Worker model* note in `tenants_back/settings.py` and Architecture
+See the *Worker model* note in `tenants_back/settings_base.py` and Architecture
 trade-offs below.
 
 ## Python runtime (pyenv + Python 3.10)
@@ -697,7 +697,9 @@ When you need a fourth Aurora cluster (`tenant_3`):
 
 | Component | Path | Purpose |
 |---|---|---|
-| Settings | `tenants_back/settings.py` | Multi-DB, Redis, middleware chain |
+| Settings (entry) | `tenants_back/settings.py` | Dispatcher: picks the mode, then applies `settings_local` |
+| Settings (base) | `tenants_back/settings_base.py` | Shared/standalone base — Multi-DB, Redis, middleware chain |
+| Settings (MT) | `tenants_back/settings_multitenant.py` | Multi-tenant overlay over the base |
 | WSGI | `tenants_back/wsgi.py` | gunicorn entry (sync prefork) |
 | Public URLs | `tenants_back/urls_public.py` | Apex domain: admin, `/api/tenants/` |
 | Tenant URLs | `tenants_back/urls_tenant.py` | Tenant subdomains: admin, business APIs |
@@ -724,7 +726,7 @@ them**. Both items below share the same root cause: a **synchronous request
 model on a finite pool of prefork worker processes** (one request per process).
 The async path (UvicornWorker) is intentionally not used — with our required
 sync tenant/shard middleware it gives no concurrency win (see the *Worker model*
-note in `tenants_back/settings.py`).
+note in `tenants_back/settings_base.py`).
 
 #### Why the async path gives no win here (illustration)
 

@@ -6,7 +6,7 @@ from unittest import mock
 
 from django.test import SimpleTestCase
 
-from tenants.context import current_db
+from tenants.context import bound_alias
 
 
 class _FakeConn:
@@ -34,7 +34,7 @@ class TenantCommandShardTests(SimpleTestCase):
         t = _tenant("shard_7")
 
         def spy(name, *a, **kw):
-            seen["db"] = current_db.get()          # where the sub-command's ORM would route
+            seen["db"] = bound_alias()          # where the sub-command's ORM would route
             seen["name"] = name
 
         cmd = tc.Command()
@@ -45,7 +45,7 @@ class TenantCommandShardTests(SimpleTestCase):
 
         self.assertEqual(seen["name"], "seed_products")
         self.assertEqual(seen["db"], "shard_7")        # routed to the tenant's shard, not default
-        self.assertIsNone(current_db.get())            # restored to unset after the command
+        self.assertIsNone(bound_alias())            # restored to unset after the command
 
     def test_run_from_argv_wraps_in_tenant_context(self):
         from tenants.management.commands import tenant_command as tc
@@ -54,7 +54,7 @@ class TenantCommandShardTests(SimpleTestCase):
 
         class _Klass:
             def run_from_argv(self, args):
-                seen["db"] = current_db.get()
+                seen["db"] = bound_alias()
 
         cmd = tc.Command()
         with mock.patch.object(tc, "get_commands", return_value={"seed_products": "products"}), \
@@ -64,4 +64,4 @@ class TenantCommandShardTests(SimpleTestCase):
             cmd.run_from_argv(["manage.py", "tenant_command", "seed_products", "--schema=beta"])
 
         self.assertEqual(seen["db"], "shard_9")
-        self.assertIsNone(current_db.get())
+        self.assertIsNone(bound_alias())

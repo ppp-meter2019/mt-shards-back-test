@@ -229,45 +229,47 @@ class TenantResolveCache:
         self.cache.set(self._schema_snap_key(tenant.schema_name), payload, ttl, nx=True)
         return True
 
+    def _put_many_by_ttl(self, keyed_tenants):
+        """Batched FORCE-write of positive snapshots, grouped by TTL — the shared core of
+        put_many() / put_schema_many(). `keyed_tenants` yields (cache_key, tenant); the CALLER
+        owns the host↔key vs schema↔key mapping, mirroring how _sweep_namespace takes a key_fn
+        on the DELETE side. One set_many per distinct TTL (django_redis pipelines each).
+        Returns the number written; a no-op when positive caching is off.
+
+        The two public wrappers stay separate on purpose: they serve DIFFERENT namespaces with
+        different readers and cardinality (N host-snaps vs 1 schema-snap per tenant). Only the
+        grouping loop is common, and it lives here so a future change (chunking, pipelining, a
+        metrics counter) cannot land in one copy and miss the other."""
+        warm = self.warm_enabled
+        if not warm and not self._pos_ttl:
+            return 0
+        by_ttl = {}
+        for key, tenant in keyed_tenants:
+            by_ttl.setdefault(self._ttl_for(tenant, warm), {})[key] = self.dump(tenant)
+        n = 0
+        for ttl, batch in by_ttl.items():
+            self.cache.set_many(batch, ttl)
+            n += len(batch)
+        return n
+
     def put_many(self, items):
-        """Batched FORCE-write of positive snapshots — the reconcile path. `items` is an
-        iterable of (hostname, tenant). Groups entries by TTL (ttl_by_status under WARM,
-        else flat _pos_ttl) and issues ONE set_many per distinct TTL (django_redis pipelines
-        each). Returns the number written. A no-op when positive caching is off.
+        """Batched FORCE-write of HOST snapshots — the reconcile path. `items` is an iterable
+        of (hostname, tenant); one entry per Domain row. Returns the number written.
 
         FORCE semantics: overwrites unconditionally — the 5s hold (tombstone) is NOT
         respected here. That is deliberate: reconcile is the authoritative single writer
         that just read the DB, so writing fresh data over a hold is correct; the hold only
         guards the resolve path's nx race (put/store), and the real mid-rebuild races are
         handled by the dirty-recheck + sweep_orphans, not by the hold."""
-        warm = self.warm_enabled
-        if not warm and not self._pos_ttl:
-            return 0
-        by_ttl = {}
-        for hostname, tenant in items:
-            by_ttl.setdefault(self._ttl_for(tenant, warm), {})[self._snap_key(hostname)] = self.dump(tenant)
-        n = 0
-        for ttl, batch in by_ttl.items():
-            self.cache.set_many(batch, ttl)
-            n += len(batch)
-        return n
+        return self._put_many_by_ttl((self._snap_key(h), t) for h, t in items)
 
     def put_schema_many(self, tenants):
-        """Batched FORCE-write of schema-snap positives — the reconcile path's schema-keyed
-        sibling of put_many(). `tenants` is an iterable of Tenant (deduped by schema upstream).
-        Groups by TTL, one set_many each; returns the count written. No-op when positive
-        caching is off."""
-        warm = self.warm_enabled
-        if not warm and not self._pos_ttl:
-            return 0
-        by_ttl = {}
-        for t in tenants:
-            by_ttl.setdefault(self._ttl_for(t, warm), {})[self._schema_snap_key(t.schema_name)] = self.dump(t)
-        n = 0
-        for ttl, batch in by_ttl.items():
-            self.cache.set_many(batch, ttl)
-            n += len(batch)
-        return n
+        """Batched FORCE-write of SCHEMA snapshots — the reconcile path's schema-keyed sibling
+        of put_many(), read by the Celery worker (TenantTask.get_tenant_for_schema). `tenants`
+        is an iterable of Tenant, deduped by schema upstream (a tenant has N domains but ONE
+        schema). Same FORCE semantics as put_many(); returns the count written."""
+        return self._put_many_by_ttl(
+            (self._schema_snap_key(t.schema_name), t) for t in tenants)
 
     def store_miss(self, hostname):
         if self._neg_ttl:
@@ -426,9 +428,9 @@ class TenantResolveCache:
         force=True: hard reload — overwrite everything with fresh DB data (batched).
 
         ⚠ Under the GATE/WARM stage do NOT use this — it writes flat-TTL snapshots and
-        does not build/maintain `tres:hosts`. Use host_registry.run_locked() (reconcile:
+        does not build/maintain `treg:hosts`. Use host_registry.run_locked() (reconcile:
         ttl_by_status + SET + orphan-sweep). The warm_resolve_cache command/task route to
-        reconcile automatically when TENANT_REGISTRY_WARM_ENABLED is on."""
+        reconcile automatically when TENANT_REGISTRY["WARM_ENABLED"] is on."""
         from tenants.models import Domain
         pos_ttl = self._pos_ttl
         if not pos_ttl:
