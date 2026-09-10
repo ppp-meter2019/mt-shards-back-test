@@ -1,23 +1,15 @@
-import re
-
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import Error as DBError, connections, transaction
-from django.db.utils import ConnectionDoesNotExist
+from django.db import connections, transaction
 from django_tenants.utils import get_public_schema_name
 from rest_framework import serializers
 
-from users.models import User
-
-from .context import tenant_context
 from .models import Domain, ReservedHostRule, Shard, Tenant
 from .resolver import resolve_cache
-from .validators import validate_tenant_domain, validate_tenant_schema_name
-
-# ASCII PostgreSQL-safe schema name: starts with a lowercase letter, then
-# lowercase letters / digits / underscores, total 1-63 chars. ASCII-only on
-# purpose - `str.isalnum()` would accept Unicode letters/digits (e.g. Cyrillic
-# or non-ASCII digits), which we do not want in a schema identifier.
-_SCHEMA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+from .validators import (
+    validate_schema_name,
+    validate_tenant_domain,
+    validate_tenant_schema_name,
+)
 
 
 class DomainSerializer(serializers.ModelSerializer):
@@ -136,25 +128,16 @@ class TenantSerializer(serializers.ModelSerializer):
             self.fields["domain"].required = False
 
     def get_admins(self, obj: Tenant) -> list:
-        """List of company-admin usernames inside the tenant's schema.
+        """Company-admin users inside the tenant's schema.
 
-        One extra query per tenant, executed on the tenant's SHARD inside its
-        schema via `tenant_context` (wires both the router alias and the
-        search_path). Cheap for a tens-of-tenants admin UI; if you ever get
-        hundreds of tenants, replace with a single cross-schema raw SQL query.
+        Reads context["admins"], which TenantViewSet._admins_for() pre-fills with one pair
+        of queries per SHARD — this method issues none. Empty when the serializer is used
+        outside the viewset, exactly like schema_exists and last_migration.
         """
-        try:
-            with tenant_context(obj):
-                return list(
-                    User.objects.filter(role=User.Role.COMPANY_ADMIN)
-                    .order_by("username")
-                    .values("id", "username", "is_active")
-                )
-        except (DBError, ConnectionDoesNotExist):
-            # Tenant schema broken / not yet migrated / shard unreachable → don't blow
-            # up the listing, just show no admins. Narrowed to DB/connection errors so
-            # a real programming error still surfaces (500) instead of hiding here.
+        table = self.context.get("admins")
+        if table is None:
             return []
+        return table.get((obj.shard.alias, obj.schema_name), [])
 
     def get_schema_exists(self, obj: Tenant) -> bool:
         """Whether the tenant's schema actually exists in its shard database.
@@ -184,18 +167,15 @@ class TenantSerializer(serializers.ModelSerializer):
         return table.get((obj.shard.alias, obj.schema_name))
 
     def validate_schema_name(self, value: str) -> str:
-        value = value.strip().lower()
+        # Format + normalization + the pg_ guard all live in tenants.validators, shared with
+        # Tenant.clean() (admin) and bootstrap_tenant, so the three enforce one rule. NOTE it
+        # RETURNS the normalized name ("Foo-Bar" -> "foo_bar"), so keep using its result.
+        try:
+            value = validate_schema_name(value)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.messages)
         if value == get_public_schema_name():
             raise serializers.ValidationError("Schema name 'public' is reserved.")
-        if not _SCHEMA_NAME_RE.fullmatch(value):
-            raise serializers.ValidationError(
-                "schema_name must be ASCII: start with a lowercase letter, then "
-                "lowercase letters, digits or underscores (max 63 chars)."
-            )
-        if value.startswith("pg_"):
-            raise serializers.ValidationError(
-                "schema_name cannot start with 'pg_' (reserved by PostgreSQL)."
-            )
         # Reject reserved global service labels (www/api/admin/...) — same source
         # as Domain validation (tenants.ReservedHostRule).
         try:

@@ -15,6 +15,11 @@ class FakeNxCache:
     """Minimal in-memory cache covering what get_tenant / forget_hosts use,
     including the django_redis-only nx=True flag."""
 
+    # django_redis attributes TenantResolveCache._snapshot_key_prefix() reads, so the
+    # SCAN-based iter_snapshot_hosts / iter_snapshot_schemas work against this double too.
+    key_prefix = "tres"
+    version = 1
+
     def __init__(self):
         self.store = {}
 
@@ -41,6 +46,45 @@ class FakeNxCache:
         n = len(self.store)
         self.store.clear()
         return n
+
+
+class FakeSetRedis:
+    """Raw-client double for the `treg:*` SET operations used by HostRegistry.reconcile /
+    _rebuild_once. Keys are modelled as {name: set|str}.
+
+    It records the op ORDER in `.ops`, because the invariant under test is sequencing as
+    much as the end state: the SET must be built in `treg:hosts:new` and only then RENAMEd
+    over `treg:hosts` — a direct SADD into the live key would publish a half-built SET and
+    make the gate reject live hosts.
+    """
+
+    def __init__(self, dirty=None):
+        self.keys = {}
+        self.ops = []
+        self.dirty = dirty                     # what get(DIRTY_KEY) returns
+
+    def delete(self, name):
+        self.ops.append(("delete", name))
+        return 1 if self.keys.pop(name, None) is not None else 0
+
+    def sadd(self, name, *members):            # VARARGS — _rebuild_once fans in a whole chunk
+        self.ops.append(("sadd", name, len(members)))
+        self.keys.setdefault(name, set()).update(members)
+        return len(members)
+
+    def exists(self, name):
+        self.ops.append(("exists", name))
+        return 1 if name in self.keys else 0
+
+    def rename(self, src, dst):
+        self.ops.append(("rename", src, dst))
+        if src not in self.keys:
+            from redis.exceptions import ResponseError
+            raise ResponseError("no such key")  # real Redis behaviour: keeps the exists→rename
+        self.keys[dst] = self.keys.pop(src)     # ordering honest
+
+    def get(self, name):
+        return self.dirty
 
 
 @contextmanager

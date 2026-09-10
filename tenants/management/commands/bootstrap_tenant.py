@@ -21,6 +21,7 @@ from tenants.models import Domain, Shard, Tenant
 from tenants.validators import (
     normalize_host,
     validate_tenant_domain,
+    validate_schema_name,
     validate_tenant_schema_name,
 )
 from users.models import User
@@ -74,7 +75,14 @@ class Command(TenantCommand):
             raise CommandError(f"{joined} Use --force to override.")
 
     def handle(self, *args, **opts):
-        schema = opts["schema"].lower()
+        # Validate + normalize EXPLICITLY rather than letting Tenant.clean() do it: the
+        # row is created with .create() (which bypasses clean()), and an operator who
+        # passed --schema deserves a loud error instead of a silent rewrite. The result is
+        # assigned back so the success message below prints what was actually created.
+        try:
+            schema = validate_schema_name(opts["schema"])
+        except ValidationError as exc:
+            raise CommandError(f"--schema: {'; '.join(exc.messages)}")
         if schema == "public":
             raise CommandError("Refusing to overwrite 'public' — use bootstrap_public.")
 

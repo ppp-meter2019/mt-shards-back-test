@@ -28,35 +28,55 @@ logger = get_task_logger(__name__)
 
 def _argsig(task_args):
     """Stable short signature of the task args, so two schedule entries that share a
-    task name but differ by args (e.g. fetch(1) vs fetch(7)) get DISTINCT locks."""
-    blob = json.dumps(task_args or [], sort_keys=True, default=str)
+    task name but differ by args (e.g. fetch(1) vs fetch(7)) get DISTINCT locks and
+    DISTINCT TaskRun watermarks.
+
+    EMPTY args (None or []) map to the empty string, not to a digest of "[]". Most schedule
+    entries take no args, so this keeps their lock key readable (`beat:fanout:x.report:`)
+    and — more to the point — keeps their TaskRun rows readable, which is what an operator
+    reads by hand when asking why a task did not fire for a tenant. A digest there would be
+    a constant that never distinguishes anything. Uniqueness is unaffected: "" can never
+    collide with a 12-hex-char digest.
+    """
+    if not task_args:
+        return ""
+    blob = json.dumps(task_args, sort_keys=True, default=str)
     # usedforsecurity=False: this digest is only a cache-key discriminator, never a security
     # boundary — the flag keeps md5 usable under a FIPS-enabled OpenSSL (where a bare
     # hashlib.md5() would raise) and is a no-op elsewhere.
     return hashlib.md5(blob.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
-def _acquire_lock(task_name, task_args):
+def _acquire_lock(task_name, args_sig):
     """Overlap-lock (atomic cache.add == SETNX). Returns True if this wave may run; False if a
     previous wave of the SAME (task, args) still holds the lock (a deliberate skip). If the
     beat_lock Redis is DOWN, cache.add RAISES (IGNORE_EXCEPTIONS is off) and fanout_dispatch
-    fails LOUDLY — surfacing the outage instead of silently skipping."""
-    key = "beat:fanout:%s:%s" % (task_name, _argsig(task_args))
+    fails LOUDLY — surfacing the outage instead of silently skipping.
+
+    Takes the signature rather than the raw args so the lock and the TaskRun watermark are
+    keyed by one value computed once per wave — they must never disagree about what counts
+    as "the same schedule entry"."""
+    key = "beat:fanout:%s:%s" % (task_name, args_sig)
     return bool(caches["beat_lock"].add(key, "1", timeout=beat_conf("LOCK_SECONDS")))
 
 
-def _due_by_tenant_tz(task_name, task_args, cron, now, grace):
+def _due_by_tenant_tz(task_name, args_sig, cron, now, grace):
     """Calendar due-check per tenant, evaluated in each tenant's own timezone
     (level-triggered). Considers ONLY the latest past occurrence of `cron` and fires it
     iff it is (a) newer than that tenant's last run (TaskRun) and (b) within `grace` of
     now. A missed tick self-heals within grace; beyond grace it is skipped (never fired
     late, never N times). See deploy/celery_fanout_design.md §3 / §3.1.
+
+    Keyed by (task_name, args_sig), the SAME identity the overlap-lock uses: two entries
+    sharing a task name but differing by args are independent schedules, and reading one
+    watermark for both would let the wave that lands second treat the occurrence as already
+    run and skip it indefinitely.
     """
     from datetime import datetime, timezone as _utc
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
     from croniter import croniter
 
-    last = TaskRun.load_map(task_name)
+    last = TaskRun.load_map(task_name, args_sig)
     due = []
     for schema, tzname in active_tenants_with_tz():
         try:
@@ -80,7 +100,10 @@ def _due_by_tenant_tz(task_name, task_args, cron, now, grace):
              queue=task_queue("fanout"), acks_late=True, max_retries=0)
 def fanout_dispatch(task_name, scope="tenants", cron=None, grace=None,
                     task_args=None, task_kwargs=None, task_options=None, batch_size=None):
-    if not _acquire_lock(task_name, task_args):
+    # ONE signature per wave, shared by the lock, the due-check and the watermark. Computing
+    # it in each place instead would make three copies of "which schedule entry is this".
+    args_sig = _argsig(task_args)
+    if not _acquire_lock(task_name, args_sig):
         logger.info("fanout_dispatch: %s skipped (overlapping wave)", task_name)
         return {"skipped": "overlapping"}
 
@@ -88,14 +111,14 @@ def fanout_dispatch(task_name, scope="tenants", cron=None, grace=None,
     if cron:                                    # calendar → per-tenant tz due-check
         now = timezone.now()
         grace = grace if grace is not None else beat_conf("TZ_GRACE_SECONDS")
-        due = _due_by_tenant_tz(task_name, task_args, cron, now, grace)
+        due = _due_by_tenant_tz(task_name, args_sig, cron, now, grace)
         run_ts = now.isoformat()                # watermark; sub_dispatch stamps it after send
     else:                                       # interval → all ACTIVE tenants (tz-agnostic)
         due = list(active_target_schemas(scope))
         run_ts = None
     for i in range(0, len(due), batch_size):
         sub_dispatch.delay(task_name, due[i:i + batch_size],
-                           task_args, task_kwargs, task_options, run_ts)
+                           task_args, task_kwargs, task_options, run_ts, args_sig)
     logger.info("fanout_dispatch: %s -> %d tenant(s) in %d batch(es) (%s)",
                 task_name, len(due), (len(due) + batch_size - 1) // batch_size,
                 "tz" if cron else "interval")
@@ -105,7 +128,13 @@ def fanout_dispatch(task_name, scope="tenants", cron=None, grace=None,
 @shared_task(name="tenants.tasks.sub_dispatch", base=Task,
              queue=task_queue("fanout"), acks_late=True, max_retries=0)
 def sub_dispatch(task_name, schemas, task_args=None, task_kwargs=None,
-                 task_options=None, run_ts=None):
+                 task_options=None, run_ts=None, args_sig=None):
+    # args_sig defaults to None so a message enqueued by a PREVIOUS release (before the
+    # parameter existed) still runs instead of failing with a TypeError under acks_late +
+    # max_retries=0. Recomputing locally is equivalent: task_args have already been through
+    # the broker's JSON round-trip by the time either side sees them.
+    if args_sig is None:
+        args_sig = _argsig(task_args)
     sent = []
     for schema in schemas:
         try:
@@ -120,5 +149,5 @@ def sub_dispatch(task_name, schemas, task_args=None, task_kwargs=None,
     # Calendar tasks only: advance the watermark for successfully-sent schemas
     # (at-least-once — mark AFTER send). Interval tasks pass run_ts=None.
     if run_ts and sent:
-        TaskRun.mark_ran(task_name, sent, run_ts)
+        TaskRun.mark_ran(task_name, args_sig, sent, run_ts)
     return {"task": task_name, "sent": len(sent), "requested": len(schemas)}

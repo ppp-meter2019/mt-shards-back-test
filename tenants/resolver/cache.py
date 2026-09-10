@@ -2,7 +2,7 @@
 mechanics: markers, TTLs, dump/load, the nx+tombstone coherency protocol, invalidation
 (one host / hosts / tenant / tenants / ids / names / all) and warm-up.
 
-Read/write primitives (get_snapshot / put / store / store_miss / sweep_orphans) are
+Read/write primitives (get_snapshot / put / put_many / store_miss / sweep_orphans) are
 driven by the resolver service facade (tenants.resolver.service), NOT the middleware.
 Fail-open (degrade to a DB resolve on any cache error) is the service's concern;
 IGNORE_EXCEPTIONS masks Redis-down as a miss. redis_alive() bypasses that mask for
@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 
 class CacheUnavailable(RuntimeError):
     """Raised when raise_on_error=True and the tenant_resolve Redis is unreachable."""
+
+
+class LegacyWarmRefused(RuntimeError):
+    """Raised when warm() is called while the registry WARM stage is on — see the guard
+    there. Subclasses RuntimeError because this is API MISUSE (a programming error), not an
+    environment condition: unlike CacheUnavailable, nobody is expected to catch it."""
 
 
 class TenantResolveCache:
@@ -105,44 +111,52 @@ class TenantResolveCache:
             raise CacheUnavailable("tenant_resolve Redis is not reachable")
 
     # ---- serialization ----
-    # Explicit allowlist of the fields a snapshot carries — NOT every model field. The
-    # reconstructed request.tenant is used ONLY for routing (schema + shard) and the status
-    # gate, so it carries just those (plus pks for FK coherence).
-    # CONTRACT: never read any OTHER Tenant/Shard attribute off request.tenant — on a cache
-    # HIT it would be the model default and diverge from a cache MISS (fresh from DB). Adding
-    # a field here is a deliberate act: it puts that value into Redis (tenant_resolve, db2).
-    # This is why company_name / description / last_error / timestamps stay OUT.
+    # Explicit allowlist of the fields a snapshot carries. Deliberately NOT derived from
+    # TenantSnapshot's dataclass fields: `domain_url` is one of those, but it is PER-REQUEST
+    # (django_tenants writes the incoming Host onto it), so caching it would stamp one
+    # hostname onto a snapshot shared by ALL of a tenant's domains.
+    # Adding a field here puts that value into Redis (tenant_resolve, db2), so it is a
+    # deliberate act — which is why company_name / description / last_error / timestamps
+    # stay OUT. There is no longer a "never read anything else" rule to remember: load()
+    # returns a TenantSnapshot, which simply has no other fields.
+    # No `shard_id`: it was the model's FK attname, duplicating shard.id in every payload,
+    # and it existed only to keep a rebuilt model instance self-consistent.
     _SNAPSHOT_FIELDS = {
-        "tenant": ("id", "schema_name", "status", "shard_id"),
+        "tenant": ("id", "schema_name", "status"),
         "shard":  ("id", "alias"),
     }
 
     @classmethod
     def dump(cls, tenant):
-        shard = tenant.shard
-        return {
-            "tenant": {f: getattr(tenant, f) for f in cls._SNAPSHOT_FIELDS["tenant"]},
-            "shard":  {f: getattr(shard,  f) for f in cls._SNAPSHOT_FIELDS["shard"]},
-        }
+        """Serialize a tenant's routing snapshot for the cache.
 
-    @staticmethod
-    def _build(model, values):
-        fields = {f.attname for f in model._meta.fields}
-        return model(**{k: v for k, v in values.items() if k in fields})
+        Accepts a Tenant OR a TenantSnapshot: the resolve path hands over an already
+        captured snapshot, while reconcile and warm hand over rows straight off the Domain
+        queryset. capture() is idempotent, so normalizing first keeps ONE type inside this
+        method and stops the payload keys drifting from the dataclass.
+        """
+        from .snapshot import TenantSnapshot
+        snap = TenantSnapshot.capture(tenant)
+        return {
+            "tenant": {f: getattr(snap, f) for f in cls._SNAPSHOT_FIELDS["tenant"]},
+            "shard":  {f: getattr(snap.shard, f) for f in cls._SNAPSHOT_FIELDS["shard"]},
+        }
 
     @classmethod
     def load(cls, data):
-        # Rebuild a read-only routing snapshot from _SNAPSHOT_FIELDS. Non-carried fields
-        # take their model default — do NOT read them off request.tenant (see the CONTRACT
-        # on _SNAPSHOT_FIELDS). Tolerant of legacy entries that still carry extra keys:
-        # _build filters to real model fields, so old full snapshots load fine.
-        from tenants.models import Shard, Tenant
-        tenant = cls._build(Tenant, data["tenant"])
-        shard = cls._build(Shard, data["shard"])
-        shard.read_only = True
-        tenant.shard = shard                 # real pk -> shard_id consistent; .alias needs no DB
-        tenant.read_only = True
-        return tenant
+        """Rebuild the routing snapshot from a cached payload.
+
+        Reads only the declared keys, so a payload written by an older release (which also
+        carried `shard_id`) loads unchanged — and an older release reading a payload written
+        here tolerates its absence too, which is what makes a rolling deploy safe without
+        bumping the cache version.
+        """
+        from .snapshot import ShardSnapshot, TenantSnapshot
+        t, s = data["tenant"], data["shard"]
+        return TenantSnapshot(
+            id=t["id"], schema_name=t["schema_name"], status=t["status"],
+            shard=ShardSnapshot(id=s["id"], alias=s["alias"]),
+        )
 
     # ---- key namespacing ----
     def _snap_key(self, hostname):
@@ -219,15 +233,21 @@ class TenantResolveCache:
 
         nx: a hold (tombstone) is never overwritten and a slow resolver can't resurrect stale
         data. TTL: ttl_by_status under WARM (ACTIVE→None=no expiry) else flat _pos_ttl; a no-op
-        when positive caching is off (legacy _pos_ttl=0, WARM off)."""
+        when positive caching is off (legacy _pos_ttl=0, WARM off).
+
+        Returns whether the HOST snapshot was actually written — False when positive caching
+        is off, or when nx declined (a tombstone is held, or another writer got there first).
+        The return value is the OUTCOME, not "caching is enabled": under nx the write can
+        legitimately not land, and a caller branching on it must see that. The schema-snap
+        result is deliberately not folded in — the host key is what the caller asked to fill."""
         warm = self.warm_enabled
         if not warm and not self._pos_ttl:
             return False
         ttl = self._ttl_for(tenant, warm)
         payload = self.dump(tenant)
-        self.cache.set(self._snap_key(hostname), payload, ttl, nx=True)
+        filled = bool(self.cache.set(self._snap_key(hostname), payload, ttl, nx=True))
         self.cache.set(self._schema_snap_key(tenant.schema_name), payload, ttl, nx=True)
-        return True
+        return filled
 
     def _put_many_by_ttl(self, keyed_tenants):
         """Batched FORCE-write of positive snapshots, grouped by TTL — the shared core of
@@ -423,38 +443,88 @@ class TenantResolveCache:
 
     # ---- warm-up ----
     def warm(self, *, force=False, chunk=500, raise_on_error=False):
-        """LEGACY positive-cache warm for the GATE-OFF path (flat _pos_ttl, no host SET).
+        """Positive-cache warm for the GATE-OFF path (flat _pos_ttl, no host SET).
         force=False: fill only ABSENT entries (nx, idempotent, respects tombstones).
         force=True: hard reload — overwrite everything with fresh DB data (batched).
 
-        ⚠ Under the GATE/WARM stage do NOT use this — it writes flat-TTL snapshots and
-        does not build/maintain `treg:hosts`. Use host_registry.run_locked() (reconcile:
-        ttl_by_status + SET + orphan-sweep). The warm_resolve_cache command/task route to
-        reconcile automatically when TENANT_REGISTRY["WARM_ENABLED"] is on."""
+        Writes BOTH namespaces, like put() and reconcile: a host-snap per Domain and a
+        schema-snap per DISTINCT tenant. Both are required for a warm to mean anything: the
+        WORKER reads only the schema-keyed side (TenantTask.get_tenant_for_schema ->
+        get_schema_snapshot), so warming hosts alone leaves every task resolving from the DB
+        until some front request happens to fill the schema-snap through put().
+
+        REFUSES to run under the GATE/WARM stage (LegacyWarmRefused) — see the guard below.
+        Use host_registry.run_locked() (reconcile: ttl_by_status + SET + orphan-sweep) there;
+        the warm_resolve_cache command/task already route to it when WARM is on."""
+        # ENFORCED, not merely documented. Under WARM this method is the wrong tool and its
+        # damage is SILENT: it writes positives without building/maintaining `treg:hosts`, so
+        # it refreshes exactly what the SET is supposed to gate while leaving the SET stale —
+        # and a forget_all-then-warm sequence becomes an uncapped member cold-fill herd on
+        # `default`, the very thing the gate exists to prevent.
+        #
+        # Placed FIRST, before the _pos_ttl early-return: _pos_ttl may legitimately be 0 while
+        # WARM is on (see the `enabled` property), and in that combination — the worst one —
+        # the early return would swallow the misuse as a silent `return 0`.
+        #
+        # NOT gated by raise_on_error: that flag is about Redis being unreachable (an
+        # environment condition). A wrong call is a bug and must always be loud.
+        if self.warm_enabled:
+            raise LegacyWarmRefused(
+                "TenantResolveCache.warm() is not usable while TENANT_REGISTRY"
+                "['WARM_ENABLED'] is on: it writes flat-TTL positives and does NOT build or "
+                "maintain the `treg:hosts` SET the gate reads. Use host_registry.run_locked() "
+                "(reconcile), or the commands that already route to it: "
+                "`manage.py warm_resolve_cache` / `manage.py invalidate_resolve_cache --all`."
+            )
         from tenants.models import Domain
-        pos_ttl = self._pos_ttl
-        if not pos_ttl:
+        if not self._pos_ttl:
             return 0
         self._ensure_alive(raise_on_error)
-        cache = self.cache
-        qs = Domain.objects.select_related("tenant__shard").iterator(chunk_size=chunk)
+        # CHUNKED at THIS level on purpose: put_many / _put_many_by_ttl materialize every
+        # payload they are handed, so bounding memory is the CALLER's job — the same contract
+        # HostRegistry._rebuild_once relies on. Handing them the whole queryset would build one
+        # dict of every domain in the platform and issue a single enormous set_many.
+        rows = Domain.objects.select_related("tenant__shard").iterator(chunk_size=chunk)
         n = 0
-        if force:
-            batch = {}
-            for d in qs:
-                batch[self._snap_key(d.domain)] = self.dump(d.tenant)
-                if len(batch) >= chunk:
-                    cache.set_many(batch, pos_ttl)
-                    n += len(batch)
-                    batch = {}
-            if batch:
-                cache.set_many(batch, pos_ttl)
-                n += len(batch)
-        else:
-            for d in qs:
-                if cache.set(self._snap_key(d.domain), self.dump(d.tenant), pos_ttl, nx=True):
-                    n += 1
+        for batch in self._iter_chunks(rows, chunk):
+            # One schema-snap per DISTINCT tenant: a tenant has N domains but ONE schema.
+            by_schema = {d.tenant.schema_name: d.tenant for d in batch}
+            if force:
+                n += self.put_many((d.domain, d.tenant) for d in batch)
+                self.put_schema_many(by_schema.values())
+            else:
+                n += self._fill_absent(batch, by_schema)
         return n
+
+    @staticmethod
+    def _iter_chunks(iterable, size):
+        """Yield lists of at most `size` items — the memory bound put_many callers must
+        provide (see the note in warm())."""
+        batch = []
+        for item in iterable:
+            batch.append(item)
+            if len(batch) >= size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    def _fill_absent(self, rows, by_schema):
+        """nx half of warm(): fill only ABSENT entries in BOTH namespaces, so a tombstone is
+        never overwritten. Per-key SET NX because no batch API carries nx (set_many cannot),
+        which is why the schema side is deduped by the caller — otherwise a tenant with N
+        domains would cost N redundant schema-snap writes instead of one.
+
+        Returns the number of HOST snapshots actually filled; schema-snaps are not counted,
+        so the total still means "domains warmed"."""
+        ttl, cache = self._pos_ttl, self.cache
+        filled = 0
+        for d in rows:
+            if cache.set(self._snap_key(d.domain), self.dump(d.tenant), ttl, nx=True):
+                filled += 1
+        for schema, tenant in by_schema.items():
+            cache.set(self._schema_snap_key(schema), self.dump(tenant), ttl, nx=True)
+        return filled
 
 
 resolve_cache = TenantResolveCache()   # module-level singleton

@@ -15,7 +15,10 @@ enforcement paths used by admin.
 from datetime import timedelta
 from unittest import mock
 
+from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.management import call_command
+from django.db import IntegrityError, connections, transaction
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
@@ -23,8 +26,14 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 import tenants.resolver as rc
 from tenants.models import Domain, ReservedHostRule, Shard, TaskRun, Tenant
 from tenants.serializers import TenantSerializer
-from tenants.validators import validate_tenant_domain, validate_tenant_schema_name
-from tenants.views import BaseDomainsView
+from tenants.validators import (
+    quote_schema,
+    validate_schema_name,
+    validate_tenant_domain,
+    validate_tenant_schema_name,
+)
+from tenants.context import tenant_context
+from tenants.views import BaseDomainsView, TenantViewSet
 from users.models import User
 
 SEED_LABELS = {"www", "api", "admin", "mail", "staging",
@@ -263,24 +272,276 @@ class BaseDomainsEndpointDBTests(TestCase):
 class TaskRunTests(TestCase):
     """Durable per-(task, schema) watermark: bulk upsert + load_map round-trip."""
 
+    SIG = ""                  # _argsig(None) — the no-args schedule entry
+
     def test_mark_ran_upserts_and_load_map_reads(self):
         t1 = timezone.now().replace(microsecond=0)
-        TaskRun.mark_ran("app.daily", ["a", "b"], t1)
-        self.assertEqual(set(TaskRun.load_map("app.daily")), {"a", "b"})
+        TaskRun.mark_ran("app.daily", self.SIG, ["a", "b"], t1)
+        self.assertEqual(set(TaskRun.load_map("app.daily", self.SIG)), {"a", "b"})
 
         t2 = t1 + timedelta(hours=1)
-        TaskRun.mark_ran("app.daily", ["a"], t2)          # upsert 'a', leave 'b'
-        m = TaskRun.load_map("app.daily")
+        TaskRun.mark_ran("app.daily", self.SIG, ["a"], t2)      # upsert 'a', leave 'b'
+        m = TaskRun.load_map("app.daily", self.SIG)
         self.assertEqual(m["a"], t2)
         self.assertEqual(m["b"], t1)
 
     def test_mark_ran_parses_iso_string(self):
         t = timezone.now().replace(microsecond=0)
-        TaskRun.mark_ran("app.weekly", ["c"], t.isoformat())   # run_ts as ISO string
-        self.assertEqual(TaskRun.load_map("app.weekly")["c"], t)
+        TaskRun.mark_ran("app.weekly", self.SIG, ["c"], t.isoformat())   # run_ts as ISO
+        self.assertEqual(TaskRun.load_map("app.weekly", self.SIG)["c"], t)
 
     def test_load_map_is_scoped_per_task(self):
         now = timezone.now()
-        TaskRun.mark_ran("task.x", ["a"], now)
-        TaskRun.mark_ran("task.y", ["b"], now)
-        self.assertEqual(set(TaskRun.load_map("task.x")), {"a"})
+        TaskRun.mark_ran("task.x", self.SIG, ["a"], now)
+        TaskRun.mark_ran("task.y", self.SIG, ["b"], now)
+        self.assertEqual(set(TaskRun.load_map("task.x", self.SIG)), {"a"})
+
+
+class SchemaNameLifecycleTests(TestCase):
+    """The end-to-end claim behind allowing a LEADING DIGIT in a schema name.
+
+    `1st_choice` is a legitimate company name, but PostgreSQL cannot reference such a
+    schema unquoted — so allowing it is only safe if EVERY site quotes. The DB-free suite
+    pins the validators; this pins the thing they cannot: that such a schema actually
+    survives CREATE -> migrate -> read back -> DROP against a real PostgreSQL.
+    """
+
+    def _shard(self):
+        alias = next(a for a in settings.DATABASES if a != "default")
+        return Shard.objects.get_or_create(
+            alias=alias, defaults={"name": alias, "is_active": True})[0]
+
+    def test_leading_digit_schema_survives_create_and_drop(self):
+        schema = validate_schema_name("1st-Choice")          # -> "1st_choice"
+        self.assertEqual(schema, "1st_choice")
+        shard = self._shard()
+        conn = connections[shard.alias]
+
+        with conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {quote_schema(schema)}")
+        try:
+            # It really exists, under the name we asked for (case- and char-exact).
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT schema_name FROM information_schema.schemata "
+                    "WHERE schema_name = %s", [schema])
+                self.assertEqual(cur.fetchone()[0], schema)
+            # And search_path accepts it — this is the step a hyphenated or mixed-case
+            # name would only survive because upstream single-quotes the value.
+            with conn.cursor() as cur:
+                cur.execute(f"SET search_path = '{schema}'")
+                cur.execute("SHOW search_path")
+                self.assertIn(schema, cur.fetchone()[0])
+        finally:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP SCHEMA {quote_schema(schema)} CASCADE")
+                cur.execute("SET search_path = 'public'")
+
+    def test_injectable_schema_name_never_reaches_sql(self):
+        """quote_schema is the last line: a name that predates validation (data migration,
+        manual INSERT) must abort BEFORE the cursor, not produce two statements."""
+        with self.assertRaises(ValueError):
+            quote_schema('x";DROP SCHEMA public CASCADE;--')
+        # public is still there, i.e. nothing was executed on the way to the exception.
+        with connections["default"].cursor() as cur:
+            cur.execute("SELECT 1 FROM information_schema.schemata "
+                        "WHERE schema_name = 'public'")
+            self.assertIsNotNone(cur.fetchone())
+
+    def test_serializer_and_admin_agree_on_the_same_name(self):
+        """The defect that started this: the API normalized+validated while the admin
+        (Tenant.clean) did neither, so the two disagreed about what a valid tenant is."""
+        shard = self._shard()
+        ser = TenantSerializer(data={"schema_name": "Freedom-First",
+                                     "company_name": "Freedom First",
+                                     "shard_id": shard.pk, "domain": "ff.example.com"})
+        self.assertTrue(ser.is_valid(), ser.errors)
+        self.assertEqual(ser.validated_data["schema_name"], "freedom_first")
+
+        t = Tenant(schema_name="Freedom-First", company_name="Other", shard=shard)
+        t.clean()
+        self.assertEqual(t.schema_name, "freedom_first")     # same answer, both paths
+
+
+class TaskRunArgsSigTests(TestCase):
+    """The (schema, task, args_sig) uniqueness key, against the real constraint.
+
+    Two calendar entries sharing a task name but differing by args are independent
+    schedules; with the key on (schema, task) alone the second one's watermark collides
+    with the first's and its occurrence reads as already run.
+    """
+
+    def test_same_task_different_args_keep_separate_watermarks(self):
+        t1 = timezone.now().replace(microsecond=0)
+        t2 = t1 + timedelta(hours=1)
+        TaskRun.mark_ran("app.fetch", "sig_one", ["alpha"], t1)
+        TaskRun.mark_ran("app.fetch", "sig_two", ["alpha"], t2)
+
+        self.assertEqual(TaskRun.load_map("app.fetch", "sig_one"), {"alpha": t1})
+        self.assertEqual(TaskRun.load_map("app.fetch", "sig_two"), {"alpha": t2})
+        self.assertEqual(TaskRun.objects.filter(task="app.fetch").count(), 2)
+
+    def test_upsert_is_scoped_to_one_signature(self):
+        t1 = timezone.now().replace(microsecond=0)
+        t2 = t1 + timedelta(hours=1)
+        TaskRun.mark_ran("app.fetch", "sig_one", ["alpha"], t1)
+        TaskRun.mark_ran("app.fetch", "sig_two", ["alpha"], t1)
+        TaskRun.mark_ran("app.fetch", "sig_one", ["alpha"], t2)      # advance only sig_one
+
+        self.assertEqual(TaskRun.load_map("app.fetch", "sig_one"), {"alpha": t2})
+        self.assertEqual(TaskRun.load_map("app.fetch", "sig_two"), {"alpha": t1})
+
+    def test_task_index_still_spans_every_args_variant(self):
+        """The `task`-only index serves the operator question "why did app.fetch not fire
+        for tenant X", which must see all variants."""
+        now = timezone.now()
+        TaskRun.mark_ran("app.fetch", "sig_one", ["alpha", "beta"], now)
+        TaskRun.mark_ran("app.fetch", "sig_two", ["alpha"], now)
+        self.assertEqual(TaskRun.objects.filter(task="app.fetch").count(), 3)
+
+
+class DomainCanonicalConstraintTests(TestCase):
+    """tenants_domain_canonical — the invariant candidate_q()'s direct comparison rests on,
+    and the reason a non-canonical hostname can no longer become an unreachable tenant.
+
+    Inserted with bulk_create on purpose: that bypasses Domain.save() (and its
+    normalization) exactly the way a data migration would, so it is the path the constraint
+    exists to police.
+    """
+
+    def setUp(self):
+        shard = Shard.objects.get_or_create(
+            alias=next(a for a in settings.DATABASES if a != "default"),
+            defaults={"is_active": True})[0]
+        self.tenant = Tenant.objects.create(
+            schema_name="canon", company_name="Canon", shard=shard)
+
+    def _bulk(self, domain):
+        Domain.objects.bulk_create(
+            [Domain(domain=domain, tenant=self.tenant, is_primary=False)])
+
+    def test_canonical_domains_are_accepted(self):
+        for d in ["acme.com", "x.acme.com", "a-b.acme.com"]:
+            with self.subTest(domain=d):
+                with transaction.atomic():
+                    self._bulk(d)
+                self.assertTrue(Domain.objects.filter(domain=d).exists())
+
+    def test_non_canonical_domains_are_refused(self):
+        """Upper case, trailing dot, surrounding whitespace — each would make the tenant
+        unreachable (request.get_host() is compared exactly) and would break
+        candidate_q()'s superset contract."""
+        for d in ["ACME.COM", "acme.com.", "acme.com..", " acme.com", "acme.com "]:
+            with self.subTest(domain=d):
+                with self.assertRaises(IntegrityError), transaction.atomic():
+                    self._bulk(d)
+
+    def test_save_still_normalizes_so_the_normal_path_never_trips_it(self):
+        d = Domain.objects.create(domain="  ACME.COM.  ", tenant=self.tenant,
+                                  is_primary=False)
+        d.refresh_from_db()
+        self.assertEqual(d.domain, "acme.com")
+
+    def test_constraint_allows_exactly_the_fixed_points_of_normalize_host(self):
+        """The constraint and normalize_host must describe the same set, because
+        candidate_q() compares a normalize_host()-ed value against the raw column."""
+        from tenants.validators import normalize_host
+        for d in ["acme.com", "ACME.COM", "acme.com.", "acme.com ", " acme.com"]:
+            with self.subTest(domain=d):
+                is_fixed_point = normalize_host(d) == d
+                try:
+                    with transaction.atomic():
+                        self._bulk(d)
+                    accepted = True
+                except IntegrityError:
+                    accepted = False
+                self.assertEqual(accepted, is_fixed_point)
+
+
+class CandidateQAgainstRealRowsTests(TestCase):
+    """candidate_q()/matches() equivalence against REAL rows and real SQL.
+
+    The DB-free sibling (test_reserved_hosts.CandidateQSupersetTests) simulates Postgres;
+    this is the only place the actual query plan is exercised. All fixtures are canonical —
+    non-canonical rows cannot exist (see DomainCanonicalConstraintTests).
+    """
+
+    CANONICAL = ["acme.com", "x.acme.com", "www.acme.com", "y.x.acme.com", "other.com"]
+
+    def setUp(self):
+        shard = Shard.objects.get_or_create(
+            alias=next(a for a in settings.DATABASES if a != "default"),
+            defaults={"is_active": True})[0]
+        tenant = Tenant.objects.create(schema_name="dots", company_name="Dots", shard=shard)
+        Domain.objects.bulk_create([Domain(domain=d, tenant=tenant, is_primary=False)
+                                    for d in self.CANONICAL])
+
+    def _assert_superset(self, rule):
+        candidates = set(
+            Domain.objects.filter(rule.candidate_q()).values_list("domain", flat=True))
+        truth = {d for d in self.CANONICAL if rule.matches(d)}
+        self.assertTrue(truth, "fixture should produce at least one true match")
+        self.assertEqual(truth - candidates, set(),
+                         f"{rule}: candidate_q EXCLUDED true match(es)")
+
+    def test_exact_rule_superset_holds(self):
+        self._assert_superset(
+            ReservedHostRule(match_type=ReservedHostRule.MatchType.EXACT, value="acme.com"))
+
+    def test_suffix_rule_superset_holds(self):
+        self._assert_superset(
+            ReservedHostRule(match_type=ReservedHostRule.MatchType.SUFFIX, value="acme.com"))
+
+    def test_label_rule_superset_holds(self):
+        self._assert_superset(ReservedHostRule(
+            match_type=ReservedHostRule.MatchType.LABEL, value="www", base_domain=""))
+
+
+class AdminsProbeAgainstRealSchemasTests(TestCase):
+    """_admins_for against real per-schema users tables.
+
+    The DB-free suite mocks the cursor, so it pins the SHAPE (one pair of queries per
+    shard, quoting, per-branch role parameter) but not the SQL itself. This is the only
+    place the cross-schema UNION actually runs — and the only place that proves the batched
+    probe returns what the old per-tenant tenant_context() query returned.
+    """
+
+    def setUp(self):
+        self.alias = next(a for a in settings.DATABASES if a != "default")
+        shard = Shard.objects.get_or_create(
+            alias=self.alias, defaults={"is_active": True})[0]
+        self.tenants = [
+            Tenant.objects.create(schema_name=s, company_name=s.title(), shard=shard)
+            for s in ("probe_a", "probe_b")
+        ]
+        # Real schemas + the users table in each, via the normal provisioning path.
+        for t in self.tenants:
+            call_command("migrate_schemas", tenant=True, schema_name=t.schema_name,
+                         verbosity=0)
+        with tenant_context(self.tenants[0]):
+            User.objects.create_user(username="root_a", password="x",
+                                     role=User.Role.COMPANY_ADMIN)
+            User.objects.create_user(username="cust_a", password="x",
+                                     role=User.Role.CUSTOMER)   # must NOT be listed
+
+    def test_returns_only_company_admins_of_the_right_schema(self):
+        got = TenantViewSet._admins_for(self.tenants)
+        self.assertEqual([a["username"] for a in got[(self.alias, "probe_a")]], ["root_a"])
+        self.assertNotIn((self.alias, "probe_b"), got)     # no admins there yet
+
+    def test_matches_what_a_per_tenant_query_would_return(self):
+        """Equivalence with the path this replaced."""
+        batched = TenantViewSet._admins_for(self.tenants)
+        for t in self.tenants:
+            with tenant_context(t):
+                expected = list(User.objects.filter(role=User.Role.COMPANY_ADMIN)
+                                .order_by("username")
+                                .values("id", "username", "is_active"))
+            self.assertEqual(batched.get((self.alias, t.schema_name), []), expected)
+
+    def test_tenant_without_a_migrated_schema_is_simply_absent(self):
+        shard = Shard.objects.get(alias=self.alias)
+        ghost = Tenant.objects.create(schema_name="probe_ghost",
+                                      company_name="Ghost", shard=shard)
+        got = TenantViewSet._admins_for(self.tenants + [ghost])
+        self.assertNotIn((self.alias, "probe_ghost"), got)

@@ -9,6 +9,7 @@ from django.test import SimpleTestCase
 
 from tenants_back.celery import app
 from tenants.context import active_alias, bound_alias, use_alias
+from tenants.resolver import ShardSnapshot, TenantSnapshot
 
 
 @app.task(bind=True, name="tests.tenanttask_probe")
@@ -26,8 +27,8 @@ class TenantTaskCallTests(SimpleTestCase):
         self.assertEqual(r.result, "default")
 
     def test_bare_call_inherits_ambient(self):
-        """A bare in-process call (no request) inherits the caller's context — unchanged from
-        the old prerun/postrun behavior (those signals don't fire off the worker/eager path)."""
+        """A bare in-process call (no request) inherits the caller's context: with no message
+        there is no _schema_name to switch to, so the ambient context is the only answer."""
         with use_alias("shard_x"):
             self.assertEqual(_probe(), "shard_x")
 
@@ -104,8 +105,15 @@ class _FakeGlobal:
 class GetTenantForSchemaTests(SimpleTestCase):
     """The worker resolution tiering: GLOBAL (invalidated) -> LOCAL -> DB."""
 
-    def _run(self, glob, l1_seed=None, db_tenant="DB"):
+    # The DB tier now narrows its row with TenantSnapshot.capture(), so the sentinel has to
+    # BE a snapshot: capture() is idempotent on one, which is exactly the property the
+    # worker path relies on (its two cache tiers already return snapshots).
+    DB_SENTINEL = TenantSnapshot(id=1, schema_name="s", status="active",
+                                 shard=ShardSnapshot(id=2, alias="shard_a"))
+
+    def _run(self, glob, l1_seed=None, db_tenant=None):
         from tenants.celery import task as taskmod
+        db_tenant = self.DB_SENTINEL if db_tenant is None else db_tenant
         l1 = _FakeL1()
         if l1_seed is not None:
             l1.store["s"] = l1_seed
@@ -128,7 +136,7 @@ class GetTenantForSchemaTests(SimpleTestCase):
     def test_global_hold_bypasses_stale_local_goes_db(self):
         glob = _FakeGlobal(snapshot=_FakeGlobal.HOLD)
         result, l1, db = self._run(glob, l1_seed="STALE")
-        self.assertEqual(result, "DB")                         # NOT the stale L1 value
+        self.assertIs(result, self.DB_SENTINEL)                # NOT the stale L1 value
         db.objects.select_related.assert_called_once()
 
     def test_global_miss_falls_to_local_hit(self):
@@ -140,14 +148,14 @@ class GetTenantForSchemaTests(SimpleTestCase):
     def test_global_miss_local_miss_hits_db_l1_only(self):
         glob = _FakeGlobal(snapshot=_FakeGlobal.MISS)
         result, l1, db = self._run(glob)
-        self.assertEqual(result, "DB")
-        self.assertEqual(l1.store["s"], "DB")                  # L1 filled
+        self.assertIs(result, self.DB_SENTINEL)
+        self.assertIs(l1.store["s"], self.DB_SENTINEL)         # L1 filled
         self.assertEqual(glob.put_schema_calls, [])            # worker NEVER writes the global cache
 
     def test_global_disabled_uses_local_then_db_without_global_write(self):
         glob = _FakeGlobal(enabled=False)
         result, l1, db = self._run(glob)
-        self.assertEqual(result, "DB")
+        self.assertIs(result, self.DB_SENTINEL)
         self.assertEqual(glob.put_schema_calls, [])            # no global write when disabled
 
 

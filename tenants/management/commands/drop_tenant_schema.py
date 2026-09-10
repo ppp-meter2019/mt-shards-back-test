@@ -10,14 +10,15 @@ Guards:
   * refuses the 'public' schema;
   * refuses a schema still referenced by a LIVE Tenant — delete the tenant
     first (no override: this is strictly an orphan-cleanup tool);
-  * validates the alias (must be in DATABASES) and the schema-name format;
+  * validates the alias (must be in DATABASES), and canonicalizes the schema name the
+    same way the creation path does, so `--schema=Foo-Bar` targets the row stored as
+    `foo_bar` rather than silently missing it;
   * asks for confirmation (type the schema name) unless --no-input.
 
-Runs DROP SCHEMA "<schema>" CASCADE on the shard's connection (the app role
-owns tenant schemas, so it may drop them).
+Runs DROP SCHEMA "<schema>" CASCADE on the shard's connection (the app role owns tenant
+schemas, so it may drop them). The identifier goes through tenants.validators.quote_schema,
+which validates and quotes in one call.
 """
-import re
-
 from django.conf import settings
 from django.core.management.base import CommandError
 
@@ -26,8 +27,7 @@ from django.db import connections
 from django_tenants.utils import get_public_schema_name
 
 from tenants.models import Tenant
-
-_SCHEMA_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+from tenants.validators import normalize_schema_name, quote_schema
 
 
 class Command(TenantCommand):
@@ -41,7 +41,9 @@ class Command(TenantCommand):
 
     def handle(self, *args, **opts):
         alias = opts["database"]
-        schema = (opts["schema"] or "").strip().lower()
+        # Same normalization the creation path applies, so `--schema=Foo-Bar` targets the
+        # row that was actually stored as `foo_bar` instead of silently missing it.
+        schema = normalize_schema_name(opts["schema"])
 
         if alias not in settings.DATABASES:
             raise CommandError(
@@ -49,8 +51,8 @@ class Command(TenantCommand):
             )
         if schema == get_public_schema_name():
             raise CommandError("Refusing to drop the 'public' schema.")
-        if not _SCHEMA_RE.fullmatch(schema):
-            raise CommandError(f"Invalid schema name {schema!r}.")
+        if not schema:
+            raise CommandError("--schema is required.")
 
         live = Tenant.objects.filter(schema_name=schema, shard__alias=alias).first()
         if live:
@@ -78,7 +80,7 @@ class Command(TenantCommand):
             if answer != schema:
                 raise CommandError("Confirmation did not match - aborted.")
 
-        # schema is validated by _SCHEMA_RE above, so safe to interpolate.
+        # quote_schema validates AND quotes together — see the note in migrate_schemas.
         with conn.cursor() as cur:
-            cur.execute(f'DROP SCHEMA "{schema}" CASCADE')
+            cur.execute(f'DROP SCHEMA {quote_schema(schema)} CASCADE')
         self.stdout.write(self.style.SUCCESS(f"Dropped schema {schema!r} on shard {alias!r}."))

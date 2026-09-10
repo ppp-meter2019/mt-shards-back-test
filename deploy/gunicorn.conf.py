@@ -19,9 +19,12 @@ umask = 0o007
 
 # Worker processes. Override via env if you need to.
 workers = int(os.environ.get("GUNICORN_WORKERS", multiprocessing.cpu_count() * 2 + 1))
-# sync (prefork) — project default: one request per process, concurrency =
-# `workers`. (A `gthread` variant trades memory for in-process I/O concurrency;
-# the async UvicornWorker path needs middleware rework — see settings_base.py.)
+# sync (prefork): one request per process, concurrency = `workers`. NOT a preference —
+# a django-tenants connection carries the tenant's search_path, so it cannot be shared
+# across tenants, and an ASGI stack would give each in-flight request its own connection
+# per shard. Full reasoning in ONE place: bin/gunicorn_start.sh (`Why not ASGI`).
+# (A `gthread` variant trades memory for in-process I/O concurrency and keeps one
+# connection per thread — same connection-count question, smaller blast radius.)
 worker_class = "sync"
 timeout = 60
 graceful_timeout = 30

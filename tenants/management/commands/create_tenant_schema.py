@@ -12,6 +12,7 @@ from django.db import connections
 from django_tenants.utils import get_public_schema_name, schema_exists
 
 from tenants.models import Tenant
+from tenants.validators import quote_schema
 
 
 class Command(TenantCommand):
@@ -51,6 +52,7 @@ class Command(TenantCommand):
             self.stdout.write(f"Schema {schema} already exists in {alias}.")
             return
 
+        # quote_schema validates AND quotes together — see the note in migrate_schemas.
         with conn.cursor() as cur:
-            cur.execute(f'CREATE SCHEMA "{schema}"')
+            cur.execute(f'CREATE SCHEMA {quote_schema(schema)}')
         self.stdout.write(self.style.SUCCESS(f"Created schema {schema} in {alias}."))

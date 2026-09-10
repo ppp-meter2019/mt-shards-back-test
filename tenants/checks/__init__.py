@@ -7,7 +7,7 @@ deploy-time guards, not per-boot ones; the runtime keeps its own fail-safe defau
 
 Grouped by concern:
   * gate.py       — E001: resolve-gate flag invariants (GATE requires WARM)
-  * beat.py       — E002/E003/E005: Celery beat schedule + fanout-dispatch contract
+  * beat.py       — E002/E003/E005/E006: Celery beat schedule + fanout-dispatch contract
   * middleware.py — E004: MT middleware presence & relative order
 
 Convention: every cross-layer / cross-module contract that would otherwise fail silently — or
@@ -19,6 +19,7 @@ from .gate import gate_requires_warm
 from .beat import (
     beat_grace_ge_fanout_period,
     beat_entries_wrapped,
+    fanout_entries_are_unique,
     fanout_task_registered,
 )
 from .middleware import mt_middleware_order
@@ -29,5 +30,6 @@ __all__ = [
     "beat_grace_ge_fanout_period",
     "beat_entries_wrapped",
     "fanout_task_registered",
+    "fanout_entries_are_unique",
     "mt_middleware_order",
 ]

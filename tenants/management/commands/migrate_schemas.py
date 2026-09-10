@@ -57,6 +57,7 @@ from django_tenants.utils import (
 from commons.platform.commands import TenantCommand
 from tenants.models import Shard, Tenant
 from tenants.resolver import resolve_cache
+from tenants.validators import quote_schema
 
 
 # Statuses that may be claimed by a migration run.
@@ -249,8 +250,14 @@ class Command(TenantCommand, UpstreamCommand):
         # raised "getattr(): attribute name must be string".
         if not schema_exists(tenant.schema_name, tenant.shard.alias):
             if tenant.previous_status == Tenant.Status.NEW:
+                # quote_schema validates AND quotes in one call — a param-less execute()
+                # goes over psycopg's SIMPLE query protocol, which WOULD run a second
+                # statement after a `"`. Defence in depth: Tenant.clean() rejects such a
+                # name on create, but a row from a data migration / manual INSERT never
+                # passed through it.
                 with conn.cursor() as cur:
-                    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{tenant.schema_name}"')
+                    cur.execute(
+                        f'CREATE SCHEMA IF NOT EXISTS {quote_schema(tenant.schema_name)}')
                 self._notice(
                     f"  -> Created schema {tenant.schema_name!r} on {tenant.shard.alias!r}"
                 )

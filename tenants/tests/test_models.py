@@ -7,45 +7,51 @@ from unittest import mock
 from django.db import models
 from django.test import SimpleTestCase
 
-from tenants.models import ReadOnlyInstanceError, Shard, Tenant
+from tenants.models import Shard, Tenant
 
 
-class ReadOnlyGuardTests(SimpleTestCase):
-    def _snapshot(self):
-        t = Tenant(id=5, schema_name="alpha", status=Tenant.Status.ACTIVE)
-        t.shard = Shard(id=2, alias="shard_a")
-        t.read_only = True
-        t.shard.read_only = True
+class SnapshotIsNotAModelTests(SimpleTestCase):
+    """What replaced the `read_only` flag and its four save()/delete() overrides: the thing
+    a request or a task holds is not a model at all, so there is nothing to guard."""
+
+    def test_models_carry_no_read_only_flag(self):
+        """Pinned so the flag is not reintroduced alongside the snapshot type — two
+        mechanisms for one invariant is how they drift."""
+        self.assertFalse(hasattr(Tenant, "read_only"))
+        self.assertFalse(hasattr(Shard, "read_only"))
+
+    def test_snapshot_cannot_be_saved_because_it_has_no_save(self):
+        from tenants.resolver import TenantSnapshot
+        snap = TenantSnapshot.capture(self._tenant())
+        self.assertFalse(hasattr(snap, "save"))
+        self.assertFalse(hasattr(snap, "delete"))
+
+    def test_snapshot_exposes_only_routing_fields(self):
+        """The uncarried fields must be ABSENT, not defaulted — a defaulted company_name is
+        a plausible wrong value, an AttributeError is not."""
+        from tenants.resolver import TenantSnapshot
+        snap = TenantSnapshot.capture(self._tenant())
+        self.assertEqual(snap.schema_name, "alpha")
+        self.assertEqual(snap.shard.alias, "shard_a")
+        for absent in ("company_name", "description", "last_error", "created_on"):
+            with self.subTest(field=absent):
+                self.assertFalse(hasattr(snap, absent))
+
+    @staticmethod
+    def _tenant():
+        t = Tenant(id=5, schema_name="alpha", company_name="Acme",
+                   status=Tenant.Status.ACTIVE)
+        t.shard = Shard(id=2, alias="shard_a", name="A")
         return t
-
-    def test_tenant_save_and_delete_blocked(self):
-        t = self._snapshot()
-        with self.assertRaises(ReadOnlyInstanceError):
-            t.save()
-        with self.assertRaises(ReadOnlyInstanceError):
-            t.delete()
-
-    def test_shard_save_and_delete_blocked(self):
-        s = self._snapshot().shard
-        with self.assertRaises(ReadOnlyInstanceError):
-            s.save()
-        with self.assertRaises(ReadOnlyInstanceError):
-            s.delete()
-
-    def test_default_flag_is_false(self):
-        self.assertFalse(Tenant.read_only)
-        self.assertFalse(Shard.read_only)
-
-    def test_error_subclasses_runtimeerror(self):
-        self.assertTrue(issubclass(ReadOnlyInstanceError, RuntimeError))
 
 
 class StatusChangedAtTests(SimpleTestCase):
     """status_changed_at must track the STATUS, not the row.
 
-    The old auto_now=True did the opposite: it fired on every .save() (so an edit of
-    `description` shifted it) and never on QuerySet.update() (where every status writer
-    lives). Tenant.save() now stamps it iff the status actually moved.
+    auto_now=True would do the opposite: it fires on every .save() (so an edit of
+    `description` would shift it) and never on QuerySet.update() — where every status writer
+    lives. Hence Tenant.save() stamps it iff the status actually moved, and the .update()
+    callers set it explicitly.
     """
 
     OLD = datetime(2020, 1, 1, tzinfo=dt_timezone.utc)
@@ -111,5 +117,5 @@ class StatusChangedAtTests(SimpleTestCase):
 
     def test_field_is_not_auto_now(self):
         f = Tenant._meta.get_field("status_changed_at")
-        self.assertFalse(f.auto_now)           # auto_now would silently restore the old bug
+        self.assertFalse(f.auto_now)           # see the class docstring: auto_now inverts this
         self.assertFalse(f.auto_now_add)

@@ -6,7 +6,6 @@ from unittest import mock
 from django.test import SimpleTestCase
 
 import tenants.middleware as mw
-from tenants.models import ReadOnlyInstanceError
 from tenants.resolver import TenantResolveCache
 from tenants.resolver import NEGATIVE, TOMBSTONE
 
@@ -32,16 +31,21 @@ class ResolveCacheTests(SimpleTestCase):
                     self.mw.get_tenant(dm, "nope")
         self.assertEqual(dm.db_calls["n"], 1)
 
-    def test_request_tenant_read_only_on_miss_and_hit(self):
+    def test_miss_and_hit_expose_exactly_the_same_thing(self):
+        """The invariant the snapshot type exists for. The DB resolve used to hand out the
+        full row while the cache handed out a partial model instance, so a field like
+        company_name read correctly on a cold cache and as "" on a warm one."""
+        from tenants.resolver import TenantSnapshot
         dm = make_domain_model(make_tenant())
         with use_resolve_cache(FakeNxCache()):
             miss = self.mw.get_tenant(dm, "known")
             hit = self.mw.get_tenant(dm, "known")
+        self.assertIsInstance(miss, TenantSnapshot)
+        self.assertIsInstance(hit, TenantSnapshot)
+        self.assertEqual(miss, hit)                       # field-for-field
         for got in (miss, hit):
-            self.assertTrue(got.read_only)
-            self.assertTrue(got.shard.read_only)
-            with self.assertRaises(ReadOnlyInstanceError):
-                got.save()
+            self.assertFalse(hasattr(got, "save"))
+            self.assertFalse(hasattr(got, "company_name"))
 
     def test_tombstone_blocks_stale_nx_write(self):
         fake = FakeNxCache()
@@ -143,11 +147,32 @@ class ResolveCacheTests(SimpleTestCase):
         self.assertEqual(calls["n"], 1)                      # surfaced once, NOT retried
 
     def test_dump_load_round_trip_fidelity(self):
-        r = TenantResolveCache.load(TenantResolveCache.dump(make_tenant()))
+        from tenants.resolver import TenantSnapshot
+        t = make_tenant()
+        r = TenantResolveCache.load(TenantResolveCache.dump(t))
         self.assertEqual(r.schema_name, "alpha")
         self.assertEqual(r.shard.alias, "shard_a")
-        self.assertEqual(r.shard_id, 2)
-        self.assertTrue(r.read_only and r.shard.read_only)
+        self.assertEqual(r.shard.id, 2)
+        # The round trip and the direct capture must land on the same value — that is what
+        # makes a hit indistinguishable from a miss.
+        self.assertEqual(r, TenantSnapshot.capture(t))
+
+    def test_dump_accepts_a_snapshot_as_well_as_a_model(self):
+        """The resolve path hands dump() an already-captured snapshot; reconcile and warm
+        hand it Domain.tenant rows. Both must produce the same payload."""
+        from tenants.resolver import TenantSnapshot
+        t = make_tenant()
+        self.assertEqual(TenantResolveCache.dump(t),
+                         TenantResolveCache.dump(TenantSnapshot.capture(t)))
+
+    def test_payload_never_carries_the_request_hostname(self):
+        """domain_url is a declared field (django_tenants writes it) but is per-REQUEST —
+        caching it would stamp one hostname onto a snapshot shared by every domain of the
+        tenant."""
+        snap = TenantResolveCache.load(TenantResolveCache.dump(make_tenant()))
+        self.assertIsNone(snap.domain_url)
+        payload = TenantResolveCache.dump(make_tenant())
+        self.assertNotIn("domain_url", payload["tenant"])
 
 
 class SweepOrphansTests(SimpleTestCase):

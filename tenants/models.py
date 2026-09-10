@@ -14,24 +14,19 @@ Delete protections:
   - Tenant.shard FK is on_delete=PROTECT  (shard with tenants cannot be removed)
   - Shard.delete()  blocks deletion of the default shard
   - Tenant.delete() blocks deletion of the public tenant
+
+These models are never what a request or a task holds: `request.tenant` and the worker's
+tenant are a tenants.resolver.TenantSnapshot, which has no save()/delete() to guard.
 """
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.deletion import ProtectedError
+from django.db.models.functions import Lower, Trim
 from django.utils import timezone
 from django_tenants.models import DomainMixin, TenantMixin
 from django_tenants.utils import get_public_schema_name
-
-
-class ReadOnlyInstanceError(RuntimeError):
-    """Raised when code tries to save()/delete() a request-scoped, read-only Tenant
-    or Shard. tenants.middleware marks request.tenant (and its .shard) read-only —
-    whether resolved fresh OR rebuilt from the resolution cache — because it is a
-    routing snapshot, not a handle for mutating the registry. Re-fetch a fresh
-    instance (Model.objects.get(pk=...)) to persist changes. Subclasses RuntimeError
-    so existing `except RuntimeError` handlers still catch it."""
 
 
 class Shard(models.Model):
@@ -47,12 +42,6 @@ class Shard(models.Model):
     is_active  = models.BooleanField(default=True)
     created_on = models.DateTimeField(auto_now_add=True)
     modified   = models.DateTimeField(auto_now=True)
-
-    # Set True by tenants.middleware on request.tenant / its .shard — a read-only
-    # routing snapshot (resolved fresh OR rebuilt from the resolution cache). Saving
-    # it would clobber the real row (a cache-rebuilt instance carries only cached
-    # fields). Plain attribute, not a model field: no column, no migration.
-    read_only = False
 
     class Meta:
         # Partial unique index: at most one row with is_default=True.
@@ -90,25 +79,12 @@ class Shard(models.Model):
                 "alias": "The 'default' database is reserved for the public schema."
             })
 
-    def save(self, *args, **kwargs):
-        if self.read_only:
-            raise ReadOnlyInstanceError(
-                "This Shard is a read-only request snapshot (tenants.middleware); "
-                "re-fetch it via Shard.objects.get(pk=...) before saving."
-            )
-        return super().save(*args, **kwargs)
-
     def delete(self, *args, **kwargs):
-        """Refuse to delete a read-only request snapshot; protect the default shard.
+        """Protect the default shard.
 
         Combined with Tenant.shard on_delete=PROTECT, a real shard can only be
         deleted if it has no tenants AND is not the default shard.
         """
-        if self.read_only:
-            raise ReadOnlyInstanceError(
-                "This Shard is a read-only request snapshot; re-fetch it via "
-                "Shard.objects.get(pk=...) before deleting (would remove the real row)."
-            )
         if self.is_default:
             raise ProtectedError(
                 "Default shard cannot be deleted - it is reserved for the public schema.",
@@ -144,8 +120,8 @@ class Tenant(TenantMixin):
         FAILED      = "failed",      "Failed"
 
     # Human-readable company label. Unique + required, but NOT an identifier:
-    # every lookup/routing uses schema_name. Renamed from `name` to remove the
-    # name-vs-schema_name ambiguity.
+    # every lookup/routing uses schema_name. Named `company_name` rather than `name` so the
+    # display label is never mistaken for the identifier at a call site.
     company_name      = models.CharField(max_length=120, unique=True)
     # Free-text notes; optional, purely descriptive.
     description       = models.TextField(blank=True)
@@ -176,9 +152,6 @@ class Tenant(TenantMixin):
     auto_create_schema = False
     auto_drop_schema   = False
 
-    # See Shard.read_only.
-    read_only = False
-
     def __str__(self):
         return self.company_name
 
@@ -198,11 +171,18 @@ class Tenant(TenantMixin):
                 raise ValidationError({"shard": "Business tenants cannot live on the default shard."})
             if not self.shard.is_active:
                 raise ValidationError({"shard": "Selected shard is not active."})
-            # On create, reject a schema_name that collides with a reserved global
-            # subdomain label (same source as Domain validation). Create-only:
-            # schema_name is immutable, and we must not fail edits of an existing row.
+            # On create, validate the schema_name FORMAT and the reserved-label rules with
+            # the same validators the API serializer uses, so the admin and the API cannot
+            # disagree about what a valid tenant is. This is the ONLY format check on the
+            # admin path: the model field itself carries django-tenants' `^(?!pg_).{1,63}$`,
+            # which accepts spaces, quotes and non-ASCII — and schema_name from here reaches
+            # `CREATE SCHEMA "{...}"` in migrate_schemas.
+            # Create-only: schema_name is immutable (read-only on the admin change form), and
+            # re-validating would block edits of a row whose name predates the convention.
+            # NB assigns the NORMALIZED name back ("Foo-Bar" -> "foo_bar").
             if self.pk is None:
-                from .validators import validate_tenant_schema_name
+                from .validators import validate_schema_name, validate_tenant_schema_name
+                self.schema_name = validate_schema_name(self.schema_name)
                 validate_tenant_schema_name(self.schema_name)
 
     @classmethod
@@ -216,11 +196,6 @@ class Tenant(TenantMixin):
         return obj
 
     def save(self, *args, **kwargs):
-        if self.read_only:
-            raise ReadOnlyInstanceError(
-                "This Tenant is a read-only request snapshot (tenants.middleware); "
-                "re-fetch it via Tenant.objects.get(pk=...) before saving."
-            )
         # status_changed_at tracks the STATUS, not the row — so stamp it here iff the status
         # actually moved. This keeps every .save() path correct (the admin status change
         # included) without each caller remembering, and stops an unrelated edit
@@ -237,12 +212,7 @@ class Tenant(TenantMixin):
         return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
-        """Refuse to delete a read-only request snapshot; protect the public tenant."""
-        if self.read_only:
-            raise ReadOnlyInstanceError(
-                "This Tenant is a read-only request snapshot; re-fetch it via "
-                "Tenant.objects.get(pk=...) before deleting (would remove the real row)."
-            )
+        """Protect the public tenant."""
         if self.schema_name == get_public_schema_name():
             raise ProtectedError(
                 "Public tenant cannot be deleted - it is required by django-tenants "
@@ -254,6 +224,31 @@ class Tenant(TenantMixin):
 
 class Domain(DomainMixin):
     """hostname -> tenant mapping. Resolved every request by ShardAwareTenantMiddleware."""
+
+    class Meta:
+        constraints = [
+            # The column is CANONICAL by construction: lower-cased, whitespace-trimmed, no
+            # trailing dot — exactly the fixed points of validators.normalize_host.
+            #
+            # Two things depend on it. (1) Reachability: request.get_host() returns the raw
+            # header and this column compares exactly, so a non-canonical row is a tenant
+            # nobody can reach — better to refuse the INSERT than to serve nothing.
+            # (2) ReservedHostRule.candidate_q() compares the column DIRECTLY, which is
+            # sound only while this holds; without it that method silently excludes true
+            # matches and the `conflicts` action under-reports.
+            #
+            # Domain.save() normalizes, but bulk_create() / QuerySet.update() / raw SQL
+            # bypass it — this is what makes the invariant hold on those paths too. NB
+            # save() can still produce a rejected value for pathological input
+            # ("acme.com ." normalizes to "acme.com "), and that INSERT failing loudly is
+            # the intended outcome; validate_hostname refuses such input earlier anyway.
+            models.CheckConstraint(
+                condition=models.Q(
+                    domain=models.Func(
+                        Lower(Trim("domain")), models.Value("."), function="RTRIM")),
+                name="tenants_domain_canonical",
+            ),
+        ]
 
     def clean(self):
         """Validate format + reserved-host rules for business-tenant domains.
@@ -382,20 +377,22 @@ class ReservedHostRule(models.Model):
         in SQL so matches() (the authority) confirms only a narrowed set.
 
         Contract: MUST NOT exclude any true match; over-inclusion is fine (matches()
-        drops it). Lookups are case-INSENSITIVE on purpose: CLI-created domains may be
-        stored non-normalized, and matches() compares lower-cased — a case-sensitive
-        prefilter would miss them and break the superset guarantee.
+        drops it). Compares the column DIRECTLY — case-sensitively, with no trailing-dot
+        handling — and that is sound ONLY because the tenants_domain_canonical CHECK
+        constraint guarantees every stored domain is already a fixed point of
+        normalize_host, which is what matches() reduces its argument to. Weaken that
+        constraint and this method starts silently excluding true matches.
         """
         from django.db.models import Q
         from .validators import normalize_host
         val = normalize_host(self.value)
         if self.match_type == self.MatchType.EXACT:
-            return Q(domain__iexact=val)
+            return Q(domain=val)
         if self.match_type == self.MatchType.SUFFIX:
-            return Q(domain__iexact=val) | Q(domain__iendswith="." + val)
+            return Q(domain=val) | Q(domain__endswith="." + val)
         if self.match_type == self.MatchType.LABEL:
             # leading label == val; the base (if any) is confirmed by matches().
-            return Q(domain__iexact=val) | Q(domain__istartswith=val + ".")
+            return Q(domain=val) | Q(domain__startswith=val + ".")
         return Q(pk__in=[])       # unknown type → nothing
 
     def denial_message(self, host: str) -> str:
@@ -409,33 +406,57 @@ class ReservedHostRule(models.Model):
 
 
 class TaskRun(models.Model):
-    """Durable per-(task, tenant-schema) last-run watermark for CALENDAR (tz) fanout.
+    """Durable per-(task, args, tenant-schema) last-run watermark for CALENDAR (tz) fanout.
 
     Lives in default.public (SHARED). Makes per-tenant due-ness level-triggered: a missed
     tick self-heals within `grace`, and re-firing the same occurrence is deduped. Only
     calendar tasks write here; interval / public tasks do not. See
     deploy/celery_fanout_design.md §3.
+
+    `args_sig` is part of the identity because two schedule entries may share a task NAME
+    and differ only by args — `fetch(1)` at 08:00 and `fetch(7)` at 09:00 are two
+    independent schedules. The fanout overlap-lock already discriminates on the same axis
+    (tenants.celery.dispatch._argsig); the watermark must agree with it, or the entry whose
+    wave lands second reads the first one's watermark, sees the occurrence as already run,
+    and is skipped forever. It is a short digest rather than the raw args so the column
+    stays bounded and indexable, and "" for the no-args majority so those rows read as
+    plainly as they did before the column existed.
     """
     schema      = models.CharField(max_length=63)
     task        = models.CharField(max_length=255)
+    # tenants.celery.dispatch._argsig(task_args): a 12-char digest, or "" for the common
+    # no-args entry — so the rows an operator reads by hand stay readable and only an entry
+    # that actually carries args gets a discriminator. Never NULL.
+    args_sig    = models.CharField(max_length=12, blank=True, default="")
     last_run_at = models.DateTimeField()
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["schema", "task"], name="tenants_taskrun_unique"),
+            models.UniqueConstraint(fields=["schema", "task", "args_sig"],
+                                    name="tenants_taskrun_unique"),
         ]
+        # `task` alone, not the full key: this index serves operator queries ("why did
+        # x.report not fire for tenant Y") across every args variant of a task.
         indexes = [models.Index(fields=["task"], name="tenants_taskrun_task_idx")]
 
     def __str__(self):
-        return f"{self.task}@{self.schema} last={self.last_run_at:%Y-%m-%d %H:%M:%SZ}"
+        # The signature is shown only when there is one — for a no-args entry ("") it would
+        # be a constant in the operator's face on every row.
+        sig = f"[{self.args_sig}]" if self.args_sig else ""
+        return f"{self.task}{sig}@{self.schema} last={self.last_run_at:%Y-%m-%d %H:%M:%SZ}"
 
     @classmethod
-    def load_map(cls, task):
-        """{schema: last_run_at} for a task — one query, read at the start of each tick."""
-        return dict(cls.objects.filter(task=task).values_list("schema", "last_run_at"))
+    def load_map(cls, task, args_sig):
+        """{schema: last_run_at} for ONE schedule entry — one query per tick. Scoped by
+        args_sig as well as task: another entry for the same task with different args keeps
+        its own watermark."""
+        return dict(
+            cls.objects.filter(task=task, args_sig=args_sig)
+                       .values_list("schema", "last_run_at")
+        )
 
     @classmethod
-    def mark_ran(cls, task, schemas, run_ts):
+    def mark_ran(cls, task, args_sig, schemas, run_ts):
         """Bulk-upsert last_run_at=run_ts for the given schemas (after successful send)."""
         if not schemas:
             return
@@ -443,9 +464,10 @@ class TaskRun(models.Model):
             from django.utils.dateparse import parse_datetime
             run_ts = parse_datetime(run_ts)
         cls.objects.bulk_create(
-            [cls(schema=s, task=task, last_run_at=run_ts) for s in schemas],
+            [cls(schema=s, task=task, args_sig=args_sig, last_run_at=run_ts)
+             for s in schemas],
             update_conflicts=True,
-            unique_fields=["schema", "task"],
+            unique_fields=["schema", "task", "args_sig"],
             update_fields=["last_run_at"],
         )
 

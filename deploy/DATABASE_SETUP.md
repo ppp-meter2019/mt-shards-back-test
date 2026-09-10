@@ -245,6 +245,44 @@ After Step 5 the platform is initialized: the `public` schema exists on
 
 ## 7. Provisioning a business tenant
 
+### 7a. Choosing `schema_name`
+
+`schema_name` becomes a physical PostgreSQL schema, so it is **not** simply the tenant's
+subdomain label. A host label legitimately allows upper case and hyphens; a schema name
+does not. `tenants.validators.normalize_schema_name()` folds both automatically, so the
+mapping is mechanical:
+
+| Primary host | `schema_name` |
+| --- | --- |
+| `cadc.routegenie.com` | `cadc` |
+| `Freedom-First.routegenie.com` | `freedom_first` |
+| `24-7-transit.routegenie.com` | `24_7_transit` |
+| `1st-choice.routegenie.com` | `1st_choice` |
+
+Accepted: ASCII letters, digits and underscores; must start with a letter **or a digit**;
+max 63 characters (PostgreSQL `NAMEDATALEN - 1` — a longer name is silently truncated,
+which would alias two tenants); must not start with `pg_`, and must not collide with a
+reserved global label (`www`, `api`, `admin`, … — see `tenants.ReservedHostRule`).
+
+Rejected outright, because there is nothing to fold: quotes, spaces, dots, path
+separators, non-ASCII, a leading underscore. Both write paths enforce this identically —
+the API serializer and `Tenant.clean()` (the admin form) — and `bootstrap_tenant` fails
+loudly rather than rewriting an explicit `--schema`.
+
+Two consequences worth knowing before you name 600 tenants:
+
+* **A leading digit is allowed on purpose** (`1st_choice` is a real company name). Postgres
+  cannot reference such a schema unquoted, which is why every SQL site in the codebase goes
+  through `tenants.validators.quote_schema()` — it validates *and* quotes in one call, so a
+  call site cannot do one without the other. If you add a new site that touches a schema
+  name in SQL, use it; do not hand-write the quotes.
+* **`schema_name` is immutable.** Renaming later is not one operation: it touches the
+  physical schema, the `Tenant` row, `TaskRun.schema` rows, the `schema-snap:<schema>` keys
+  in the resolve cache, and any in-flight Celery message carrying a `_schema_name` header.
+  Get it right at creation.
+
+### 7b. Running the provisioning step
+
 Creating the `Tenant` row (admin UI or API) only inserts a registry record with
 `status=NEW` — **no schema exists yet**. Provisioning is a separate, explicit
 step on a backend host.

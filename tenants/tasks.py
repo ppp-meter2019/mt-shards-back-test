@@ -1,7 +1,14 @@
 """Tenant provisioning / housekeeping tasks.
 
-provision_tenant runs on the `service` queue (it's a management/housekeeping operation,
-not a business task). It is the async equivalent of
+Queue placement — MT-only; task_queue() returns None in standalone, so every task below
+falls back to the host's default queue there:
+  provision_tenant, drop_tenant_schema_task  -> `service`  management operations, not
+      business tasks, and long-running (provisioning runs migrate_schemas).
+  reconcile_host_registry_task               -> `fast`     NOT `service`: time-to-warm is
+      on the availability path, and the cost is bounded by the treg:warming lock rather
+      than by the queue. Full rationale at its decorator.
+
+provision_tenant is the async equivalent of
 `migrate_schemas --tenant --schema_name=<schema>`: create the schema on the tenant's
 shard, migrate it, flip NEW->ACTIVE/FAILED.
 
@@ -64,7 +71,19 @@ def drop_tenant_schema_task(database, schema):
 # from the DB, single-writer (treg:warming lock lives inside run_locked). Tenant-agnostic
 # (public context) → plain Task. Enqueued on-demand (host_registry.trigger_warm) and,
 # in production, scheduled daily as a safety net. No-op unless TENANT_REGISTRY["WARM_ENABLED"].
-@shared_task(base=Task, acks_late=True, max_retries=0)
+#
+# QUEUE = `fast`, deliberately — NOT `service` like its provisioning siblings above.
+# Time-to-warm is on the AVAILABILITY path: while treg:hosts is absent, host_registry.check
+# returns UNKNOWN → the resolver fails open under fill_cap → exhausting that budget answers
+# legitimate tenants with a retryable 503 (ResolveDeferred). `service` is shared with
+# provision_tenant, whose migrate_schemas run takes MINUTES, so a reconcile queued behind one
+# would prolong exactly the outage it exists to end. `fast` drains fastest, and the cost is
+# bounded by design rather than by the queue: cluster-wide there is at most ONE real run (the
+# fenced treg:warming lock; every other delivery pings + fails to acquire and returns in ~2
+# round-trips) and at most one enqueue per TENANT_REGISTRY["WARM_PENDING_SECONDS"] (the
+# treg:warm_pending NX marker in trigger_warm). Spelled out via task_queue() rather than left
+# to CELERY_TASK_DEFAULT_QUEUE so the choice is visible — it reads like an omission otherwise.
+@shared_task(base=Task, queue=task_queue("fast"), acks_late=True, max_retries=0)
 def reconcile_host_registry_task():
     from tenants.resolver import host_registry
     return {"reconciled": host_registry.run_locked()}

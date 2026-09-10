@@ -7,9 +7,9 @@ dispatcher's docstring for the layer order, and deploy/standalone_multitenant_de
 for why the tiers are what they are.
 
 Nothing here may import settings_multitenant: the dependency runs base <- overlay, one way.
-That is the point of the split — the previous layout had the overlay import names back out
-of this file, which worked only while every one of them happened to be defined above the
-overlay's import line.
+That is the point of the split. The alternative — the overlay importing individual names back
+out of this file — works only while every one of them happens to be defined above the
+overlay's import line, i.e. it depends on statement order inside a module.
 """
 
 import os
@@ -120,8 +120,11 @@ DATABASE_ROUTERS = []
 
 
 # ---------------------------------------------------------------------------
-# Worker model: SYNC Gunicorn `sync` (prefork) over WSGI (the async/ASGI path is
-# intentionally unused — see README "Architecture trade-offs").
+# Worker model: SYNC Gunicorn `sync` (prefork) over WSGI. Not a preference — a
+# django-tenants connection carries the tenant's search_path, so correctness needs one
+# request per connection per unit of concurrency, which prefork gives by construction.
+# The reasoning lives in ONE place: bin/gunicorn_start.sh (`Why not ASGI`); the
+# illustrated version is in README "Architecture trade-offs" / docs/why-no-async.*.
 #
 # Middleware — STANDALONE base (stock session; no tenant/shard middleware, nothing to
 # bind a session to on a single DB). Multi-tenant inserts ShardAwareTenantMiddleware +
@@ -159,6 +162,11 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = "tenants_back.wsgi.application"
+# A DECLARATION, not a switch: Django never reads ASGI_APPLICATION (it is a Channels
+# setting) and get_asgi_application() does not consult it, so changing this line has no
+# effect on anything. What actually selects the stack is gunicorn's worker class + module
+# (bin/gunicorn_start.sh, deploy/gunicorn.conf.py). Kept so the intended stack is stated
+# next to WSGI_APPLICATION rather than only in deploy scripts.
 ASGI_APPLICATION = None
 
 

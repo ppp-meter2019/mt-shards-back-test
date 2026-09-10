@@ -96,6 +96,15 @@ class FanoutDispatchTests(SimpleTestCase):
     def test_argsig_distinguishes_args(self):
         self.assertNotEqual(dispatch._argsig([1]), dispatch._argsig([7]))
 
+    def test_argsig_is_empty_for_no_args(self):
+        """Most entries take no args; "" keeps their lock key and their TaskRun rows
+        readable instead of stamping a constant digest on all of them. It can never collide
+        with a real signature, which is 12 hex chars."""
+        self.assertEqual(dispatch._argsig(None), "")
+        self.assertEqual(dispatch._argsig([]), "")
+        self.assertEqual(len(dispatch._argsig([7])), 12)
+        self.assertNotEqual(dispatch._argsig([7]), "")
+
     def test_overlap_lock_skips(self):
         with mock.patch("tenants.celery.dispatch._acquire_lock", return_value=False), \
              mock.patch.object(dispatch.sub_dispatch, "delay") as delay:
@@ -135,6 +144,63 @@ class FanoutDispatchTests(SimpleTestCase):
         self.assertIsNotNone(delay.call_args.args[5])
 
 
+class SameTaskDifferentArgsTests(SimpleTestCase):
+    """Two CALENDAR entries sharing a task NAME but differing by args are INDEPENDENT
+    schedules — `fetch(1)` and `fetch(7)` each keep their own overlap-lock and their own
+    per-tenant watermark.
+
+    Keyed by task name alone, the wave that lands second reads the first one's watermark,
+    finds the occurrence already run, and is skipped — indefinitely, and silently, since the
+    two never contend for the lock. That is why TaskRun's key includes args_sig
+    (migration 0008) and why one signature is computed per wave and threaded through.
+    """
+
+    def test_lock_and_watermark_use_the_same_signature(self):
+        """The two must never disagree about what 'the same schedule entry' is."""
+        seen = {}
+        with mock.patch("tenants.celery.dispatch._acquire_lock",
+                        side_effect=lambda n, sig: seen.setdefault("lock", sig) or True), \
+             mock.patch("tenants.celery.dispatch._due_by_tenant_tz",
+                        side_effect=lambda n, sig, *a: seen.setdefault("due", sig) or ["a"]), \
+             mock.patch.object(dispatch.sub_dispatch, "delay") as delay:
+            dispatch.fanout_dispatch.run("app.fetch", cron="0 8 * * *", task_args=[7])
+        self.assertEqual(seen["lock"], dispatch._argsig([7]))
+        self.assertEqual(seen["due"], seen["lock"])
+        self.assertEqual(delay.call_args.args[6], seen["lock"])   # threaded to sub_dispatch
+
+    def test_two_arg_variants_read_separate_watermarks(self):
+        """The bug this guards: fetch(1) marking its watermark must not make fetch(7)
+        look already-run for the same occurrence."""
+        calls = []
+        with mock.patch("tenants.celery.dispatch.active_tenants_with_tz",
+                        return_value=[("alpha", "UTC")]), \
+             mock.patch.object(dispatch.TaskRun, "load_map",
+                               side_effect=lambda t, sig: calls.append((t, sig)) or {}):
+            now = datetime(2026, 6, 15, 8, 0, 30, tzinfo=dt_tz.utc)
+            for args in ([1], [7]):
+                dispatch._due_by_tenant_tz("app.fetch", dispatch._argsig(args),
+                                           "0 8 * * *", now, 300)
+        self.assertEqual([t for t, _ in calls], ["app.fetch", "app.fetch"])
+        self.assertNotEqual(calls[0][1], calls[1][1])          # distinct watermark keys
+
+    def test_sub_dispatch_stamps_the_watermark_it_was_given(self):
+        with mock.patch("tenants.celery.dispatch.current_app"), \
+             mock.patch.object(dispatch.TaskRun, "mark_ran") as mark:
+            dispatch.sub_dispatch.run("app.fetch", ["alpha"], task_args=[7],
+                                      run_ts="2026-06-15T08:00:30+00:00",
+                                      args_sig="deadbeefcafe")
+        self.assertEqual(mark.call_args.args[1], "deadbeefcafe")
+
+    def test_sub_dispatch_recomputes_the_signature_when_absent(self):
+        """A message enqueued by a previous release carries no args_sig; recomputing keeps
+        it working instead of a TypeError under acks_late + max_retries=0."""
+        with mock.patch("tenants.celery.dispatch.current_app"), \
+             mock.patch.object(dispatch.TaskRun, "mark_ran") as mark:
+            dispatch.sub_dispatch.run("app.fetch", ["alpha"], task_args=[7],
+                                      run_ts="2026-06-15T08:00:30+00:00")
+        self.assertEqual(mark.call_args.args[1], dispatch._argsig([7]))
+
+
 class SubDispatchTests(SimpleTestCase):
     def test_sends_per_schema_with_schema_header(self):
         with mock.patch("tenants.celery.dispatch.current_app") as app:
@@ -161,7 +227,9 @@ class SubDispatchTests(SimpleTestCase):
              mock.patch.object(dispatch.TaskRun, "mark_ran") as mark:
             app.send_task.side_effect = [None, RuntimeError("hiccup")]
             dispatch.sub_dispatch.run("app.daily", ["alpha", "beta"], run_ts="2026-06-15T08:00:30+00:00")
-        mark.assert_called_once_with("app.daily", ["alpha"], "2026-06-15T08:00:30+00:00")
+        # keyed by args_sig as well as task — see TaskRun / migration 0008
+        mark.assert_called_once_with("app.daily", dispatch._argsig(None), ["alpha"],
+                                     "2026-06-15T08:00:30+00:00")
 
 
 class DueByTenantTzTests(SimpleTestCase):
@@ -170,7 +238,9 @@ class DueByTenantTzTests(SimpleTestCase):
     def _due(self, tenants, now, grace, last=None):
         with mock.patch("tenants.celery.dispatch.active_tenants_with_tz", return_value=tenants), \
              mock.patch.object(dispatch.TaskRun, "load_map", return_value=last or {}):
-            return dispatch._due_by_tenant_tz("t", None, "0 8 * * *", now, grace)
+            # 2nd arg is the args SIGNATURE, not the raw args
+            return dispatch._due_by_tenant_tz("t", dispatch._argsig(None),
+                                              "0 8 * * *", now, grace)
 
     def test_on_time_fires(self):
         self.assertEqual(self._due([("a", "UTC")], _utc(2026, 6, 15, 8, 0, 30), 300), ["a"])
@@ -292,3 +362,70 @@ class FanoutTaskRegisteredCheckTests(SimpleTestCase):
         with mock.patch("tenants.checks.beat.FANOUT_TASK_NAME", "tenants.tasks.NONEXISTENT"):
             errs = checks.fanout_task_registered(None)
         self.assertTrue(any(e.id == "tenants.E005" for e in errs))
+
+
+def _cal(args, *, grace=None, fanout_period=None):
+    """A wrapped CALENDAR fanout entry (08:00 daily) with the given args."""
+    kw = {}
+    if grace is not None:
+        kw["grace"] = grace
+    if fanout_period is not None:
+        kw["fanout_period"] = fanout_period
+    return scoped_schedule({"task": "x.report", "schedule": crontab(minute=0, hour=8),
+                            "args": args}, scope="tenants", **kw)
+
+
+class FanoutEntryUniquenessTests(SimpleTestCase):
+    """tenants.E006 — (task_name, args) IS the overlap-lock key, so two entries sharing it
+    suppress each other. Identical entries look fine (one INFO line per tick); entries that
+    share the pair but differ in cron/interval/grace are nondeterministic."""
+
+    def _errs(self, schedule):
+        with override_settings(CELERY_BEAT_SCHEDULE=schedule):
+            return checks.fanout_entries_are_unique(None)
+
+    def test_distinct_args_are_fine(self):
+        """The legitimate shape: fetch(1) and fetch(7) get distinct lock keys AND distinct
+        TaskRun watermarks."""
+        self.assertEqual(self._errs({"a": _cal([1]), "b": _cal([7])}), [])
+
+    def test_single_entry_is_fine(self):
+        self.assertEqual(self._errs({"a": _cal([7])}), [])
+
+    def test_public_scope_entries_are_ignored(self):
+        """scope='public' is a passthrough — not a fanout entry, so not this check's business."""
+        pub = scoped_schedule({"task": "x.cleanup", "schedule": crontab(minute=0, hour=3)},
+                              scope="public")
+        self.assertEqual(self._errs({"a": pub, "b": pub}), [])
+
+    def test_identical_entries_are_flagged(self):
+        errs = self._errs({"report_b": _cal([7]), "report_c": _cal([7])})
+        self.assertEqual([e.id for e in errs], ["tenants.E006"])
+        self.assertIn("['report_b', 'report_c']", errs[0].msg)
+        self.assertIn("identical", errs[0].msg)
+        self.assertIn("Delete the duplicate", errs[0].hint)
+
+    def test_same_args_different_grace_reports_the_nondeterminism(self):
+        """Worse than a duplicate: the applied grace depends on which wave takes the lock."""
+        errs = self._errs({"b": _cal([7], grace=300), "c": _cal([7], grace=60)})
+        self.assertEqual([e.id for e in errs], ["tenants.E006"])
+        self.assertIn("nondeterministic", errs[0].msg)
+
+    def test_same_args_different_fanout_period_is_flagged(self):
+        errs = self._errs({"b": _cal([7], fanout_period=60),
+                           "c": _cal([7], fanout_period=30)})
+        self.assertEqual([e.id for e in errs], ["tenants.E006"])
+
+    def test_calendar_and_interval_for_the_same_args_collide(self):
+        """The lock key carries neither cron nor scope, so a calendar entry and an interval
+        entry for the same task+args fight over one key."""
+        interval = scoped_schedule({"task": "x.report", "schedule": 300.0, "args": [7]},
+                                   scope="tenants")
+        errs = self._errs({"cal": _cal([7]), "iv": interval})
+        self.assertEqual([e.id for e in errs], ["tenants.E006"])
+
+    def test_one_error_per_colliding_group(self):
+        errs = self._errs({"b": _cal([7]), "c": _cal([7]),
+                           "d": _cal([1]), "e": _cal([1]),
+                           "f": _cal([9])})
+        self.assertEqual(len(errs), 2)                      # two groups, one lone entry

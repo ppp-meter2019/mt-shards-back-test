@@ -26,7 +26,7 @@ from django_tenants.utils import get_public_schema_name
 from .context import tenant_context, use_alias
 from .errors import error_response
 from .models import Tenant
-from .resolver import ResolveDeferred, resolve as resolve_tenant
+from .resolver import ResolveDeferred, TenantSnapshot, resolve as resolve_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -146,12 +146,11 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
             # (branded 5xx via process_request) instead of mislabeling it a cache failure and
             # retrying a dead DB.
             raise OperationalError(str(exc)) from exc
-        # request.tenant is a read-only routing snapshot, uniformly — whether resolved
-        # fresh (here) or rebuilt from cache. Refuse save()/delete() either way so
-        # behavior never depends on cache state (miss vs hit).
-        tenant.read_only = True
-        tenant.shard.read_only = True
-        return tenant
+        # Narrow to the routing snapshot HERE, not only on the cache path: a MISS must
+        # expose exactly what a HIT exposes. Handing out the full row here is what made
+        # request.tenant.company_name work on a cold cache and silently read "" on a warm
+        # one — the divergence the snapshot type exists to remove.
+        return TenantSnapshot.capture(tenant)
 
 
 class TenantShardRoutingMiddleware:
@@ -159,10 +158,10 @@ class TenantShardRoutingMiddleware:
     resetting both on the way out.
 
     Both axes are wired by tenants.context — the ONE implementation of the enter/exit dance,
-    shared with TenantTask and tenant_command. This class used to hand-roll it and had
-    drifted: the schema was set BEFORE the try, so an alias missing from settings.DATABASES
-    left current_db set for the life of the thread. The one thing NOT delegated is the exit
-    reset — see the finally in __call__.
+    shared with TenantTask and tenant_command. Delegating matters here: entering the two axes
+    by hand invites setting the schema before the try, which leaks current_db for the life of
+    the thread when the alias is missing from settings.DATABASES. The one thing NOT delegated
+    is the exit reset — see the finally in __call__.
     """
 
     sync_capable = True

@@ -1,5 +1,4 @@
 import logging
-import re
 
 from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
@@ -23,15 +22,12 @@ from .context import tenant_context
 from .models import Domain, ReservedHostRule, Shard, Tenant
 from .permissions import IsTenantAdminOnPublic
 from .resolver import resolve_cache
+from .validators import is_safe_schema_identifier, quote_schema
 from .serializers import (
     ReservedHostRuleSerializer,
     ShardSerializer,
     TenantSerializer,
 )
-
-# Defence-in-depth: schema names are already validated on creation, but they're
-# interpolated as SQL identifiers in _last_migrations_for, so re-check here.
-_SAFE_SCHEMA_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +209,11 @@ class TenantViewSet(viewsets.ModelViewSet):
     # every write path below rejects it. It's a system record django-tenants
     # needs to route the public host.
     queryset = (
-        Tenant.objects.select_related("shard").order_by("-created_on")
+        Tenant.objects.select_related("shard")
+        # `domains` is rendered for every row (nested DomainSerializer) — without this the
+        # reverse FK costs one extra query per tenant.
+        .prefetch_related("domains")
+        .order_by("-created_on")
     )
     serializer_class = TenantSerializer
     permission_classes = [IsTenantAdminOnPublic]
@@ -277,7 +277,68 @@ class TenantViewSet(viewsets.ModelViewSet):
             return ctx                                  # create/update: no physical scan
         ctx["existing_schemas"] = self._existing_schemas_for(qs)
         ctx["last_migrations"] = self._last_migrations_for(qs)
+        ctx["admins"] = self._admins_for(qs)
         return ctx
+
+    @staticmethod
+    def _admins_for(qs) -> dict:
+        """Return {(shard_alias, schema_name): [{"id","username","is_active"}, …]}.
+
+        One pair of queries per SHARD, not per tenant. Serializing this field per tenant
+        means an ORM query inside tenant_context() — a `SET search_path` PLUS a `SELECT`
+        for every row, so 2N round-trips for a list, N separate degrade-and-log cycles
+        when a shard is down, and N resets of django-tenants' search_path cache. Same
+        shape as _last_migrations_for: find which schemas actually have the table, then
+        one UNION ALL over those.
+
+        Table and column names come from the model's _meta, so a db_table / db_column
+        override cannot silently break this. Schema identifiers go through quote_schema
+        (validate + quote) and are pre-filtered on the safety floor, exactly as in
+        _last_migrations_for.
+        """
+        by_shard: dict[str, set[str]] = {}
+        for t in qs:
+            by_shard.setdefault(t.shard.alias, set()).add(t.schema_name)
+
+        table = User._meta.db_table
+        col = {f: User._meta.get_field(f).column
+               for f in ("id", "username", "is_active", "role")}
+
+        result: dict = {}
+        for alias, schemas in by_shard.items():
+            safe = sorted(s for s in schemas if is_safe_schema_identifier(s))
+            if not safe:
+                continue
+            # Degrade per shard, like the sibling probes: a down shard shows its tenants
+            # with no admins instead of 500-ing the console.
+            try:
+                with connections[alias].cursor() as cur:
+                    cur.execute(
+                        "SELECT table_schema FROM information_schema.tables "
+                        "WHERE table_name = %s AND table_schema = ANY(%s)",
+                        [table, safe],
+                    )
+                    present = [s for (s,) in cur.fetchall()]
+                    if not present:
+                        continue
+                    # One UNION branch per schema. Bounded by the page size, so the host
+                    # project's pagination class is what keeps this plan small — this repo
+                    # deliberately sets none (see settings_base REST_FRAMEWORK).
+                    union = " UNION ALL ".join(
+                        f"SELECT '{s}' AS schema, {col['id']}, {col['username']}, "
+                        f"{col['is_active']} FROM {quote_schema(s)}.{table} "
+                        f"WHERE {col['role']} = %s"
+                        for s in present
+                    )
+                    cur.execute(union + " ORDER BY schema, 3",
+                                [User.Role.COMPANY_ADMIN] * len(present))
+                    for schema, uid, username, is_active in cur.fetchall():
+                        result.setdefault((alias, schema), []).append(
+                            {"id": uid, "username": username, "is_active": is_active})
+            except (DBError, ConnectionDoesNotExist):
+                logger.warning("admins probe failed for shard %r; its tenants shown "
+                               "without admins", alias, exc_info=True)
+        return result
 
     @staticmethod
     def _existing_schemas_for(qs) -> set:
@@ -338,14 +399,19 @@ class TenantViewSet(viewsets.ModelViewSet):
                         "WHERE table_name = 'django_migrations' AND table_schema = ANY(%s)",
                         [schema_list],
                     )
-                    migrated = [s for (s,) in cur.fetchall() if _SAFE_SCHEMA_RE.match(s)]
+                    # These names come from the DB, not from a request, but they are
+                    # interpolated as an SQL identifier below — so filter on the safety
+                    # floor (is_safe_schema_identifier), which unlike the creation
+                    # convention does NOT reject a merely non-canonical legacy name.
+                    migrated = [s for (s,) in cur.fetchall() if is_safe_schema_identifier(s)]
                     if not migrated:
                         continue
                     # One UNION across the migrated schemas; latest row per schema.
-                    # Schema names are validated above, so safe to interpolate.
+                    # quote_schema() re-validates and quotes; the `'{s}'` literal is safe
+                    # for the same reason (the filter above excludes `'`).
                     union = " UNION ALL ".join(
                         f"SELECT '{s}' AS schema, id, app, name, applied "
-                        f'FROM "{s}".django_migrations'
+                        f"FROM {quote_schema(s)}.django_migrations"
                         for s in migrated
                     )
                     cur.execute(
@@ -373,8 +439,9 @@ class TenantViewSet(viewsets.ModelViewSet):
     def provision(self, request, pk=None):
         """Queue async provisioning (create schema + migrate) for a NEW tenant.
 
-        Enqueues provision_tenant on the `slow` queue; the worker does the
-        atomic NEW->PENDING claim, CREATE SCHEMA, migrate, NEW->ACTIVE/FAILED.
+        Enqueues provision_tenant on the `service` queue (it is a management
+        operation, not a business task — see tenants/tasks.py); the worker does
+        the atomic NEW->PENDING claim, CREATE SCHEMA, migrate, NEW->ACTIVE/FAILED.
 
         Re-provisioning guard: only a NEW tenant is provisionable. Any other
         status is rejected (409) — you cannot re-provision an already-provisioned

@@ -36,7 +36,14 @@ class Command(TenantCommand):
 
         if flags.warm_enabled():
             # Under the gate, reconcile is the ONLY correct warm (builds the SET +
-            # ttl_by_status). It supersedes the legacy positive-only warm.
+            # ttl_by_status). It supersedes the positive-only warm in the else-branch, which
+            # now REFUSES to run under WARM (TenantResolveCache.LegacyWarmRefused) — so this
+            # branch is enforced, not merely conventional.
+            #
+            # SUNSET: when WARM becomes permanent, the else-branch and
+            # TenantResolveCache.warm() both go away and this command simply IS reconcile.
+            # Until then the gate-off warm is the LIVE path for the default configuration
+            # (TENANT_REGISTRY["WARM_ENABLED"] defaults to False), so it is not dead code.
             from tenants.resolver import host_registry
             n = host_registry.run_locked()
             if n is None:

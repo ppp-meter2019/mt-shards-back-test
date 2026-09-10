@@ -236,3 +236,106 @@ class BootstrapTenantReservedCheckTests(SimpleTestCase):
              mock.patch.object(bt_mod, "validate_tenant_domain", return_value="acme.foo.com"):
             cmd = self._cmd()
             self.assertIsNone(cmd._check_reserved("acme", "acme.foo.com", force=False))
+
+
+class TrailingDotTests(SimpleTestCase):
+    """A single trailing dot is the DNS root — `example.com.` and `example.com` are the same
+    host. More than one leaves an EMPTY LABEL, i.e. the input is malformed.
+
+    The split of responsibility that makes both true at once:
+      normalize_host()    aggressive (strips every trailing dot) — it is the CANONICALIZER
+                          Domain.save() runs on write paths that bypass validation, and a
+                          stored trailing dot makes the tenant unreachable.
+      validate_hostname() strict — inspects the RAW value, allows exactly one trailing dot,
+                          and lets the per-label loop reject whatever is left.
+    """
+
+    def test_normalize_host_is_the_aggressive_canonicalizer(self):
+        for raw in ["acme.com", "acme.com.", "acme.com..", "  ACME.COM...  "]:
+            with self.subTest(raw=raw):
+                self.assertEqual(V.normalize_host(raw), "acme.com")
+
+    def test_one_trailing_dot_is_accepted_and_dropped(self):
+        self.assertEqual(V.validate_hostname("acme.com."), "acme.com")
+
+    def test_more_than_one_trailing_dot_is_rejected(self):
+        """Repairing it would make the SAME malformation pass or fail depending only on
+        where in the string it sits — `a..b` is rejected, so `a.b..` must be too."""
+        for raw in ["acme.com..", "acme.com...", "a.b..", "a..b"]:
+            with self.subTest(raw=raw), self.assertRaises(ValidationError):
+                V.validate_hostname(raw)
+
+    def test_label_rule_rejects_a_dot(self):
+        """validate_label's own error says "no dots", so `www.` must not slip through as
+        the accepted label `www`."""
+        self.assertEqual(V.validate_label("WWW"), "www")
+        for raw in ["www.", "www..", "a.b"]:
+            with self.subTest(raw=raw), self.assertRaises(ValidationError):
+                V.validate_label(raw)
+
+
+class CandidateQSupersetTests(SimpleTestCase):
+    """candidate_q() promises to exclude no true match. It narrows in SQL while matches()
+    decides in Python, so the two must agree — and since the tenants_domain_canonical CHECK
+    constraint guarantees every stored domain is a fixed point of normalize_host, agreeing
+    means comparing the column DIRECTLY. This simulates what Postgres would return for one
+    column value, so the contract is pinned without a database; db_integration.py runs it
+    against real rows AND checks that the constraint actually refuses the rest.
+    """
+
+    # Every value the constraint permits — i.e. exactly the fixed points of normalize_host.
+    CANONICAL = ["acme.com", "x.acme.com", "www.acme.com", "y.x.acme.com", "other.com"]
+
+    @staticmethod
+    def _simulate(q, stored):
+        def leaf(child):
+            lookup, value = child
+            if lookup.endswith("__endswith"):   return stored.endswith(value)
+            if lookup.endswith("__startswith"): return stored.startswith(value)
+            if lookup == "domain":              return stored == value
+            raise AssertionError(f"unsimulated lookup {lookup!r} — extend this helper")
+        def walk(node):
+            vals = [walk(c) if hasattr(c, "children") else leaf(c) for c in node.children]
+            return any(vals) if node.connector == "OR" else all(vals)
+        return walk(q)
+
+    def _assert_superset(self, rule):
+        """For every canonical value: matched => candidate. The direction matters — the
+        prefilter may over-include, it may never drop."""
+        matched = set()
+        for stored in self.CANONICAL:
+            if rule.matches(stored):
+                matched.add(stored)
+                self.assertTrue(self._simulate(rule.candidate_q(), stored),
+                                f"{rule} matches {stored!r} but candidate_q excludes it")
+        self.assertTrue(matched, "fixture should produce at least one true match")
+        return matched
+
+    def test_exact_rule_superset_holds(self):
+        matched = self._assert_superset(R(match_type=R.MatchType.EXACT, value="acme.com"))
+        self.assertEqual(matched, {"acme.com"})
+
+    def test_suffix_rule_superset_holds(self):
+        matched = self._assert_superset(R(match_type=R.MatchType.SUFFIX, value="acme.com"))
+        self.assertEqual(matched, {"acme.com", "x.acme.com", "www.acme.com", "y.x.acme.com"})
+
+    def test_label_rule_superset_holds(self):
+        matched = self._assert_superset(
+            R(match_type=R.MatchType.LABEL, value="www", base_domain=""))
+        self.assertEqual(matched, {"www.acme.com"})
+
+    def test_prefilter_still_narrows(self):
+        """Over-inclusion is allowed but pointless — a non-matching domain must be excluded,
+        or `conflicts` would stream the whole table through matches()."""
+        rule = R(match_type=R.MatchType.SUFFIX, value="acme.com")
+        self.assertFalse(rule.matches("other.com"))
+        self.assertFalse(self._simulate(rule.candidate_q(), "other.com"))
+
+    def test_case_and_dots_are_not_handled_in_sql_by_design(self):
+        """Pinned so nobody "restores" the i*/RTRIM wrapping: such a value cannot be in the
+        column (the CHECK constraint refuses it), and wrapping the column costs the unique
+        index on the EXACT path."""
+        rule = R(match_type=R.MatchType.EXACT, value="acme.com")
+        for non_canonical in ["ACME.COM", "acme.com."]:
+            with self.subTest(stored=non_canonical):
+                self.assertFalse(self._simulate(rule.candidate_q(), non_canonical))

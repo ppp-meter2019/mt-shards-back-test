@@ -4,7 +4,7 @@ from unittest import mock
 
 from django.test import SimpleTestCase, override_settings
 
-from tenants.resolver import CacheUnavailable, TenantResolveCache
+from tenants.resolver import CacheUnavailable, LegacyWarmRefused, TenantResolveCache
 from tenants.resolver import NEGATIVE, TOMBSTONE
 
 from ._support import FakeNxCache, make_tenant
@@ -34,12 +34,14 @@ class TenantResolveCacheTests(SimpleTestCase):
         rc.cache.store[rc._snap_key("h")] = NEGATIVE
         self.assertIs(rc.get_snapshot("h"), rc.NEG)
 
-    def test_get_snapshot_positive_loads_readonly_tenant(self):
+    def test_get_snapshot_positive_loads_a_snapshot(self):
+        from tenants.resolver import TenantSnapshot
         rc = self.rc()
         rc.cache.store[rc._snap_key("h")] = rc.dump(make_tenant())
         got = rc.get_snapshot("h")
+        self.assertIsInstance(got, TenantSnapshot)
         self.assertEqual(got.schema_name, "alpha")
-        self.assertTrue(got.read_only and got.shard.read_only)
+        self.assertFalse(hasattr(got, "save"))
 
     def test_classify_covers_all_value_kinds(self):
         rc = self.rc()
@@ -58,17 +60,19 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertIs(rc.get_snapshot("h"), rc.MISS)     # UNKNOWN → MISS, no load()/KeyError
 
     def test_dump_allowlist_excludes_non_routing_fields(self):
-        # Snapshot carries ONLY the routing allowlist — no company_name/last_error/etc.
+        # The payload carries ONLY the routing allowlist — no company_name/last_error/etc.
+        # No `shard_id` either: it duplicated shard.id and existed only to keep a rebuilt
+        # MODEL instance self-consistent, which load() no longer produces.
         rc = self.rc()
         snap = rc.dump(make_tenant())
-        self.assertEqual(set(snap["tenant"]), {"id", "schema_name", "status", "shard_id"})
+        self.assertEqual(set(snap["tenant"]), {"id", "schema_name", "status"})
         self.assertEqual(set(snap["shard"]), {"id", "alias"})
-        # routing fields round-trip; a non-carried field is the model default, never read
-        # off request.tenant (see the _SNAPSHOT_FIELDS contract).
         got = rc.load(snap)
         self.assertEqual(got.schema_name, "alpha")
         self.assertEqual(got.shard.alias, "shard_a")
-        self.assertEqual(got.company_name, "")      # make_tenant set "Alpha" — NOT carried
+        # make_tenant set company_name="Alpha"; it is ABSENT rather than defaulted to ""
+        # — that is the difference between an AttributeError and a plausible wrong value.
+        self.assertFalse(hasattr(got, "company_name"))
 
     # --- store / store_miss (nx respects tombstone) ---
     def test_store_is_nx_and_respects_tombstone(self):
@@ -136,7 +140,7 @@ class TenantResolveCacheTests(SimpleTestCase):
         rc.cache.store[rc._schema_snap_key("s")] = rc.dump(make_tenant(schema_name="s"))
         got = rc.get_schema_snapshot("s")
         self.assertEqual(got.schema_name, "s")
-        self.assertTrue(got.read_only and got.shard.read_only)
+        self.assertFalse(hasattr(got, "save"))
 
     @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True})
     def test_put_warms_both_host_and_schema(self):
@@ -170,6 +174,20 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertEqual(n, 2)
         self.assertEqual(fake.store, {})
 
+    # --- put: return contract ---
+    def test_put_reports_whether_the_host_snap_was_written(self):
+        """put() returns the nx OUTCOME, not "caching is enabled": a held tombstone means the
+        write did not land, and the caller must be able to tell."""
+        rc = self.rc()
+        self.assertTrue(rc.put("h", make_tenant()))              # fresh key -> written
+        self.assertFalse(rc.put("h", make_tenant()))             # nx declined -> already there
+        rc.cache.store[rc._snap_key("held")] = TOMBSTONE
+        self.assertFalse(rc.put("held", make_tenant()))          # tombstone respected
+
+    @override_settings(TENANT_RESOLVE={"POSITIVE_CACHE_SECONDS": 0, "MISS_CACHE_SECONDS": 60})
+    def test_put_is_false_when_positive_caching_is_off(self):
+        self.assertFalse(self.rc().put("h", make_tenant()))
+
     # --- warm (Domain mocked) ---
     def test_warm_fill_gaps_skips_tombstone(self):
         rc = self.rc()
@@ -192,6 +210,50 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertEqual(n, 2)
         self.assertIsInstance(rc.cache.store[rc._snap_key("h1")], dict)  # tombstone overwritten
         self.assertIsInstance(rc.cache.store[rc._snap_key("h2")], dict)
+
+    def test_warm_writes_schema_snaps_deduped_per_tenant(self):
+        """warm() must keep BOTH namespaces in lockstep, like put() and reconcile: host-only
+        warming left the WORKER cache (get_schema_snapshot) cold after a 'successful' warm.
+        One schema-snap per DISTINCT tenant — two domains of one tenant must not cost two."""
+        rc = self.rc()
+        alpha, beta = make_tenant(schema_name="alpha"), make_tenant(schema_name="beta")
+        rows = [_Row("a1.com", alpha), _Row("a2.com", alpha), _Row("b.com", beta)]
+        with mock.patch("tenants.models.Domain") as D:
+            D.objects.select_related.return_value.iterator.return_value = iter(rows)
+            n = rc.warm(force=True)
+        self.assertEqual(n, 3)                                   # counts DOMAINS warmed
+        self.assertEqual(
+            sorted(k for k in rc.cache.store if k.startswith("schema-snap:")),
+            ["schema-snap:alpha", "schema-snap:beta"],
+        )
+
+    def test_warm_nx_writes_schema_snaps_too(self):
+        rc = self.rc()
+        rows = [_Row("a.com", make_tenant(schema_name="alpha"))]
+        with mock.patch("tenants.models.Domain") as D:
+            D.objects.select_related.return_value.iterator.return_value = iter(rows)
+            rc.warm()
+        self.assertIn("schema-snap:alpha", rc.cache.store)
+
+    # --- warm: the WARM-stage guard ---
+    @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True})
+    def test_warm_refuses_under_warm_stage(self):
+        """warm() writes positives WITHOUT building treg:hosts, so under WARM it must refuse
+        rather than silently half-warm the cache. Both branches (nx and force) are covered:
+        neither builds the SET."""
+        rc = self.rc()
+        for kwargs in ({}, {"force": True}):
+            with self.subTest(**kwargs), self.assertRaises(LegacyWarmRefused):
+                rc.warm(**kwargs)
+
+    @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True},
+                       TENANT_RESOLVE={"POSITIVE_CACHE_SECONDS": 0})
+    def test_warm_guard_precedes_the_positive_ttl_early_return(self):
+        """WARM on + flat TTL disabled is a VALID config (see the `enabled` property) and the
+        worst one to get wrong: if the guard sat after the `_pos_ttl` early-return, this call
+        would swallow the misuse as a silent `return 0`."""
+        with self.assertRaises(LegacyWarmRefused):
+            self.rc().warm()
 
     # --- health / raise_on_error ---
     def test_raise_on_error_raises_when_down(self):

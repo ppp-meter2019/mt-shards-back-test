@@ -152,7 +152,7 @@ def sub_dispatch(task_name, schemas, task_args=None, task_kwargs=None,
         except Exception:
             logger.exception("sub_dispatch: send failed for %s (retried next tick)", schema)
     if run_ts and sent:                                # calendar only; at-least-once
-        TaskRun.mark_ran(task_name, sent, run_ts)
+        TaskRun.mark_ran(task_name, args_sig, sent, run_ts)
     return {"sent": len(sent), "requested": len(schemas)}
 ```
 
@@ -181,10 +181,27 @@ def sync_tenant_timezone(schema_name, tz):                        # hook for the
 class TaskRun(models.Model):                                      # default.public watermark
     schema = models.CharField(max_length=63)
     task = models.CharField(max_length=255)
+    args_sig = models.CharField(max_length=12, blank=True)        # _argsig(task_args), "" if none
     last_run_at = models.DateTimeField()
-    class Meta: unique_together = [("schema", "task")]
-    # load_map(task) -> {schema: last_run_at};  mark_ran(task, schemas, run_ts) bulk-upsert
+    class Meta: unique_together = [("schema", "task", "args_sig")]
+    # load_map(task, args_sig) -> {schema: last_run_at}
+    # mark_ran(task, args_sig, schemas, run_ts) bulk-upsert
 ```
+
+`args_sig` is part of the identity, not decoration. Two calendar entries may share a task
+NAME and differ only by args — `fetch(1)` at 08:00 and `fetch(7)` at 09:00 are independent
+schedules, which is why the overlap-lock keys on `(task, _argsig(args))`. The watermark must
+agree: keyed by task name alone, the wave that lands second reads the first one's watermark,
+sees the occurrence as already run, and is skipped indefinitely — silently, because the two
+never contend for the lock. One signature is computed per wave in `fanout_dispatch` and
+threaded through the lock, the due-check and `sub_dispatch`, so the three cannot disagree.
+
+`_argsig` returns `""` for an entry with no args rather than a digest of `"[]"`. Most
+entries take none, so a digest there would be a constant stamped on nearly every row and
+lock key while distinguishing nothing — and these rows are read by hand when asking why a
+task did not fire for a tenant. Uniqueness is unaffected (`""` cannot collide with 12 hex
+chars), and migration `0008_taskrun_args_sig` backfills existing rows with `""`, which is
+the identity they already had.
 
 Enumeration helpers (`commons/platform/tenancy.py`), both EXCLUDE the public schema:
 ```python
@@ -202,8 +219,8 @@ def active_tenants_with_tz():                    # calendar tasks — only confi
 Due decision — **latest occurrence + grace window** (no unbounded catch-up, so
 interdependent tasks are never fired late/out of order):
 ```python
-def _due_by_tenant_tz(task_name, task_args, cron, now, grace):
-    last, due = TaskRun.load_map(task_name), []
+def _due_by_tenant_tz(task_name, args_sig, cron, now, grace):
+    last, due = TaskRun.load_map(task_name, args_sig), []
     for schema, tzname in active_tenants_with_tz():
         tz = ZoneInfo(tzname)
         t_fire = croniter(cron, now.astimezone(tz)).get_prev(datetime).astimezone(utc)  # last past fire
@@ -413,7 +430,10 @@ New dependency: `croniter` (universal requirements; used only by the MT tz path)
   (latest-occurrence + grace, level-triggered) wired into `fanout_dispatch`'s calendar
   branch; `sub_dispatch` marks `TaskRun` after send (calendar only, at-least-once);
   `active_tenants_with_tz` (excludes public + NULL tz); `croniter` dep; grace check is
-  `tenants.E002` (grace ≥ fanout_period). Tests: `test_fanout.py` (31 total) + `TaskRunTests`
+  `tenants.E002` (grace ≥ fanout_period); `tenants.E006` (no two fanout entries share
+  `(task_name, args)` — that pair IS the overlap-lock key, so such entries suppress each
+  other, and if they differ in cron/interval/grace the applied grace depends on which wave
+  wins the lock). Tests: `test_fanout.py` (31 total) + `TaskRunTests`
   in `db_integration.py` (DB harness). MT suite 178. Live cutover still deferred to D/E.
 - **C. Gate — DONE.** `tenants_back/celery.py` is mode-aware: MT → `tenants.celery.CeleryApp`
   (shard-aware); standalone → plain `celery.Celery`. Verified by probe: in standalone the

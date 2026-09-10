@@ -13,9 +13,9 @@ from .cache import SimpleCache
 from .compat import current_schema_name, get_public_schema_name, tenant_context, use_alias
 
 # Celery >= 5.4 (pinned in requirements: celery[redis]>=5.4,<6) ships DjangoTask, which closes
-# stale DB connections after each task. The pin guarantees it, so there is NO pre-5.4 fallback
-# (the old `except ImportError: BaseTask = Task` promised close_old_connections signals it never
-# wired — a misleading no-op; removed with the pin).
+# stale DB connections after each task. The pin is what makes this a hard import: on a Celery
+# without DjangoTask there is no equivalent, so degrading to celery.Task would silently drop
+# the connection cleanup rather than fall back to it.
 from celery.contrib.django.task import DjangoTask
 BaseTask = DjangoTask
 
@@ -52,13 +52,15 @@ class TenantTask(BaseTask):
     def __call__(self, *args, **kwargs):
         """Enter the tenant's shard+schema for EXACTLY this invocation; the context manager's
         finally restores it whether the task returns OR raises, and regardless of worker pool.
-        Replaces the old task_prerun/postrun pair (two signals with no shared finally + state
-        stashed on the task singleton). Branches:
+        It has to be one with-block here rather than a task_prerun/task_postrun pair: two
+        signals share no finally, and the context manager would have to be stashed on the task
+        SINGLETON between them — which is neither crash- nor pool-safe. Branches:
           * worker / apply_async / .delay / eager .apply()  -> headers carry _schema_name
             (CeleryApp.send_task and apply() always stamp it) -> switch to that schema;
           * public/management  -> pin the router axis to 'default' (don't trust ambient);
           * bare in-process call `task(...)` (no request)  -> inherit the CALLER's ambient
-            context, exactly as before (the old signals never fired off the worker/eager path).
+            context: with no message there is no schema to switch to, and a direct call is the
+            caller's own context by construction.
         """
         schema = _schema_from_request(self)
         if not schema:                                     # bare direct call: no message context
@@ -119,9 +121,16 @@ class TenantTask(BaseTask):
 
     @classmethod
     def _db_get(cls, schema_name):
-        """Authoritative DB resolve (no cache writes of any kind)."""
+        """Authoritative DB resolve (no cache writes of any kind).
+
+        Narrowed to the routing snapshot for the same reason as the request path: the two
+        cache tiers above return a TenantSnapshot, so this fallback must too, or a task's
+        view of its tenant would depend on which tier answered.
+        """
         from tenants.models import Tenant
-        return Tenant.objects.select_related("shard").get(schema_name=schema_name)
+        from tenants.resolver import TenantSnapshot
+        return TenantSnapshot.capture(
+            Tenant.objects.select_related("shard").get(schema_name=schema_name))
 
     def apply(self, args=None, kwargs=None, *a, **kw):     # eager / ALWAYS_EAGER
         kw["headers"] = headers_with_schema(kw.get("headers") or {})

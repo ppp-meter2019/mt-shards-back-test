@@ -7,10 +7,11 @@ Layers (import from `tenants.resolver`, not the submodules):
   registry.py  — the `treg:hosts` SET gate (membership, reconcile, fenced lock)
   throttle.py  — fill_cap rate-limiter + single-flight coalescing (NOT the gate decision)
   markers.py   — cache sentinels (NEGATIVE, TOMBSTONE)
+  snapshot.py  — TenantSnapshot / ShardSnapshot: the routing view resolve() returns
 
 Design + event sequences: deploy/resolve_gate_design.md.
 """
-from .cache import CacheUnavailable, TenantResolveCache, resolve_cache
+from .cache import CacheUnavailable, LegacyWarmRefused, TenantResolveCache, resolve_cache
 from .markers import NEGATIVE, TOMBSTONE
 from .registry import (
     DIRTY_KEY,
@@ -22,13 +23,15 @@ from .registry import (
     host_registry,
 )
 from .service import ResolveDeferred, resolve
+from .snapshot import ShardSnapshot, TenantSnapshot
 from .throttle import FillCap, fill_cap, single_flight
 
 __all__ = [
     "resolve", "ResolveDeferred",
-    "resolve_cache", "TenantResolveCache", "CacheUnavailable",
+    "resolve_cache", "TenantResolveCache", "CacheUnavailable", "LegacyWarmRefused",
     "host_registry", "HostRegistry",
     "fill_cap", "FillCap", "single_flight",
     "NEGATIVE", "TOMBSTONE",
+    "TenantSnapshot", "ShardSnapshot",
     "HOSTS_KEY", "HOSTS_NEW_KEY", "DIRTY_KEY", "WARM_LOCK_KEY", "WARM_PENDING_KEY",
 ]
