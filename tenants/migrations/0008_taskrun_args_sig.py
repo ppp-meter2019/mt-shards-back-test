@@ -5,7 +5,7 @@ overlap-lock already discriminates on that axis; the watermark did not, so the e
 wave landed second read the first one's watermark, saw the occurrence as already run, and
 was skipped indefinitely. See tenants.models.TaskRun and deploy/celery_fanout_design.md §3.
 
-Existing rows backfill to "", which is exactly what tenants.celery.dispatch._argsig returns
+Existing rows backfill to "", which is exactly what tenants.celery.dispatch.argsig returns
 for an entry with no args — the overwhelming majority. So the backfill is not a guess: those
 rows keep the identity they already had and keep being honoured, and the new column only
 ever carries a value for an entry that actually passes args.

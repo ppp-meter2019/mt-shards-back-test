@@ -94,16 +94,16 @@ class TaskQueueTests(SimpleTestCase):
 
 class FanoutDispatchTests(SimpleTestCase):
     def test_argsig_distinguishes_args(self):
-        self.assertNotEqual(dispatch._argsig([1]), dispatch._argsig([7]))
+        self.assertNotEqual(dispatch.argsig([1]), dispatch.argsig([7]))
 
     def test_argsig_is_empty_for_no_args(self):
         """Most entries take no args; "" keeps their lock key and their TaskRun rows
         readable instead of stamping a constant digest on all of them. It can never collide
         with a real signature, which is 12 hex chars."""
-        self.assertEqual(dispatch._argsig(None), "")
-        self.assertEqual(dispatch._argsig([]), "")
-        self.assertEqual(len(dispatch._argsig([7])), 12)
-        self.assertNotEqual(dispatch._argsig([7]), "")
+        self.assertEqual(dispatch.argsig(None), "")
+        self.assertEqual(dispatch.argsig([]), "")
+        self.assertEqual(len(dispatch.argsig([7])), 12)
+        self.assertNotEqual(dispatch.argsig([7]), "")
 
     def test_overlap_lock_skips(self):
         with mock.patch("tenants.celery.dispatch._acquire_lock", return_value=False), \
@@ -164,7 +164,7 @@ class SameTaskDifferentArgsTests(SimpleTestCase):
                         side_effect=lambda n, sig, *a: seen.setdefault("due", sig) or ["a"]), \
              mock.patch.object(dispatch.sub_dispatch, "delay") as delay:
             dispatch.fanout_dispatch.run("app.fetch", cron="0 8 * * *", task_args=[7])
-        self.assertEqual(seen["lock"], dispatch._argsig([7]))
+        self.assertEqual(seen["lock"], dispatch.argsig([7]))
         self.assertEqual(seen["due"], seen["lock"])
         self.assertEqual(delay.call_args.args[6], seen["lock"])   # threaded to sub_dispatch
 
@@ -178,7 +178,7 @@ class SameTaskDifferentArgsTests(SimpleTestCase):
                                side_effect=lambda t, sig: calls.append((t, sig)) or {}):
             now = datetime(2026, 6, 15, 8, 0, 30, tzinfo=dt_tz.utc)
             for args in ([1], [7]):
-                dispatch._due_by_tenant_tz("app.fetch", dispatch._argsig(args),
+                dispatch._due_by_tenant_tz("app.fetch", dispatch.argsig(args),
                                            "0 8 * * *", now, 300)
         self.assertEqual([t for t, _ in calls], ["app.fetch", "app.fetch"])
         self.assertNotEqual(calls[0][1], calls[1][1])          # distinct watermark keys
@@ -198,7 +198,7 @@ class SameTaskDifferentArgsTests(SimpleTestCase):
              mock.patch.object(dispatch.TaskRun, "mark_ran") as mark:
             dispatch.sub_dispatch.run("app.fetch", ["alpha"], task_args=[7],
                                       run_ts="2026-06-15T08:00:30+00:00")
-        self.assertEqual(mark.call_args.args[1], dispatch._argsig([7]))
+        self.assertEqual(mark.call_args.args[1], dispatch.argsig([7]))
 
 
 class SubDispatchTests(SimpleTestCase):
@@ -228,7 +228,7 @@ class SubDispatchTests(SimpleTestCase):
             app.send_task.side_effect = [None, RuntimeError("hiccup")]
             dispatch.sub_dispatch.run("app.daily", ["alpha", "beta"], run_ts="2026-06-15T08:00:30+00:00")
         # keyed by args_sig as well as task — see TaskRun / migration 0008
-        mark.assert_called_once_with("app.daily", dispatch._argsig(None), ["alpha"],
+        mark.assert_called_once_with("app.daily", dispatch.argsig(None), ["alpha"],
                                      "2026-06-15T08:00:30+00:00")
 
 
@@ -239,7 +239,7 @@ class DueByTenantTzTests(SimpleTestCase):
         with mock.patch("tenants.celery.dispatch.active_tenants_with_tz", return_value=tenants), \
              mock.patch.object(dispatch.TaskRun, "load_map", return_value=last or {}):
             # 2nd arg is the args SIGNATURE, not the raw args
-            return dispatch._due_by_tenant_tz("t", dispatch._argsig(None),
+            return dispatch._due_by_tenant_tz("t", dispatch.argsig(None),
                                               "0 8 * * *", now, grace)
 
     def test_on_time_fires(self):

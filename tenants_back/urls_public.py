@@ -8,14 +8,14 @@ are only reachable via tenant subdomains.
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from tenants.admin import public_admin_site
-from tenants.views import (
+from tenants.console.admin import public_admin_site
+from tenants.console.views import (
     BaseDomainsView,
     ReservedHostRuleViewSet,
     ShardViewSet,
     TenantViewSet,
-    health,
 )
+from tenants.views import health
 from users.views import PublicTokenObtainPairView, TokenRefreshView
 
 router = DefaultRouter()

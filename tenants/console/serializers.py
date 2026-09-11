@@ -3,9 +3,10 @@ from django.db import connections, transaction
 from django_tenants.utils import get_public_schema_name
 from rest_framework import serializers
 
-from .models import Domain, ReservedHostRule, Shard, Tenant
-from .resolver import resolve_cache
-from .validators import (
+# Runtime layer — console -> tenants is the allowed direction (tenants/console/__init__.py).
+from tenants.models import Domain, ReservedHostRule, Shard, Tenant
+from tenants.resolver import resolve_cache
+from tenants.validators import (
     validate_schema_name,
     validate_tenant_domain,
     validate_tenant_schema_name,

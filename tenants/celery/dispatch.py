@@ -25,8 +25,16 @@ from tenants.models import TaskRun
 
 logger = get_task_logger(__name__)
 
+# The module's PUBLIC surface. `argsig` is on it deliberately, not incidentally: the
+# tenants.E006 system check (tenants/checks/beat.py) must compute the schedule-entry
+# signature with the SAME code the runtime keys its overlap-lock and TaskRun watermark on,
+# or the check and the runtime would disagree about what "the same entry" means. That makes
+# it a cross-module contract, so it carries a public name — a leading underscore would have
+# invited a rename that silently breaks the check.
+__all__ = ["argsig", "fanout_dispatch", "sub_dispatch"]
 
-def _argsig(task_args):
+
+def argsig(task_args):
     """Stable short signature of the task args, so two schedule entries that share a
     task name but differ by args (e.g. fetch(1) vs fetch(7)) get DISTINCT locks and
     DISTINCT TaskRun watermarks.
@@ -102,7 +110,7 @@ def fanout_dispatch(task_name, scope="tenants", cron=None, grace=None,
                     task_args=None, task_kwargs=None, task_options=None, batch_size=None):
     # ONE signature per wave, shared by the lock, the due-check and the watermark. Computing
     # it in each place instead would make three copies of "which schedule entry is this".
-    args_sig = _argsig(task_args)
+    args_sig = argsig(task_args)
     if not _acquire_lock(task_name, args_sig):
         logger.info("fanout_dispatch: %s skipped (overlapping wave)", task_name)
         return {"skipped": "overlapping"}
@@ -134,7 +142,7 @@ def sub_dispatch(task_name, schemas, task_args=None, task_kwargs=None,
     # max_retries=0. Recomputing locally is equivalent: task_args have already been through
     # the broker's JSON round-trip by the time either side sees them.
     if args_sig is None:
-        args_sig = _argsig(task_args)
+        args_sig = argsig(task_args)
     sent = []
     for schema in schemas:
         try:

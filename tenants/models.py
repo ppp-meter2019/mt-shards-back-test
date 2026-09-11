@@ -136,7 +136,7 @@ class Tenant(TenantMixin):
     # the latter: it fires on every .save() (an admin edit of `description` would shift it)
     # and never on QuerySet.update() (where every status writer lives). The value is now
     # maintained by save() below for .save() paths, and set explicitly by the .update()
-    # callers (migrate_schemas, reconcile_tenants, TenantViewSet._transition).
+    # callers (migrate_schemas, reconcile_tenants, console.views.TenantViewSet._transition).
     status_changed_at = models.DateTimeField(default=timezone.now)
     last_error        = models.TextField(blank=True)
     created_on        = models.DateField(auto_now_add=True)
@@ -416,7 +416,7 @@ class TaskRun(models.Model):
     `args_sig` is part of the identity because two schedule entries may share a task NAME
     and differ only by args — `fetch(1)` at 08:00 and `fetch(7)` at 09:00 are two
     independent schedules. The fanout overlap-lock already discriminates on the same axis
-    (tenants.celery.dispatch._argsig); the watermark must agree with it, or the entry whose
+    (tenants.celery.dispatch.argsig); the watermark must agree with it, or the entry whose
     wave lands second reads the first one's watermark, sees the occurrence as already run,
     and is skipped forever. It is a short digest rather than the raw args so the column
     stays bounded and indexable, and "" for the no-args majority so those rows read as
@@ -424,7 +424,7 @@ class TaskRun(models.Model):
     """
     schema      = models.CharField(max_length=63)
     task        = models.CharField(max_length=255)
-    # tenants.celery.dispatch._argsig(task_args): a 12-char digest, or "" for the common
+    # tenants.celery.dispatch.argsig(task_args): a 12-char digest, or "" for the common
     # no-args entry — so the rows an operator reads by hand stay readable and only an entry
     # that actually carries args gets a discriminator. Never NULL.
     args_sig    = models.CharField(max_length=12, blank=True, default="")

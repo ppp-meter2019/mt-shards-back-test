@@ -705,10 +705,11 @@ When you need a fourth Aurora cluster (`tenant_3`):
 | Tenant URLs | `tenants_back/urls_tenant.py` | Tenant subdomains: admin, business APIs |
 | Context | `tenants/context.py` | ContextVar `current_db` + `use_alias` + shard-aware `schema_context`/`tenant_context` (drop-in replacements for the django-tenants ones; also monkeypatched over them in `apps.ready()`) |
 | Models | `tenants/models.py` | Shard, Tenant (status FSM), Domain + protections |
-| Admin | `tenants/admin.py` | `public_admin_site` + Shard/Tenant/Domain |
+| Admin | `tenants/console/admin.py` | `public_admin_site` + Shard/Tenant/Domain/ReservedHostRule (`tenants/admin.py` is a one-line shim — Django autodiscovers `<app>.admin` by name) |
 | Router | `tenants/routers.py` | TenantSyncRouter + multi-DB guard |
 | Middleware | `tenants/middleware.py` | `ShardAwareTenantMiddleware` + `TenantShardRoutingMiddleware` (sync; tenant + shard routing) |
-| Views | `tenants/views.py` | TenantViewSet + `health` |
+| Views (runtime) | `tenants/views.py` | `health` only — imported by BOTH URLconfs |
+| Console | `tenants/console/` | Operator UI/API: Tenant/Shard/ReservedHostRule viewsets, serializers, admin, physical-state `probes.py`. Subpackage, not an app (no models); one-way boundary guarded by `scripts/ci_guard_console_boundary.sh` |
 | Commands | `tenants/management/commands/` | `sync_shards`, `create_tenant_schema`, `migrate_schemas`, `reconcile_tenants` |
 | Gunicorn | `bin/gunicorn_start.sh` | sync (prefork) workers on unix socket |
 | Nginx | `deploy/nginx_backend.conf` | static + `/api/`, `/admin/` via unix socket |

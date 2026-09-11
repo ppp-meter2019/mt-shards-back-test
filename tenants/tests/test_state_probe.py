@@ -7,7 +7,7 @@ from unittest import mock
 from django.db.utils import OperationalError
 from django.test import SimpleTestCase
 
-from tenants.views import TenantViewSet
+from tenants.console import probes
 
 
 def _tenant(schema, alias):
@@ -24,23 +24,23 @@ def _dead_connections():
 class ProbeDegradeTests(SimpleTestCase):
     def test_existing_schemas_degrades_on_dead_shard(self):
         qs = [_tenant("alpha", "shard_x")]
-        with mock.patch("tenants.views.connections", _dead_connections()):
-            result = TenantViewSet._existing_schemas_for(qs)   # must not raise
+        with mock.patch("tenants.console.probes.connections", _dead_connections()):
+            result = probes.existing_schemas(qs)   # must not raise
         self.assertEqual(result, set())
 
     def test_last_migrations_degrades_on_dead_shard(self):
         qs = [_tenant("alpha", "shard_x")]
-        with mock.patch("tenants.views.connections", _dead_connections()):
-            result = TenantViewSet._last_migrations_for(qs)    # must not raise
+        with mock.patch("tenants.console.probes.connections", _dead_connections()):
+            result = probes.last_migrations(qs)    # must not raise
         self.assertEqual(result, {})
 
     def test_programming_error_is_not_swallowed(self):
         # A non-DB error (e.g. a bug) must propagate, not degrade to empty.
         conns = mock.MagicMock()
         conns.__getitem__.return_value.cursor.side_effect = KeyError("bug")
-        with mock.patch("tenants.views.connections", conns):
+        with mock.patch("tenants.console.probes.connections", conns):
             with self.assertRaises(KeyError):
-                TenantViewSet._existing_schemas_for([_tenant("alpha", "shard_x")])
+                probes.existing_schemas([_tenant("alpha", "shard_x")])
 
 
 def _scripted_connections(script):
@@ -61,22 +61,22 @@ def _scripted_connections(script):
 
 
 class AdminsProbeTests(SimpleTestCase):
-    """_admins_for batches per SHARD. Serializing this field per tenant cost a
+    """probes.admins() batches per SHARD. Serializing this field per tenant cost a
     `SET search_path` plus a `SELECT` for every row (2N round-trips for a list); the probe
     replaces that with one pair of queries per shard, the same shape the sibling probes use.
     """
 
     def test_degrades_on_dead_shard(self):
         qs = [_tenant("alpha", "shard_x")]
-        with mock.patch("tenants.views.connections", _dead_connections()):
-            self.assertEqual(TenantViewSet._admins_for(qs), {})   # must not raise
+        with mock.patch("tenants.console.probes.connections", _dead_connections()):
+            self.assertEqual(probes.admins(qs), {})   # must not raise
 
     def test_programming_error_is_not_swallowed(self):
         conns = mock.MagicMock()
         conns.__getitem__.return_value.cursor.side_effect = KeyError("bug")
-        with mock.patch("tenants.views.connections", conns):
+        with mock.patch("tenants.console.probes.connections", conns):
             with self.assertRaises(KeyError):
-                TenantViewSet._admins_for([_tenant("alpha", "shard_x")])
+                probes.admins([_tenant("alpha", "shard_x")])
 
     def test_one_pair_of_queries_per_shard_not_per_tenant(self):
         """Four tenants on one shard must still cost exactly two statements."""
@@ -86,8 +86,8 @@ class AdminsProbeTests(SimpleTestCase):
         ]
         conns = _scripted_connections(script)
         qs = [_tenant(s, "shard_x") for s in ("alpha", "beta", "gamma", "delta")]
-        with mock.patch("tenants.views.connections", conns):
-            result = TenantViewSet._admins_for(qs)
+        with mock.patch("tenants.console.probes.connections", conns):
+            result = probes.admins(qs)
         self.assertEqual(len(conns.statements), 2)
         self.assertEqual(result, {
             ("shard_x", "alpha"): [{"id": 1, "username": "root", "is_active": True}],
@@ -99,8 +99,8 @@ class AdminsProbeTests(SimpleTestCase):
         script = [[("alpha",), ("beta",)], []]
         conns = _scripted_connections(script)
         qs = [_tenant(s, "shard_x") for s in ("alpha", "beta", "gamma")]
-        with mock.patch("tenants.views.connections", conns):
-            TenantViewSet._admins_for(qs)
+        with mock.patch("tenants.console.probes.connections", conns):
+            probes.admins(qs)
         union = conns.statements[1][0]
         self.assertEqual(union.count("UNION ALL"), 1)          # 2 branches
         self.assertIn('"alpha".users_user', union)
@@ -110,8 +110,8 @@ class AdminsProbeTests(SimpleTestCase):
     def test_role_is_passed_as_a_parameter_per_branch(self):
         script = [[("alpha",), ("beta",)], []]
         conns = _scripted_connections(script)
-        with mock.patch("tenants.views.connections", conns):
-            TenantViewSet._admins_for([_tenant(s, "shard_x") for s in ("alpha", "beta")])
+        with mock.patch("tenants.console.probes.connections", conns):
+            probes.admins([_tenant(s, "shard_x") for s in ("alpha", "beta")])
         _sql, params = conns.statements[1]
         self.assertEqual(params, ["company_admin", "company_admin"])   # one per branch
 
@@ -121,8 +121,8 @@ class AdminsProbeTests(SimpleTestCase):
         script = [[("alpha",)], []]
         conns = _scripted_connections(script)
         qs = [_tenant("alpha", "shard_x"), _tenant('a"b', "shard_x")]
-        with mock.patch("tenants.views.connections", conns):
-            TenantViewSet._admins_for(qs)
+        with mock.patch("tenants.console.probes.connections", conns):
+            probes.admins(qs)
         first_params = conns.statements[0][1]
         self.assertEqual(first_params[1], ["alpha"])           # 'a"b' never reaches SQL
         self.assertIn('"alpha".users_user', conns.statements[1][0])
@@ -132,8 +132,8 @@ class AdminsProbeTests(SimpleTestCase):
                   [("beta",)], [("beta", 2, "boss", False)]]
         conns = _scripted_connections(script)
         qs = [_tenant("alpha", "shard_x"), _tenant("beta", "shard_y")]
-        with mock.patch("tenants.views.connections", conns):
-            result = TenantViewSet._admins_for(qs)
+        with mock.patch("tenants.console.probes.connections", conns):
+            result = probes.admins(qs)
         self.assertEqual(len(conns.statements), 4)             # 2 per shard
         self.assertEqual(set(result), {("shard_x", "alpha"), ("shard_y", "beta")})
 
@@ -143,7 +143,7 @@ class AdminsSerializerFieldTests(SimpleTestCase):
     tenant_context(obj) — the N in the 2N — so a regression here silently restores it."""
 
     def _serializer(self, context):
-        from tenants.serializers import TenantSerializer
+        from tenants.console.serializers import TenantSerializer
         return TenantSerializer(context=context)
 
     def test_reads_the_precomputed_table(self):
@@ -166,9 +166,9 @@ class AdminsSerializerFieldTests(SimpleTestCase):
         asserted absent from the module — the per-tenant version needed both."""
         conns = mock.MagicMock()
         conns.__getitem__.side_effect = AssertionError("get_admins must not touch the DB")
-        with mock.patch("tenants.views.connections", conns):
+        with mock.patch("tenants.console.probes.connections", conns):
             self.assertEqual(
                 self._serializer({"admins": {}}).get_admins(_tenant("alpha", "shard_x")), [])
-        import tenants.serializers as ser
+        import tenants.console.serializers as ser
         self.assertFalse(hasattr(ser, "tenant_context"),
                          "serializers must not import tenant_context any more")

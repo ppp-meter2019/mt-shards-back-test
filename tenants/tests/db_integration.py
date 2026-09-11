@@ -25,7 +25,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 import tenants.resolver as rc
 from tenants.models import Domain, ReservedHostRule, Shard, TaskRun, Tenant
-from tenants.serializers import TenantSerializer
+from tenants.console.serializers import TenantSerializer
 from tenants.validators import (
     quote_schema,
     validate_schema_name,
@@ -33,7 +33,7 @@ from tenants.validators import (
     validate_tenant_schema_name,
 )
 from tenants.context import tenant_context
-from tenants.views import BaseDomainsView, TenantViewSet
+from tenants.console.views import BaseDomainsView, TenantViewSet
 from users.models import User
 
 SEED_LABELS = {"www", "api", "admin", "mail", "staging",
@@ -272,7 +272,7 @@ class BaseDomainsEndpointDBTests(TestCase):
 class TaskRunTests(TestCase):
     """Durable per-(task, schema) watermark: bulk upsert + load_map round-trip."""
 
-    SIG = ""                  # _argsig(None) — the no-args schedule entry
+    SIG = ""                  # argsig(None) — the no-args schedule entry
 
     def test_mark_ran_upserts_and_load_map_reads(self):
         t1 = timezone.now().replace(microsecond=0)

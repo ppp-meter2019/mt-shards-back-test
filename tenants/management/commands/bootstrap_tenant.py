@@ -13,6 +13,7 @@ Example:
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django_tenants.utils import get_public_schema_name
 
 from commons.platform.commands import TenantCommand
 
@@ -83,7 +84,7 @@ class Command(TenantCommand):
             schema = validate_schema_name(opts["schema"])
         except ValidationError as exc:
             raise CommandError(f"--schema: {'; '.join(exc.messages)}")
-        if schema == "public":
+        if schema == get_public_schema_name():
             raise CommandError("Refusing to overwrite 'public' — use bootstrap_public.")
 
         domain = normalize_host(opts["domain"])

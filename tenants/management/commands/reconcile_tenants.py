@@ -17,7 +17,7 @@ from django.db import connection, connections
 from django.db.migrations.loader import MigrationLoader
 from django.db.utils import ConnectionDoesNotExist
 from django.utils import timezone
-from django_tenants.utils import schema_exists
+from django_tenants.utils import get_public_schema_name, schema_exists
 
 from tenants.models import Tenant
 from tenants.resolver import resolve_cache
@@ -84,7 +84,7 @@ class Command(TenantCommand):
         ))
 
     def _build_queryset(self, opts):
-        qs = Tenant.objects.select_related("shard").exclude(schema_name="public")
+        qs = Tenant.objects.select_related("shard").exclude(schema_name=get_public_schema_name())
         if opts["only_pending"]:
             qs = qs.filter(status=Tenant.Status.PENDING)
         if opts["schema"]:
@@ -237,7 +237,7 @@ class Command(TenantCommand):
     # Report mode
     # ------------------------------------------------------------------
     def _print_report(self, single_schema: Optional[str] = None):
-        qs = Tenant.objects.select_related("shard").exclude(schema_name="public")
+        qs = Tenant.objects.select_related("shard").exclude(schema_name=get_public_schema_name())
         if single_schema:
             qs = qs.filter(schema_name=single_schema)
 

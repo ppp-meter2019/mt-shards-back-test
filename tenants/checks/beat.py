@@ -117,7 +117,7 @@ def fanout_entries_are_unique(app_configs, **kwargs):
     entry" means. Imported lazily: dispatch pulls in tenants.models, and checks are
     registered from apps.ready().
     """
-    from tenants.celery.dispatch import _argsig
+    from tenants.celery.dispatch import argsig
 
     schedule = getattr(settings, "CELERY_BEAT_SCHEDULE", None) or {}
     groups = {}
@@ -125,7 +125,7 @@ def fanout_entries_are_unique(app_configs, **kwargs):
         if entry.get("task") != FANOUT_TASK_NAME:
             continue
         kw = entry.get("kwargs") or {}
-        groups.setdefault((kw.get("task_name"), _argsig(kw.get("task_args"))), []).append(
+        groups.setdefault((kw.get("task_name"), argsig(kw.get("task_args"))), []).append(
             (name, entry))
 
     errors = []

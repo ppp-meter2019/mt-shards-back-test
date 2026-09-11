@@ -2,7 +2,7 @@
 covered by the DB-backed harness (db_integration.BaseDomainsEndpointDBTests)."""
 from django.test import SimpleTestCase, override_settings
 
-from tenants.views import BaseDomainsView
+from tenants.console.views import BaseDomainsView
 
 
 class BaseDomainsPayloadTests(SimpleTestCase):

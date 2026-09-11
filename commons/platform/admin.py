@@ -15,6 +15,6 @@ from django.conf import settings
 
 def management_site():
     if settings.USE_MULTITENANT:
-        from tenants.admin import public_admin_site   # lazy: absent in standalone
+        from tenants.console.admin import public_admin_site   # lazy: absent in standalone
         return public_admin_site
     return None

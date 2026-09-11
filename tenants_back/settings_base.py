@@ -189,7 +189,18 @@ DATABASES = {
         "PASSWORD":           "postgres",
         "HOST":               "127.0.0.1",
         "PORT":               "5432",
-        "CONN_MAX_AGE":       60,
+        # 0 = close at the end of every request (Django's own default). Persistent
+        # connections are an OPT-IN deployment decision, not a base assumption: the count
+        # a cluster sees is backend_hosts x gunicorn_workers PER ALIAS (see "Connection
+        # sizing" in deploy/DATABASE_SETUP.md), so a non-zero value here would silently
+        # multiply by a topology this file knows nothing about — and this same base is
+        # what the standalone host project inherits. Production raises it where the
+        # topology and Aurora max_connections ARE known: settings_local.py sets
+        # CONN_MAX_AGE=60 per alias (see settings_local.py.example).
+        "CONN_MAX_AGE":       0,
+        # Kept True although it is INERT at CONN_MAX_AGE=0 (there is no reused connection
+        # to health-check): it must already be in place for the settings_local override
+        # that raises CONN_MAX_AGE, where a stale pooled connection is a real failure mode.
         "CONN_HEALTH_CHECKS": True,
         "OPTIONS":            {"connect_timeout": 5},
     },

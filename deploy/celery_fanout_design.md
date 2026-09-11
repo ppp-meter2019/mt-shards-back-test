@@ -48,7 +48,7 @@ Config knobs split into LOAD-TIME (`FANOUT_PERIOD_DEFAULT`, via env/settings_mod
   `crontab` → per-tenant local time; interval (number / `timedelta` / `schedule`) →
   tz-irrelevant, fan to all. String / `solar` / `clocked` → hard error.
 - Beat stays a **stock scheduler**; the dispatcher is an ordinary scheduled task.
-- The existing per-task tenant machinery (`_schema_name` header → `switch_schema`) is
+- The existing per-task tenant machinery (`_schema_name` header → `TenantTask.__call__`) is
   **reused unchanged**.
 - **Standalone: `scoped_schedule` is the identity** → zero behavioral change; fanout/tz/queues/
   RedBeat activate only under `USE_MULTITENANT=True`.
@@ -157,8 +157,13 @@ def sub_dispatch(task_name, schemas, task_args=None, task_kwargs=None,
 ```
 
 The real per-tenant task runs via the existing machinery: `_schema_name` header →
-`app.py::switch_schema` (task_prerun) enters the tenant's shard+schema → `restore_schema`
-(task_postrun). Unchanged.
+`TenantTask.__call__` (task.py) enters the tenant's shard+schema for exactly that
+invocation, in a `with tenant_context(...)` block whose `finally` restores both axes
+whether the task returns or raises. Unchanged.
+
+Deliberately NOT a `task_prerun`/`task_postrun` pair: two signals share no `finally`, so
+the context manager would have to be stashed on the task SINGLETON between them — neither
+crash- nor pool-safe. See the docstrings in `tenants/celery/app.py` and `task.py`.
 
 `public` scope: `scoped_schedule` passthrough → beat sends the real task once (public context,
 `CELERY_TIMEZONE`), never through the dispatcher.
@@ -487,5 +492,5 @@ New dependency: `croniter` (universal requirements; used only by the MT tz path)
 - `_due_by_tenant_tz`: two tenants, different tz → due at different UTC ticks; missed tick
   within grace self-heals; beyond grace skips; no retroactive fire.
 - `task_queue`: MT → name; standalone → None.
-- Ad-hoc tasks: `headers_with_schema`/`switch_schema` unchanged.
+- Ad-hoc tasks: `headers_with_schema`/`TenantTask.__call__` unchanged.
 - standalone: beat config loads without `django_celery_beat`.
