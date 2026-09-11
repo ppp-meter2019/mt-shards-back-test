@@ -1,6 +1,8 @@
 """Resolution cache via the middleware: hit/miss/negative, nx+tombstone race,
 fail-open, uniform read-only, dump/load fidelity. DB-free (fake domain model +
 fake nx-aware cache injected as a TenantResolveCache)."""
+from collections.abc import Iterable
+from typing import Any
 from unittest import mock
 
 from django.test import SimpleTestCase
@@ -13,17 +15,17 @@ from ._support import FakeNxCache, make_domain_model, make_tenant, use_resolve_c
 
 
 class ResolveCacheTests(SimpleTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.mw = mw.ShardAwareTenantMiddleware(lambda r: None)
 
-    def test_miss_then_hit_hits_db_once(self):
+    def test_miss_then_hit_hits_db_once(self) -> None:
         dm = make_domain_model(make_tenant())
         with use_resolve_cache(FakeNxCache()):
             self.mw.get_tenant(dm, "known")
             self.mw.get_tenant(dm, "known")
         self.assertEqual(dm.db_calls["n"], 1)
 
-    def test_negative_cached_no_second_db(self):
+    def test_negative_cached_no_second_db(self) -> None:
         dm = make_domain_model(None)
         with use_resolve_cache(FakeNxCache()):
             for _ in range(2):
@@ -31,7 +33,7 @@ class ResolveCacheTests(SimpleTestCase):
                     self.mw.get_tenant(dm, "nope")
         self.assertEqual(dm.db_calls["n"], 1)
 
-    def test_miss_and_hit_expose_exactly_the_same_thing(self):
+    def test_miss_and_hit_expose_exactly_the_same_thing(self) -> None:
         """The invariant the snapshot type exists for. The DB resolve used to hand out the
         full row while the cache handed out a partial model instance, so a field like
         company_name read correctly on a cold cache and as "" on a warm one."""
@@ -47,13 +49,13 @@ class ResolveCacheTests(SimpleTestCase):
             self.assertFalse(hasattr(got, "save"))
             self.assertFalse(hasattr(got, "company_name"))
 
-    def test_tombstone_blocks_stale_nx_write(self):
+    def test_tombstone_blocks_stale_nx_write(self) -> None:
         fake = FakeNxCache()
         fake.store["known"] = TOMBSTONE
         self.assertFalse(fake.set("known", {"stale": 1}, 60, nx=True))
         self.assertEqual(fake.store["known"], TOMBSTONE)
 
-    def test_tombstone_is_treated_as_miss_db_direct(self):
+    def test_tombstone_is_treated_as_miss_db_direct(self) -> None:
         dm = make_domain_model(make_tenant())
         fake = FakeNxCache()
         fake.store["known"] = TOMBSTONE
@@ -63,11 +65,11 @@ class ResolveCacheTests(SimpleTestCase):
         self.assertEqual(dm.db_calls["n"], 1)
         self.assertEqual(fake.store["known"], TOMBSTONE)
 
-    def test_fail_open_on_backend_without_nx(self):
+    def test_fail_open_on_backend_without_nx(self) -> None:
         class NoNxCache:
-            def get(self, key, default=None):
+            def get(self, key: str, default: Any = None) -> Any:
                 return None
-            def set(self, *a, **k):
+            def set(self, *a: Any, **k: Any) -> None:
                 if "nx" in k:
                     raise TypeError("set() got an unexpected keyword argument 'nx'")
         dm = make_domain_model(make_tenant())
@@ -75,7 +77,7 @@ class ResolveCacheTests(SimpleTestCase):
             got = self.mw.get_tenant(dm, "known")
         self.assertEqual(got.schema_name, "alpha")
 
-    def test_fail_open_on_corrupt_entry(self):
+    def test_fail_open_on_corrupt_entry(self) -> None:
         fake = FakeNxCache()
         fake.store["known"] = {"garbage": 1}
         dm = make_domain_model(make_tenant())
@@ -83,13 +85,13 @@ class ResolveCacheTests(SimpleTestCase):
             got = self.mw.get_tenant(dm, "known")
         self.assertEqual(got.schema_name, "alpha")
 
-    def test_does_not_exist_propagates(self):
+    def test_does_not_exist_propagates(self) -> None:
         dm = make_domain_model(None)
         with use_resolve_cache(FakeNxCache()):
             with self.assertRaises(dm.DoesNotExist):
                 self.mw.get_tenant(dm, "nope")
 
-    def test_raw_psycopg_op_error_normalized_not_retried(self):
+    def test_raw_psycopg_op_error_normalized_not_retried(self) -> None:
         # django-tenants runs `SET search_path` on a raw psycopg cursor, so a pool/proxy
         # timeout escapes as a raw psycopg.OperationalError (NOT django.db.OperationalError).
         # It must be surfaced as a DB outage — normalized to django OperationalError, NOT
@@ -101,11 +103,11 @@ class ResolveCacheTests(SimpleTestCase):
 
         class _Objects:
             @classmethod
-            def select_related(cls, *a):
+            def select_related(cls, *a: Any) -> type:
                 return cls
 
             @classmethod
-            def get(cls, domain=None):
+            def get(cls, domain: str | None = None) -> None:
                 calls["n"] += 1
                 raise psycopg.OperationalError("Timed-out waiting to acquire database connection.")
 
@@ -118,7 +120,7 @@ class ResolveCacheTests(SimpleTestCase):
                 self.mw.get_tenant(FakeDomain, "known")
         self.assertEqual(calls["n"], 1)                      # surfaced once, NOT retried
 
-    def test_raw_psycopg_interface_error_normalized_not_retried(self):
+    def test_raw_psycopg_interface_error_normalized_not_retried(self) -> None:
         # A closed/broken raw-cursor connection escapes as psycopg.InterfaceError — a SIBLING
         # of psycopg.OperationalError, not a subclass — so it must be normalized on its own.
         # Same contract: surfaced as a django DB outage, once, not retried.
@@ -129,11 +131,11 @@ class ResolveCacheTests(SimpleTestCase):
 
         class _Objects:
             @classmethod
-            def select_related(cls, *a):
+            def select_related(cls, *a: Any) -> type:
                 return cls
 
             @classmethod
-            def get(cls, domain=None):
+            def get(cls, domain: str | None = None) -> None:
                 calls["n"] += 1
                 raise psycopg.InterfaceError("connection already closed")
 
@@ -146,7 +148,7 @@ class ResolveCacheTests(SimpleTestCase):
                 self.mw.get_tenant(FakeDomain, "known")
         self.assertEqual(calls["n"], 1)                      # surfaced once, NOT retried
 
-    def test_dump_load_round_trip_fidelity(self):
+    def test_dump_load_round_trip_fidelity(self) -> None:
         from tenants.resolver import TenantSnapshot
         t = make_tenant()
         r = TenantResolveCache.load(TenantResolveCache.dump(t))
@@ -157,7 +159,7 @@ class ResolveCacheTests(SimpleTestCase):
         # makes a hit indistinguishable from a miss.
         self.assertEqual(r, TenantSnapshot.capture(t))
 
-    def test_dump_accepts_a_snapshot_as_well_as_a_model(self):
+    def test_dump_accepts_a_snapshot_as_well_as_a_model(self) -> None:
         """The resolve path hands dump() an already-captured snapshot; reconcile and warm
         hand it Domain.tenant rows. Both must produce the same payload."""
         from tenants.resolver import TenantSnapshot
@@ -165,7 +167,7 @@ class ResolveCacheTests(SimpleTestCase):
         self.assertEqual(TenantResolveCache.dump(t),
                          TenantResolveCache.dump(TenantSnapshot.capture(t)))
 
-    def test_payload_never_carries_the_request_hostname(self):
+    def test_payload_never_carries_the_request_hostname(self) -> None:
         """domain_url is a declared field (django_tenants writes it) but is per-REQUEST —
         caching it would stamp one hostname onto a snapshot shared by every domain of the
         tenant."""
@@ -179,19 +181,19 @@ class SweepOrphansTests(SimpleTestCase):
     class _Cache:
         """Batch-aware fake: sweep_orphans reads via get_many and deletes via delete_many."""
 
-        def __init__(self, store):
+        def __init__(self, store: dict[str, Any]) -> None:
             self.store = store
             self.deleted = []
 
-        def get_many(self, keys):
+        def get_many(self, keys: Iterable[str]) -> dict[str, Any]:
             return {k: self.store[k] for k in keys if k in self.store}
 
-        def delete_many(self, keys):
+        def delete_many(self, keys: Iterable[str]) -> None:
             for k in keys:
                 self.deleted.append(k)
                 self.store.pop(k, None)
 
-    def test_deletes_only_orphan_positives(self):
+    def test_deletes_only_orphan_positives(self) -> None:
         rc = TenantResolveCache(cache=None)
         K = rc._snap_key
         rc._cache = self._Cache({

@@ -19,6 +19,7 @@ tz-awareness is derived from the schedule TYPE, never a manual flag:
 """
 import numbers
 from datetime import timedelta
+from typing import Any
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
@@ -54,7 +55,7 @@ BEAT_DEFAULTS = {
 }
 
 
-def beat_conf(key):
+def beat_conf(key: str) -> int:
     """Resolve a TENANT_BEAT knob: settings.TENANT_BEAT[key] -> in-code default."""
     return getattr(settings, "TENANT_BEAT", {}).get(key, BEAT_DEFAULTS[key])
 
@@ -71,14 +72,14 @@ class SchedEntry(dict):
     """
 
 
-def scope_of(entry):
+def scope_of(entry: dict) -> str | None:
     """The scope (`"public"`/`"tenants"`) scoped_schedule wrapped this entry with, or None if
     the entry was NOT produced by scoped_schedule (a raw dict that bypassed the helper).
     Used by the tenants.E003 system check to enforce that every entry is wrapped."""
     return getattr(entry, "scope", None)
 
 
-def _crontab_to_cronspec(c):
+def _crontab_to_cronspec(c: crontab) -> str:
     """celery crontab -> 5-field cron string, from its original (unparsed) fields."""
     return "{0} {1} {2} {3} {4}".format(
         c._orig_minute, c._orig_hour, c._orig_day_of_month,
@@ -86,7 +87,7 @@ def _crontab_to_cronspec(c):
     )
 
 
-def _classify_schedule(sched):
+def _classify_schedule(sched: object) -> tuple[str, Any, str | None]:
     """-> (kind, beat_schedule_value, cron_spec_or_None). Fail-fast on unsupported."""
     if isinstance(sched, (numbers.Number, timedelta, interval_schedule)):
         return "interval", sched, None
@@ -99,7 +100,8 @@ def _classify_schedule(sched):
     )
 
 
-def scoped_schedule(entry, *, scope="tenants", fanout_period=None, grace=None):
+def scoped_schedule(entry: dict, *, scope: str = "tenants", fanout_period: float | None = None,
+                    grace: int | None = None) -> SchedEntry:
     """Wrap a beat entry for the fanout model. Identity in standalone / for public."""
     if scope not in ("public", "tenants"):
         raise ImproperlyConfigured(f"scoped_schedule: scope must be 'public' or 'tenants', got {scope!r}")
@@ -141,7 +143,7 @@ def scoped_schedule(entry, *, scope="tenants", fanout_period=None, grace=None):
 # Task-level queue helper (mode-aware). Not scheduling per se, but the other Celery
 # application-facing shim — kept here so app code has ONE Celery-helpers import surface.
 # ---------------------------------------------------------------------------
-def task_queue(name):
+def task_queue(name: str) -> str | None:
     """Queue for a task: `name` under multitenant, else None so Celery routes to the
     effective task_default_queue (the host's CELERY_TASK_DEFAULT_QUEUE or Celery's built-in
     default) — the queue the host's existing workers already consume. Keeps routing at the

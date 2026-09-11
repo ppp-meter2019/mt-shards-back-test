@@ -13,7 +13,7 @@ settings.* directly; this is for the bootstrap flag only.
 import os
 
 
-def use_multitenant():
+def use_multitenant() -> bool:
     """Resolve USE_MULTITENANT: env USE_MULTITENANT=0/1 → settings_mode.py → default False."""
     if "USE_MULTITENANT" in os.environ:
         return os.environ["USE_MULTITENANT"] == "1"
@@ -24,7 +24,7 @@ def use_multitenant():
         return False
 
 
-def bootstrap_float(name, default):
+def bootstrap_float(name: str, default: float) -> float:
     """Resolve a LOAD-TIME float knob the same way as use_multitenant(): env → settings_mode.py
     → default. For values consumed while settings.py is still executing (e.g. the fanout beat
     tick baked into CELERY_BEAT_SCHEDULE), where django.conf.settings / settings_local.py are

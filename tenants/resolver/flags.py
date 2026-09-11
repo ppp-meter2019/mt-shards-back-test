@@ -9,11 +9,11 @@ the fail-safe below hides.
 from .config import registry_cfg
 
 
-def warm_enabled():
+def warm_enabled() -> bool:
     return bool(registry_cfg.WARM_ENABLED)
 
 
-def gate_enabled():
+def gate_enabled() -> bool:
     # Fail-safe: the gate is effective ONLY when WARM is also on — WARM is the write side
     # that builds the treg:hosts SET the gate reads. GATE-without-WARM is treated as OFF in
     # every process; the misconfig is surfaced by the tenants.E001 system check.

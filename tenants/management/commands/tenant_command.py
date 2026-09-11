@@ -16,7 +16,9 @@ run directly against the single DB.
 NB: run_from_argv mirrors upstream's short arg-surgery (pinned to the installed django_tenants
 version — see requirements) but replaces the default-connection set_tenant with tenant_context.
 """
+
 import argparse
+from typing import Any
 
 from django.core.management import call_command, get_commands, load_command_class
 from django.core.management.base import BaseCommand, CommandError
@@ -28,7 +30,7 @@ from tenants.context import tenant_context
 class Command(_UpstreamTenantCommand):
     help = "Shard-aware wrapper: run a Django command for one tenant, on that tenant's shard."
 
-    def run_from_argv(self, argv):
+    def run_from_argv(self, argv: list[str]) -> None:
         # Mirrors django_tenants' arg surgery, but runs the wrapped command inside
         # tenant_context(tenant) instead of a default-connection set_tenant.
         if len(argv) <= 2:
@@ -48,7 +50,7 @@ class Command(_UpstreamTenantCommand):
         with tenant_context(tenant):                    # current_db -> shard + schema on shard conn
             klass.run_from_argv(args)
 
-    def handle(self, *args, **options):
+    def handle(self, *args: Any, **options: Any) -> None:
         tenant = self.get_tenant_from_options_or_interactive(**options)
         options.pop("schema_name", None)
         subcommand_name, *subcommand_options = options.pop("command_name")

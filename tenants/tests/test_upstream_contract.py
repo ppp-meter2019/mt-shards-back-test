@@ -38,21 +38,21 @@ from tenants.management.commands.migrate_schemas import Command as MigrateSchema
 class UpstreamShapeTests(SimpleTestCase):
     """Symbols and signatures the fork points call into."""
 
-    def test_synccommon_handle_signature(self):
+    def test_synccommon_handle_signature(self) -> None:
         """migrate_schemas.handle() calls SyncCommon.handle(self, ...) UNBOUND, deliberately
         bypassing the MRO so the upstream flag parsing runs before our own. A changed
         signature would be a TypeError at best and a silent behaviour shift at worst."""
         self.assertEqual(str(inspect.signature(SyncCommon.handle)), "(self, *args, **options)")
 
-    def test_synccommon_notice_exists(self):
+    def test_synccommon_notice_exists(self) -> None:
         """Every progress line our migrate_schemas prints goes through _notice()."""
         self.assertTrue(callable(getattr(SyncCommon, "_notice", None)))
 
-    def test_router_app_in_list_exists(self):
+    def test_router_app_in_list_exists(self) -> None:
         """Called from the allow_migrate body we copied into tenants/routers.py."""
         self.assertTrue(callable(getattr(TenantSyncRouter, "app_in_list", None)))
 
-    def test_hostname_from_request_still_strips_www(self):
+    def test_hostname_from_request_still_strips_www(self) -> None:
         """The resolve-cache key, treg:hosts membership and the Domain lookup are ALL built
         from the hostname this returns. If the www-stripping ever changed, cache keys and SET
         members would silently stop matching incoming Hosts."""
@@ -64,7 +64,7 @@ class UpstreamShapeTests(SimpleTestCase):
 class OurPatchLandsTests(SimpleTestCase):
     """The two places where OUR code modifies upstream state at import/ready time."""
 
-    def test_database_option_default_is_stripped(self):
+    def test_database_option_default_is_stripped(self) -> None:
         """migrate_schemas.add_arguments walks parser._actions (a private argparse surface)
         to turn the upstream default of '--database=default' into None, so "not specified" is
         distinguishable from "explicitly default". If that default came back, a no-flag full
@@ -75,7 +75,7 @@ class OurPatchLandsTests(SimpleTestCase):
         self.assertEqual(len(database), 1, "upstream stopped declaring --database")
         self.assertIsNone(database[0].default)
 
-    def test_context_monkeypatch_target_and_effect(self):
+    def test_context_monkeypatch_target_and_effect(self) -> None:
         """tenants.apps.ready() rebinds `dt_utils.schema_context` / `dt_utils.tenant_context`
         to our shard-aware versions, as a safety net for LATE third-party importers. If the
         names moved, the patch would become a silent no-op — and such importers would keep the

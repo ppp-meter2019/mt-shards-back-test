@@ -1,5 +1,6 @@
 """Direct unit tests of TenantResolveCache via DI (inject a fake nx-aware cache).
 DB-free: transaction.on_commit is patched to run immediately; Domain is mocked for warm."""
+from typing import Any
 from unittest import mock
 
 from django.test import SimpleTestCase, override_settings
@@ -11,30 +12,30 @@ from ._support import FakeNxCache, make_tenant
 
 
 class _Row:
-    def __init__(self, domain, tenant):
+    def __init__(self, domain: str, tenant: Any) -> None:
         self.domain, self.tenant = domain, tenant
 
 
 class TenantResolveCacheTests(SimpleTestCase):
-    def rc(self, fake=None):
+    def rc(self, fake: Any = None) -> TenantResolveCache:
         return TenantResolveCache(cache=fake or FakeNxCache())
 
     # --- get_snapshot ---
-    def test_get_snapshot_absent_is_miss(self):
+    def test_get_snapshot_absent_is_miss(self) -> None:
         rc = self.rc()
         self.assertIs(rc.get_snapshot("h"), rc.MISS)
 
-    def test_get_snapshot_tombstone_is_miss(self):
+    def test_get_snapshot_tombstone_is_miss(self) -> None:
         rc = self.rc()
         rc.cache.store[rc._snap_key("h")] = TOMBSTONE
         self.assertIs(rc.get_snapshot("h"), rc.MISS)
 
-    def test_get_snapshot_negative(self):
+    def test_get_snapshot_negative(self) -> None:
         rc = self.rc()
         rc.cache.store[rc._snap_key("h")] = NEGATIVE
         self.assertIs(rc.get_snapshot("h"), rc.NEG)
 
-    def test_get_snapshot_positive_loads_a_snapshot(self):
+    def test_get_snapshot_positive_loads_a_snapshot(self) -> None:
         from tenants.resolver import TenantSnapshot
         rc = self.rc()
         rc.cache.store[rc._snap_key("h")] = rc.dump(make_tenant())
@@ -43,7 +44,7 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertEqual(got.schema_name, "alpha")
         self.assertFalse(hasattr(got, "save"))
 
-    def test_classify_covers_all_value_kinds(self):
+    def test_classify_covers_all_value_kinds(self) -> None:
         rc = self.rc()
         K = rc._Kind
         self.assertIs(rc._classify(None), K.MISS)
@@ -54,12 +55,12 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertIs(rc._classify({"foo": 1}), K.UNKNOWN)                    # malformed dict
         self.assertIs(rc._classify("garbage"), K.UNKNOWN)                     # non-dict
 
-    def test_get_snapshot_malformed_dict_is_miss_not_raise(self):
+    def test_get_snapshot_malformed_dict_is_miss_not_raise(self) -> None:
         rc = self.rc()
         rc.cache.store[rc._snap_key("h")] = {"foo": 1}   # dict but wrong shape
         self.assertIs(rc.get_snapshot("h"), rc.MISS)     # UNKNOWN → MISS, no load()/KeyError
 
-    def test_dump_allowlist_excludes_non_routing_fields(self):
+    def test_dump_allowlist_excludes_non_routing_fields(self) -> None:
         # The payload carries ONLY the routing allowlist — no company_name/last_error/etc.
         # No `shard_id` either: it duplicated shard.id and existed only to keep a rebuilt
         # MODEL instance self-consistent, which load() no longer produces.
@@ -75,20 +76,20 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertFalse(hasattr(got, "company_name"))
 
     # --- store / store_miss (nx respects tombstone) ---
-    def test_store_is_nx_and_respects_tombstone(self):
+    def test_store_is_nx_and_respects_tombstone(self) -> None:
         rc = self.rc()
         k = rc._snap_key("h")
         rc.cache.store[k] = TOMBSTONE
         rc.put("h", make_tenant())
         self.assertEqual(rc.cache.store[k], TOMBSTONE)
 
-    def test_store_miss_writes_negative(self):
+    def test_store_miss_writes_negative(self) -> None:
         rc = self.rc()
         rc.store_miss("h")
         self.assertEqual(rc.cache.store[rc._snap_key("h")], NEGATIVE)
 
     # --- invalidation ---
-    def test_forget_host_writes_tombstone(self):
+    def test_forget_host_writes_tombstone(self) -> None:
         rc = self.rc()
         with mock.patch("tenants.resolver.cache.transaction.on_commit", side_effect=lambda fn: fn()):
             n = rc.forget_host("h")
@@ -96,15 +97,15 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertEqual(rc.cache.store[rc._snap_key("h")], TOMBSTONE)
 
     # --- schema-snap lockstep (invalidation) ---
-    def _run_on_commit(self):
+    def _run_on_commit(self) -> Any:
         return mock.patch("tenants.resolver.cache.transaction.on_commit",
                           side_effect=lambda fn: fn())
 
-    def test_keys_for_key_names(self):
+    def test_keys_for_key_names(self) -> None:
         rc = self.rc()
         self.assertEqual(rc._schema_snap_key("alpha"), "schema-snap:alpha")
 
-    def test_forget_hosts_derives_schema_from_cached_snapshot(self):
+    def test_forget_hosts_derives_schema_from_cached_snapshot(self) -> None:
         # A warm host snapshot carries schema_name -> forget_hosts drops BOTH namespaces.
         rc = self.rc()
         rc.cache.store[rc._snap_key("h")] = rc.dump(make_tenant(schema_name="alpha"))
@@ -113,7 +114,7 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertEqual(rc.cache.store[rc._snap_key("h")], TOMBSTONE)
         self.assertEqual(rc.cache.store[rc._schema_snap_key("alpha")], TOMBSTONE)
 
-    def test_forget_hosts_explicit_schema_without_host(self):
+    def test_forget_hosts_explicit_schema_without_host(self) -> None:
         # The post_delete path: no host, explicit schema -> only the schema-snap is dropped.
         rc = self.rc()
         with self._run_on_commit():
@@ -121,7 +122,7 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertEqual(n, 1)
         self.assertEqual(rc.cache.store[rc._schema_snap_key("beta")], TOMBSTONE)
 
-    def test_forget_hosts_cold_snapshot_leaves_schema_to_backstop(self):
+    def test_forget_hosts_cold_snapshot_leaves_schema_to_backstop(self) -> None:
         # No cached host snapshot -> schema can't be derived -> only the host key is tombstoned
         # (the Tenant post_delete receiver / reconcile sweep is the reliable schema cleaner).
         rc = self.rc()
@@ -132,7 +133,7 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertEqual([k for k in rc.cache.store if k.startswith("schema-snap:")], [])
 
     # --- schema-snap read/write (worker cache primitives) ---
-    def test_get_schema_snapshot_positive_hold_miss(self):
+    def test_get_schema_snapshot_positive_hold_miss(self) -> None:
         rc = self.rc()
         self.assertIs(rc.get_schema_snapshot("s"), rc.MISS)                    # absent
         rc.cache.store[rc._schema_snap_key("s")] = TOMBSTONE
@@ -143,7 +144,7 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertFalse(hasattr(got, "save"))
 
     @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True})
-    def test_put_warms_both_host_and_schema(self):
+    def test_put_warms_both_host_and_schema(self) -> None:
         # The FRONT resolve fill (put/store) warms BOTH namespaces in lockstep, so a front
         # request re-warms the worker's schema-snap too (the worker never writes the cache).
         rc = self.rc()
@@ -152,7 +153,7 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertIsInstance(rc.cache.store[rc._schema_snap_key("acme")], dict)
 
     @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True})
-    def test_put_is_nx_and_respects_hold_on_schema(self):
+    def test_put_is_nx_and_respects_hold_on_schema(self) -> None:
         rc = self.rc()
         rc.cache.store[rc._schema_snap_key("acme")] = TOMBSTONE          # schema held (invalidated)
         rc.put("acme.com", make_tenant(schema_name="acme"))
@@ -161,21 +162,21 @@ class TenantResolveCacheTests(SimpleTestCase):
 
     @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True},
                        TENANT_RESOLVE={"WARM_TTL_BY_STATUS": {"active": None}})
-    def test_put_schema_many_writes_each_schema_key(self):
+    def test_put_schema_many_writes_each_schema_key(self) -> None:
         rc = self.rc()
         n = rc.put_schema_many([make_tenant(schema_name="s1"), make_tenant(schema_name="s2")])
         self.assertEqual(n, 2)
         self.assertIn(rc._schema_snap_key("s1"), rc.cache.store)
         self.assertIn(rc._schema_snap_key("s2"), rc.cache.store)
 
-    def test_forget_all_clears_by_pattern_and_counts(self):
+    def test_forget_all_clears_by_pattern_and_counts(self) -> None:
         fake = FakeNxCache(); fake.store.update({"a": 1, "b": 2})
         n = self.rc(fake).forget_all()
         self.assertEqual(n, 2)
         self.assertEqual(fake.store, {})
 
     # --- put: return contract ---
-    def test_put_reports_whether_the_host_snap_was_written(self):
+    def test_put_reports_whether_the_host_snap_was_written(self) -> None:
         """put() returns the nx OUTCOME, not "caching is enabled": a held tombstone means the
         write did not land, and the caller must be able to tell."""
         rc = self.rc()
@@ -185,11 +186,11 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertFalse(rc.put("held", make_tenant()))          # tombstone respected
 
     @override_settings(TENANT_RESOLVE={"POSITIVE_CACHE_SECONDS": 0, "MISS_CACHE_SECONDS": 60})
-    def test_put_is_false_when_positive_caching_is_off(self):
+    def test_put_is_false_when_positive_caching_is_off(self) -> None:
         self.assertFalse(self.rc().put("h", make_tenant()))
 
     # --- warm (Domain mocked) ---
-    def test_warm_fill_gaps_skips_tombstone(self):
+    def test_warm_fill_gaps_skips_tombstone(self) -> None:
         rc = self.rc()
         rc.cache.store[rc._snap_key("h1")] = TOMBSTONE
         rows = [_Row("h1", make_tenant()), _Row("h2", make_tenant(schema_name="beta"))]
@@ -200,7 +201,7 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertEqual(rc.cache.store[rc._snap_key("h1")], TOMBSTONE)
         self.assertIsInstance(rc.cache.store[rc._snap_key("h2")], dict)
 
-    def test_warm_force_overwrites_everything(self):
+    def test_warm_force_overwrites_everything(self) -> None:
         rc = self.rc()
         rc.cache.store[rc._snap_key("h1")] = TOMBSTONE
         rows = [_Row("h1", make_tenant()), _Row("h2", make_tenant())]
@@ -211,7 +212,7 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertIsInstance(rc.cache.store[rc._snap_key("h1")], dict)  # tombstone overwritten
         self.assertIsInstance(rc.cache.store[rc._snap_key("h2")], dict)
 
-    def test_warm_writes_schema_snaps_deduped_per_tenant(self):
+    def test_warm_writes_schema_snaps_deduped_per_tenant(self) -> None:
         """warm() must keep BOTH namespaces in lockstep, like put() and reconcile: host-only
         warming left the WORKER cache (get_schema_snapshot) cold after a 'successful' warm.
         One schema-snap per DISTINCT tenant — two domains of one tenant must not cost two."""
@@ -227,7 +228,7 @@ class TenantResolveCacheTests(SimpleTestCase):
             ["schema-snap:alpha", "schema-snap:beta"],
         )
 
-    def test_warm_nx_writes_schema_snaps_too(self):
+    def test_warm_nx_writes_schema_snaps_too(self) -> None:
         rc = self.rc()
         rows = [_Row("a.com", make_tenant(schema_name="alpha"))]
         with mock.patch("tenants.models.Domain") as D:
@@ -237,7 +238,7 @@ class TenantResolveCacheTests(SimpleTestCase):
 
     # --- warm: the WARM-stage guard ---
     @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True})
-    def test_warm_refuses_under_warm_stage(self):
+    def test_warm_refuses_under_warm_stage(self) -> None:
         """warm() writes positives WITHOUT building treg:hosts, so under WARM it must refuse
         rather than silently half-warm the cache. Both branches (nx and force) are covered:
         neither builds the SET."""
@@ -248,7 +249,7 @@ class TenantResolveCacheTests(SimpleTestCase):
 
     @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True},
                        TENANT_RESOLVE={"POSITIVE_CACHE_SECONDS": 0})
-    def test_warm_guard_precedes_the_positive_ttl_early_return(self):
+    def test_warm_guard_precedes_the_positive_ttl_early_return(self) -> None:
         """WARM on + flat TTL disabled is a VALID config (see the `enabled` property) and the
         worst one to get wrong: if the guard sat after the `_pos_ttl` early-return, this call
         would swallow the misuse as a silent `return 0`."""
@@ -256,18 +257,18 @@ class TenantResolveCacheTests(SimpleTestCase):
             self.rc().warm()
 
     # --- health / raise_on_error ---
-    def test_raise_on_error_raises_when_down(self):
+    def test_raise_on_error_raises_when_down(self) -> None:
         rc = self.rc()
         with mock.patch.object(rc, "redis_alive", return_value=False):
             with self.assertRaises(CacheUnavailable):
                 rc.forget_all(raise_on_error=True)
 
-    def test_no_raise_when_alive(self):
+    def test_no_raise_when_alive(self) -> None:
         rc = self.rc()
         with mock.patch.object(rc, "redis_alive", return_value=True):
             rc.forget_all(raise_on_error=True)         # must not raise
 
-    def test_raise_on_error_honored_for_empty_target(self):
+    def test_raise_on_error_honored_for_empty_target(self) -> None:
         rc = self.rc()
         with mock.patch.object(rc, "redis_alive", return_value=False):
             with self.assertRaises(CacheUnavailable):
@@ -278,7 +279,7 @@ class TenantDeleteSignalTests(SimpleTestCase):
     """The Tenant post_delete receiver drops the schema-snap deterministically by schema_name
     (the domains — and their host-snaps — are already gone via the cascade)."""
 
-    def test_post_delete_drops_schema_snapshot(self):
+    def test_post_delete_drops_schema_snapshot(self) -> None:
         from tenants import signals
         inst = mock.Mock(schema_name="gamma")
         with mock.patch.object(signals.resolve_cache, "forget_schemas") as fs:

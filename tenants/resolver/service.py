@@ -7,12 +7,14 @@ fail-open fallback. The HTTP middleware only supplies a DB-resolver closure and 
 """
 import logging
 import time
+from collections.abc import Callable
 
 from django.db import OperationalError
 from redis.exceptions import RedisError
 
 from .cache import resolve_cache
 from .registry import host_registry
+from .snapshot import TenantSnapshot
 from .throttle import fill_cap, single_flight
 
 logger = logging.getLogger(__name__)
@@ -43,7 +45,7 @@ class ResolveDeferred(Exception):
     """
 
 
-def _log_cache_fail(hostname):
+def _log_cache_fail(hostname: str) -> None:
     """EXPECTED infra failure (Redis down/slow): quiet-ish WARNING, rate-limited. Fail-open is
     correct — the DB resolve returns the right tenant."""
     global _fail_last, _fail_suppressed
@@ -57,7 +59,7 @@ def _log_cache_fail(hostname):
         _fail_suppressed += 1
 
 
-def _log_cache_bug(hostname):
+def _log_cache_bug(hostname: str) -> None:
     """UNEXPECTED error = a BUG in the cache/gate path (infra is already handled: the wrapped
     cache masks Redis-down to a miss, and the gate catches RedisError). We STILL fail open —
     the DB resolve is correct, so a cache-layer bug must not 500 the request — but we log LOUD
@@ -73,7 +75,7 @@ def _log_cache_bug(hostname):
         _bug_suppressed += 1
 
 
-def _log_shed(hostname):
+def _log_shed(hostname: str) -> None:
     """Load-shed on the flag-absent branch. Sustained shedding means the registry SET is
     missing (or its Redis is down) under real traffic - an operational signal, not a
     per-request event, so it is rate-limited like the two helpers above. No exc_info: there
@@ -89,7 +91,8 @@ def _log_shed(hostname):
         _shed_suppressed += 1
 
 
-def resolve(hostname, db_resolver, not_found):
+def resolve(hostname: str, db_resolver: Callable[[], TenantSnapshot],
+            not_found: type[Exception]) -> TenantSnapshot:
     """Resolve a Host to a Tenant. ``db_resolver()`` is the authoritative DB lookup
     (returns a Tenant or raises ``not_found``). Returns the Tenant, or raises
     ``not_found`` (unknown host) / ``ResolveDeferred`` (declined to look — load-shed) /
@@ -124,7 +127,8 @@ def resolve(hostname, db_resolver, not_found):
         return db_resolver()
 
 
-def _via_cache(hostname, db_resolver, not_found):
+def _via_cache(hostname: str, db_resolver: Callable[[], TenantSnapshot],
+               not_found: type[Exception]) -> TenantSnapshot:
     snap = resolve_cache.get_snapshot(hostname)
     if snap is resolve_cache.NEG:
         raise not_found(hostname)                   # cached miss — no DB
@@ -147,7 +151,8 @@ def _via_cache(hostname, db_resolver, not_found):
     return single_flight(hostname, lambda: _fill(hostname, db_resolver, not_found))
 
 
-def _fill(hostname, db_resolver, not_found):
+def _fill(hostname: str, db_resolver: Callable[[], TenantSnapshot],
+          not_found: type[Exception]) -> TenantSnapshot:
     try:
         tenant = db_resolver()
     except not_found:

@@ -24,12 +24,19 @@ Import rule: project code imports these from `tenants.context`, never from
 `django_tenants.utils`. TenantsConfig.ready() additionally monkeypatches the
 upstream module so late importers get these versions too.
 """
+from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any
 
 from django.db import connections
 from django_tenants.utils import get_public_schema_name
+
+if TYPE_CHECKING:                       # annotation-only: keeps this module free of the
+    from .models import Tenant          # lazy-import cycle its runtime code avoids
+    from .resolver import TenantSnapshot
 
 # default=None is the SENTINEL for "no routing context established" (distinct from an
 # explicit alias of "default"). Only middleware / use_alias / _switch set a real alias; when
@@ -39,14 +46,14 @@ from django_tenants.utils import get_public_schema_name
 current_db: ContextVar = ContextVar("current_db", default=None)
 
 
-def active_alias():
+def active_alias() -> str:
     """EFFECTIVE alias, for readers that only need somewhere to look: the bound alias, or
     "default" when no routing context is established (compat, diagnostics). It COALESCES the
     unset state — do not use it where that distinction matters; use bound_alias()."""
     return current_db.get() or "default"
 
 
-def bound_alias():
+def bound_alias() -> str | None:
     """The alias explicitly BOUND to this context, or None when none is established.
 
     That None is load-bearing and must not be collapsed: it is what lets TenantDatabaseRouter
@@ -59,7 +66,7 @@ def bound_alias():
 
 
 @contextmanager
-def use_alias(alias: str):
+def use_alias(alias: str) -> Iterator[None]:
     """Set current_db for the duration of the with-block (no schema change).
 
     Use when the code manages the schema itself (e.g. raw cursors, DBA flows).
@@ -72,7 +79,7 @@ def use_alias(alias: str):
 
 
 @contextmanager
-def _switch(database, apply_to):
+def _switch(database: str, apply_to: Callable[[Any], None]) -> Iterator[None]:
     """Shared reentrancy-safe core of tenant_context / schema_context.
 
     axis 1: current_db -> `database` (read by TenantDatabaseRouter);
@@ -98,7 +105,7 @@ def _switch(database, apply_to):
 
 
 @contextmanager
-def tenant_context(tenant, database=None):
+def tenant_context(tenant: Tenant | TenantSnapshot, database: str | None = None) -> Iterator[None]:
     """Drop-in replacement for django_tenants' tenant_context (shard-aware).
 
     Wires BOTH axes: current_db -> the tenant's shard, and the tenant schema on that
@@ -109,7 +116,7 @@ def tenant_context(tenant, database=None):
 
 
 @contextmanager
-def schema_context(schema_name, database=None):
+def schema_context(schema_name: str, database: str | None = None) -> Iterator[None]:
     """Drop-in replacement for django_tenants' schema_context (shard-aware).
 
     Resolves WHICH database to target from the tenant registry (schema_name ->
@@ -122,7 +129,7 @@ def schema_context(schema_name, database=None):
         yield
 
 
-def _resolve_database(schema_name, database):
+def _resolve_database(schema_name: str, database: str | None) -> str:
     """WHICH database a schema lives on: explicit `database` wins; `public` -> 'default';
     else the tenant registry (schema_name -> Tenant.shard.alias)."""
     if database:

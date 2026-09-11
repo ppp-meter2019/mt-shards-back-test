@@ -6,10 +6,10 @@ operator tooling. Everything else that used to be in this module — the Shard /
 ReservedHostRule viewsets and the base-domains list — moved to `tenants/console/views.py`;
 see tenants/console/__init__.py for the boundary and why it is a subpackage.
 """
-from django.http import HttpResponse
+from django.http import HttpRequest, HttpResponse
 
 
-def health(request):
+def health(request: HttpRequest) -> HttpResponse:
     """Liveness probe for ALB target-group health checks.
 
     In practice this path is answered earlier by ShardAwareTenantMiddleware

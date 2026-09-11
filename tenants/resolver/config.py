@@ -8,6 +8,8 @@ present in the user's dict wins; otherwise the DEFAULTS value is returned. The f
 (flags.py) reads WARM_ENABLED/GATE_ENABLED through registry_cfg; the E001 system check reads
 the raw dict itself (it must see a GATE-on/WARM-off misconfig that fail-safe hides).
 """
+from typing import Any
+
 from django.conf import settings
 
 RESOLVE_DEFAULTS = {
@@ -33,11 +35,11 @@ REGISTRY_DEFAULTS = {
 class _Namespace:
     """Attribute view over one settings dict, merged per-key over DEFAULTS (live)."""
 
-    def __init__(self, setting_name, defaults):
+    def __init__(self, setting_name: str, defaults: dict[str, Any]) -> None:
         self._setting_name = setting_name
         self._defaults = defaults
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         # __getattr__ only fires for names NOT found normally. Underscore names (dunder
         # probes from copy/pickle, or an access before __init__ populated _defaults) must
         # raise immediately — WITHOUT touching self._defaults, or that touch would itself

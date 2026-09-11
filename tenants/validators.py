@@ -26,10 +26,16 @@ The middle one is deliberately far more permissive than the first: the first is 
 CONVENTION for new names, the second is the SAFETY floor for values that may predate it
 (a data migration out of the legacy single-tenant estate, a manual INSERT).
 """
+from __future__ import annotations
+
 import re
+from typing import TYPE_CHECKING
 
 from django.core.exceptions import ValidationError
 from django_tenants.utils import get_public_schema_name
+
+if TYPE_CHECKING:                       # annotation-only: models are imported lazily below
+    from .models import ReservedHostRule
 
 # A single DNS label: ASCII letters/digits/hyphen, 1-63 chars, no leading/trailing
 # hyphen. Bounded quantifier, no nesting => LINEAR match, zero backtracking surface.
@@ -112,7 +118,7 @@ def _public_hosts() -> set:
     )
 
 
-def matching_rule(host: str):
+def matching_rule(host: str) -> ReservedHostRule | None:
     """Return the first active ReservedHostRule that reserves `host`, or None.
 
     Called only on the (rare) tenant/domain create path, so a per-call scan of the

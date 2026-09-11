@@ -10,13 +10,16 @@ Import these from application / business code INSTEAD of importing `tenants` (or
 In standalone the `tenants` app is not installed, so this module must NOT import it
 there — hence the branch. Business code stays import-clean and works in both modes.
 """
+from collections.abc import Iterator
+from typing import Any
+
 from django.conf import settings
 
 if settings.USE_MULTITENANT:
     from django_tenants.utils import get_public_schema_name
     from tenants.context import schema_context, tenant_context, use_alias
 
-    def active_target_schemas(scope="tenants"):
+    def active_target_schemas(scope: str = "tenants") -> list[str]:
         """ACTIVE tenant schemas for the interval fanout (excludes the public schema).
 
         Read from default.public in one query. Used by tenants.tasks.fanout_dispatch;
@@ -28,7 +31,7 @@ if settings.USE_MULTITENANT:
             .values_list("schema_name", flat=True)
         )
 
-    def active_tenants_with_tz():
+    def active_tenants_with_tz() -> list[tuple[str, str]]:
         """(schema, timezone) for ACTIVE tenants that HAVE a configured tz — the calendar
         (tz) fanout targets. Excludes public and NULL-tz tenants (the latter are skipped
         until their in-schema singleton sets a timezone). One query from default.public."""
@@ -42,26 +45,26 @@ else:
     from contextlib import contextmanager
 
     @contextmanager
-    def schema_context(*args, **kwargs):
+    def schema_context(*args: Any, **kwargs: Any) -> Iterator[None]:
         # No schemas in standalone — run the body against the single default DB.
         yield
 
     @contextmanager
-    def tenant_context(*args, **kwargs):
+    def tenant_context(*args: Any, **kwargs: Any) -> Iterator[None]:
         yield
 
     @contextmanager
-    def use_alias(*args, **kwargs):
+    def use_alias(*args: Any, **kwargs: Any) -> Iterator[None]:
         yield
 
-    def get_public_schema_name():
+    def get_public_schema_name() -> str:
         return "public"
 
-    def active_target_schemas(scope="tenants"):
+    def active_target_schemas(scope: str = "tenants") -> list[str]:
         # No tenants in standalone; the fanout dispatcher is not used here.
         return []
 
-    def active_tenants_with_tz():
+    def active_tenants_with_tz() -> list[tuple[str, str]]:
         return []
 
 

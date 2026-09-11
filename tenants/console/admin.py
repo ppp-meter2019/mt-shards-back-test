@@ -9,13 +9,17 @@ Models that exist in both schemas (User) are registered on BOTH sites;
 models that only exist in one schema are registered only where they live.
 """
 
+from typing import Any
+
 from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
 from django.contrib.admin import AdminSite
 from django.contrib.auth.admin import GroupAdmin
 from django.contrib.auth.models import Group
+from django.db.models import QuerySet
 from django.db.models.deletion import ProtectedError
+from django.http import HttpRequest, HttpResponse
 from django_tenants.admin import TenantAdminMixin
 from django_tenants.utils import get_public_schema_name
 
@@ -42,7 +46,7 @@ class ShardAdminForm(forms.ModelForm):
         model = Shard
         fields = ["alias", "name", "is_default", "is_active"]
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         used = set(Shard.objects.exclude(pk=self.instance.pk).values_list("alias", flat=True))
         available = [a for a in settings.DATABASES if a not in used]
@@ -54,7 +58,7 @@ class ShardAdminForm(forms.ModelForm):
             help_text="Database alias declared in settings.DATABASES at startup.",
         )
 
-    def clean_is_default(self):
+    def clean_is_default(self) -> bool:
         """At most one default shard. The DB constraint also enforces this."""
         is_default = self.cleaned_data.get("is_default")
         if is_default:
@@ -72,10 +76,11 @@ class ShardAdmin(admin.ModelAdmin):
     list_filter  = ("is_default", "is_active")
 
     @admin.display(description="Tenants")
-    def tenant_count(self, obj):
+    def tenant_count(self, obj: Shard) -> int:
         return obj.tenants.count()
 
-    def changelist_view(self, request, extra_context=None):
+    def changelist_view(self, request: HttpRequest,
+                        extra_context: dict[str, Any] | None = None) -> HttpResponse:
         """Hint admins about aliases in settings.DATABASES that aren't yet registered."""
         registered = set(Shard.objects.values_list("alias", flat=True))
         missing = [a for a in settings.DATABASES if a not in registered]
@@ -89,13 +94,13 @@ class ShardAdmin(admin.ModelAdmin):
         return super().changelist_view(request, extra_context=extra_context)
 
     # Friendly UX for ProtectedError on delete (shard with tenants or default shard).
-    def delete_model(self, request, obj):
+    def delete_model(self, request: HttpRequest, obj: Shard) -> None:
         try:
             super().delete_model(request, obj)
         except ProtectedError:
             self.message_user(request, self._explain_protected(obj), level=messages.ERROR)
 
-    def delete_queryset(self, request, queryset):
+    def delete_queryset(self, request: HttpRequest, queryset: QuerySet) -> None:
         for obj in queryset:
             try:
                 obj.delete()
@@ -103,7 +108,7 @@ class ShardAdmin(admin.ModelAdmin):
                 self.message_user(request, self._explain_protected(obj), level=messages.ERROR)
 
     @staticmethod
-    def _explain_protected(shard):
+    def _explain_protected(shard: Shard) -> str:
         if shard.is_default:
             return (f"Shard '{shard.alias}' is the default shard and cannot be deleted. "
                     f"It is reserved for the public schema.")
@@ -127,7 +132,7 @@ class TenantAdminForm(forms.ModelForm):
         model = Tenant
         fields = "__all__"
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         instance = kwargs.get("instance") or self.instance
         public = get_public_schema_name()
@@ -168,7 +173,8 @@ class TenantAdmin(TenantAdminMixin, admin.ModelAdmin):
     search_fields   = ("company_name", "schema_name")
     readonly_fields = ("previous_status", "status_changed_at", "last_error", "created_on")
 
-    def get_readonly_fields(self, request, obj=None):
+    def get_readonly_fields(self, request: HttpRequest,
+                            obj: Tenant | None = None) -> list[str]:
         """schema_name maps to a physical PG schema — immutable once created. Read-only
         on the change form; still settable on the add form."""
         ro = list(super().get_readonly_fields(request, obj))
@@ -182,13 +188,13 @@ class TenantAdmin(TenantAdminMixin, admin.ModelAdmin):
     # snapshot is not. Beat needs no signal at all: the fanout dispatcher reads the
     # ACTIVE-tenant set fresh each tick. (status_changed_at is stamped by Tenant.save().)
 
-    def delete_model(self, request, obj):
+    def delete_model(self, request: HttpRequest, obj: Tenant) -> None:
         try:
             super().delete_model(request, obj)
         except ProtectedError:
             self.message_user(request, self._explain_protected(obj), level=messages.ERROR)
 
-    def delete_queryset(self, request, queryset):
+    def delete_queryset(self, request: HttpRequest, queryset: QuerySet) -> None:
         for obj in queryset:
             try:
                 obj.delete()
@@ -196,7 +202,7 @@ class TenantAdmin(TenantAdminMixin, admin.ModelAdmin):
                 self.message_user(request, self._explain_protected(obj), level=messages.ERROR)
 
     @staticmethod
-    def _explain_protected(tenant):
+    def _explain_protected(tenant: Tenant) -> str:
         if tenant.schema_name == get_public_schema_name():
             return ("The public tenant cannot be deleted - it is a system record "
                     "required for django-tenants to operate on the public host.")

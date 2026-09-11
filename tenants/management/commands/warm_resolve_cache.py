@@ -12,7 +12,10 @@ GATE-AWARE — a single entry point so an operator can't run the wrong warm:
 Fails loudly (CommandError) if Redis is unreachable — even under IGNORE_EXCEPTIONS,
 so a "warm" that silently did nothing can't pass for success.
 """
-from django.core.management.base import CommandError
+
+from typing import Any
+
+from django.core.management.base import CommandError, CommandParser
 
 from commons.platform.commands import TenantCommand
 
@@ -22,7 +25,7 @@ from tenants.resolver import CacheUnavailable, flags, resolve_cache
 class Command(TenantCommand):
     help = "Preload / rebuild the tenant-resolution cache (reconcile when the gate is on)."
 
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument(
             "--force", action="store_true",
             help='Hard reload (overwrite all); default fills only absent entries. '
@@ -30,7 +33,7 @@ class Command(TenantCommand):
                  'force-overwrites).',
         )
 
-    def handle(self, *args, **opts):
+    def handle(self, *args: Any, **opts: Any) -> None:
         if not resolve_cache.redis_alive():
             raise CommandError("tenant_resolve Redis is not reachable")
 

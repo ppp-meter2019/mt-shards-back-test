@@ -4,12 +4,13 @@ These tests only run in USE_MULTITENANT=True (the `tenants` app must be installe
 for its test suite to be discovered), which is exactly the mode the invariants
 apply to.
 """
+from collections.abc import Sequence
 from django.conf import settings
 from django.test import SimpleTestCase
 
 
 class InstalledAppsInvariantTests(SimpleTestCase):
-    def test_tenants_before_django_tenants(self):
+    def test_tenants_before_django_tenants(self) -> None:
         """'tenants' MUST precede 'django_tenants' so our management commands
         (notably migrate_schemas) override the upstream ones — the app listed
         FIRST wins on a command-name collision. See settings_multitenant.py SHARED_APPS."""
@@ -23,7 +24,7 @@ class InstalledAppsInvariantTests(SimpleTestCase):
             "(command-override precedence).",
         )
 
-    def test_installed_apps_are_deduplicated(self):
+    def test_installed_apps_are_deduplicated(self) -> None:
         """django-tenants requires INSTALLED_APPS to be the de-duplicated union
         of SHARED_APPS + TENANT_APPS."""
         apps = list(settings.INSTALLED_APPS)
@@ -44,14 +45,14 @@ class MiddlewareInvariantTests(SimpleTestCase):
         "users.middleware.SchemaBoundSessionMiddleware",
     )
 
-    def _assert_ordered(self, mw, chain):
+    def _assert_ordered(self, mw: list[str], chain: Sequence[str]) -> None:
         idx = []
         for name in chain:
             self.assertIn(name, mw, f"{name} missing from MIDDLEWARE")
             idx.append(mw.index(name))
         self.assertEqual(idx, sorted(idx), f"{chain} out of order in MIDDLEWARE")
 
-    def test_resolved_middleware_chains(self):
+    def test_resolved_middleware_chains(self) -> None:
         """The base list + MT inserts land in the required relative order."""
         mw = list(settings.MIDDLEWARE)
         self._assert_ordered(mw, self.RESOLVE_CHAIN)
@@ -71,14 +72,14 @@ class MiddlewareInvariantTests(SimpleTestCase):
         "django.middleware.clickjacking.XFrameOptionsMiddleware",
     )
 
-    def test_base_middleware_flows_into_mt(self):
+    def test_base_middleware_flows_into_mt(self) -> None:
         """Delta build (not rewrite): every standalone-base middleware is still present
         in the MT list, so a base addition can't be silently dropped from MT."""
         mw = set(settings.MIDDLEWARE)
         for name in self.BASE_MIDDLEWARE:
             self.assertIn(name, mw, f"base middleware {name} missing from MT MIDDLEWARE")
 
-    def test_e004_flags_missing_and_misordered(self):
+    def test_e004_flags_missing_and_misordered(self) -> None:
         """The tenants.E004 check fires on a missing entry and on a swapped order."""
         from tenants.checks import mt_middleware_order
         good = list(settings.MIDDLEWARE)
@@ -105,18 +106,18 @@ class BootstrapFloatTests(SimpleTestCase):
 
     KNOB = "FANOUT_TEST_KNOB_XYZ"   # a name nothing sets in env or settings_mode.py
 
-    def test_default_when_absent(self):
+    def test_default_when_absent(self) -> None:
         from commons.platform.mode import bootstrap_float
         self.assertEqual(bootstrap_float(self.KNOB, 60.0), 60.0)
 
-    def test_env_override_wins(self):
+    def test_env_override_wins(self) -> None:
         import os
         from unittest import mock
         from commons.platform.mode import bootstrap_float
         with mock.patch.dict(os.environ, {self.KNOB: "30"}):
             self.assertEqual(bootstrap_float(self.KNOB, 60.0), 30.0)
 
-    def test_malformed_env_fails_loud(self):
+    def test_malformed_env_fails_loud(self) -> None:
         import os
         from unittest import mock
         from commons.platform.mode import bootstrap_float
@@ -143,7 +144,7 @@ class SettingsLocalContractTests(SimpleTestCase):
     cannot drift: add an import there and this test starts requiring it.
     """
 
-    def _example_imports(self):
+    def _example_imports(self) -> list[str]:
         import ast
         example = (settings.BASE_DIR / "tenants_back" / "settings_local.py.example")
         self.assertTrue(example.exists(), "settings_local.py.example is missing")
@@ -154,7 +155,7 @@ class SettingsLocalContractTests(SimpleTestCase):
             for alias in node.names
         ]
 
-    def test_dispatcher_exports_everything_the_example_imports(self):
+    def test_dispatcher_exports_everything_the_example_imports(self) -> None:
         import tenants_back.settings as dispatcher
         names = self._example_imports()
         self.assertTrue(names, "the example no longer imports from .settings — update this test")
@@ -168,7 +169,7 @@ class SettingsLocalContractTests(SimpleTestCase):
                     f"settings_local.py will fail to load SILENTLY.",
                 )
 
-    def test_underscore_helpers_are_re_exported(self):
+    def test_underscore_helpers_are_re_exported(self) -> None:
         """Belt and braces: these two are what actually broke, and the example may not cover
         both (the deployed file imports _proxy_db_options; the example currently does not)."""
         import tenants_back.settings as dispatcher

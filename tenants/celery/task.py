@@ -7,7 +7,13 @@ schema is read from the ACTIVE shard connection, not `default`. The actual
 switch/restore happens per-invocation in TenantTask.__call__.
 """
 import copy
-from typing import Optional
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Optional
+
+from celery import Task
+
+if TYPE_CHECKING:                       # annotation-only: tenants.models / .resolver are
+    from tenants.resolver import TenantSnapshot   # imported lazily inside _db_get
 
 from .cache import SimpleCache
 from .compat import current_schema_name, get_public_schema_name, tenant_context, use_alias
@@ -23,7 +29,7 @@ _shared_storage = {}
 
 
 class SharedTenantCache(SimpleCache):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(storage=_shared_storage)
 
 
@@ -36,7 +42,7 @@ def headers_with_schema(headers: Optional[dict]) -> dict:
     return headers
 
 
-def _schema_from_request(task):
+def _schema_from_request(task: Task) -> str | None:
     """Read _schema_name from the task message (headers, or merged request). Empty on a bare
     in-process call `task(...)` (no request was pushed) — TenantTask.__call__ handles that."""
     req = task.request
@@ -49,7 +55,7 @@ class TenantTask(BaseTask):
     abstract = True
     tenant_cache_seconds = None
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Enter the tenant's shard+schema for EXACTLY this invocation; the context manager's
         finally restores it whether the task returns OR raises, and regardless of worker pool.
         It has to be one with-block here rather than a task_prerun/task_postrun pair: two
@@ -72,11 +78,11 @@ class TenantTask(BaseTask):
             return super().__call__(*args, **kwargs)
 
     @classmethod
-    def tenant_cache(cls):
+    def tenant_cache(cls) -> SharedTenantCache:
         return SharedTenantCache()
 
     @classmethod
-    def get_tenant_for_schema(cls, schema_name):
+    def get_tenant_for_schema(cls, schema_name: str) -> "TenantSnapshot":
         """Resolve schema -> Tenant(+shard), minimizing default-DB load. Order:
           1. GLOBAL shared cache (schema-snap — the INVALIDATED one) — authoritative when up,
              so all workers route on fresh data. A HOLD (active invalidation) skips straight to
@@ -113,14 +119,14 @@ class TenantTask(BaseTask):
         return tenant
 
     @classmethod
-    def _l1_seconds(cls):
+    def _l1_seconds(cls) -> int:
         s = cls.tenant_cache_seconds
         if s is None:
             s = int(getattr(cls.app.conf, "task_tenant_cache_seconds", 0) or 0)
         return s
 
     @classmethod
-    def _db_get(cls, schema_name):
+    def _db_get(cls, schema_name: str) -> "TenantSnapshot":
         """Authoritative DB resolve (no cache writes of any kind).
 
         Narrowed to the routing snapshot for the same reason as the request path: the two
@@ -132,6 +138,7 @@ class TenantTask(BaseTask):
         return TenantSnapshot.capture(
             Tenant.objects.select_related("shard").get(schema_name=schema_name))
 
-    def apply(self, args=None, kwargs=None, *a, **kw):     # eager / ALWAYS_EAGER
+    def apply(self, args: Sequence[Any] | None = None, kwargs: dict[str, Any] | None = None,
+              *a: Any, **kw: Any) -> Any:     # eager / ALWAYS_EAGER
         kw["headers"] = headers_with_schema(kw.get("headers") or {})
         return super().apply(args, kwargs, *a, **kw)

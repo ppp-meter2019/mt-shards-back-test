@@ -25,7 +25,10 @@ NOT frozen, deliberately: django_tenants' TenantMainMiddleware assigns
 runtime. It is per-REQUEST and must never be cached — see _SNAPSHOT_FIELDS.
 """
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Union
+
+if TYPE_CHECKING:                       # annotation-only: the model must not be imported here
+    from tenants.models import Tenant   # (this module is what replaces it on the hot path)
 
 
 @dataclass
@@ -66,7 +69,7 @@ class TenantSnapshot:
     domain_url: Optional[str] = None
 
     @classmethod
-    def capture(cls, tenant) -> "TenantSnapshot":
+    def capture(cls, tenant: Union["Tenant", "TenantSnapshot"]) -> "TenantSnapshot":
         """Take the routing snapshot of a Tenant.
 
         Idempotent on a snapshot: TenantTask.get_tenant_for_schema returns either a cached

@@ -19,6 +19,7 @@ Maintained by Domain signals (SADD/SREM + arm) and the reconcile task (force-reb
 Everything is gated by TENANT_REGISTRY["WARM_ENABLED"] / ["GATE_ENABLED"] — a no-op until on.
 """
 import logging
+from typing import Any
 
 from redis.exceptions import LockError, RedisError
 
@@ -47,11 +48,11 @@ class HostRegistry:
     UNKNOWN = object()
 
     @property
-    def warm_enabled(self):
+    def warm_enabled(self) -> bool:
         return flags.warm_enabled()
 
     @property
-    def gate_enabled(self):
+    def gate_enabled(self) -> bool:
         # Fail-safe (GATE effective only with WARM) lives in flags.gate_enabled(): WARM is
         # the write side that builds treg:hosts; GATE-without-WARM would make every resolve
         # UNKNOWN -> fail-open + fill_cap-throttle legit traffic, so it is treated as OFF in
@@ -59,7 +60,7 @@ class HostRegistry:
         return flags.gate_enabled()
 
     # ---- read (gate) ----
-    def check(self, hostname):
+    def check(self, hostname: str) -> object:
         """MEMBER | NONMEMBER | UNKNOWN. UNKNOWN => fail-open (SET absent or Redis error)."""
         try:
             c = resolve_cache.get_redis_raw_client()
@@ -75,7 +76,7 @@ class HostRegistry:
 
     # ---- incremental maintenance (Domain signals; WARM only) ----
     @staticmethod
-    def _apply_membership(op, hostname):
+    def _apply_membership(op: str, hostname: str) -> None:
         c = resolve_cache.get_redis_raw_client()
         if op == "sadd":
             # Lua-free guard: never build the SET incrementally — only reconcile (via RENAME)
@@ -94,7 +95,7 @@ class HostRegistry:
         pipe.expire(DIRTY_KEY, _DIRTY_TTL_SECONDS, nx=True)
         pipe.execute()
 
-    def add(self, hostname):
+    def add(self, hostname: str) -> None:
         if not self.warm_enabled:
             return
         try:
@@ -102,7 +103,7 @@ class HostRegistry:
         except RedisError:
             logger.warning("host_registry.add failed for %r", hostname, exc_info=True)
 
-    def remove(self, hostname):
+    def remove(self, hostname: str) -> None:
         if not self.warm_enabled:
             return
         try:
@@ -110,7 +111,7 @@ class HostRegistry:
         except RedisError:
             logger.warning("host_registry.remove failed for %r", hostname, exc_info=True)
 
-    def arm(self):
+    def arm(self) -> None:
         """Dead-man switch: give treg:hosts a short TTL so a failed follow-up reconcile
         self-heals (key expires → gate fails open → re-warm on next miss)."""
         if not self.warm_enabled:
@@ -122,7 +123,7 @@ class HostRegistry:
             logger.warning("host_registry.arm failed", exc_info=True)
 
     # ---- on-demand warm trigger ----
-    def trigger_warm(self):
+    def trigger_warm(self) -> None:
         """Enqueue a reconcile, coalescing bursts via a short SELF-EXPIRING NX marker
         (`treg:warm_pending`). One-sided lifecycle: only set-with-expiry here, never
         deleted elsewhere — so a lost broker publish self-heals when the marker expires,
@@ -143,7 +144,7 @@ class HostRegistry:
             logger.warning("host_registry.trigger_warm failed", exc_info=True)
 
     # ---- single-writer entry point (used by the celery task / mgmt command) ----
-    def run_locked(self):
+    def run_locked(self) -> int | None:
         """Acquire the treg:warming lock, reconcile, release. Returns the number of
         positives written, or None if another writer holds the lock (or WARM is off).
 
@@ -172,7 +173,7 @@ class HostRegistry:
             # trigger set, and the marker never gated correctness (dirty-recheck does).
 
     # ---- reconcile (force-rebuild; the warm task body, single writer) ----
-    def reconcile(self):
+    def reconcile(self) -> int:
         """Force-rebuild `treg:hosts` + positive snapshots from the DB. The caller holds
         the treg:warming lock. Positive snapshots are FORCE-overwritten in place with fresh
         data (ttl_by_status) via put_many — the 5s hold is NOT respected here (reconcile is
@@ -200,12 +201,12 @@ class HostRegistry:
     _REBUILD_CHUNK = 2000
 
     @staticmethod
-    def _rebuild_once(c):
+    def _rebuild_once(c: Any) -> tuple[int, set[str]]:
         from tenants.models import Domain
         c.delete(HOSTS_NEW_KEY)
         db_hosts, n, batch = set(), 0, []
 
-        def flush():
+        def flush() -> None:
             nonlocal n
             if not batch:
                 return

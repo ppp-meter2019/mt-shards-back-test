@@ -23,8 +23,10 @@ ALB (single origin) the CORS layer is bypassed and this header is harmless.
 import os
 import socket
 import threading
+from collections.abc import Callable
 
 from asgiref.sync import iscoroutinefunction, markcoroutinefunction
+from django.http import HttpRequest, HttpResponse
 
 from .context import active_alias
 
@@ -48,23 +50,23 @@ class DiagnosticsHeadersMiddleware:
     sync_capable  = True
     async_capable = True
 
-    def __init__(self, get_response):
+    def __init__(self, get_response: Callable[[HttpRequest], HttpResponse]) -> None:
         self.get_response = get_response
         self._is_async = iscoroutinefunction(get_response)
         if self._is_async:
             markcoroutinefunction(self)
 
-    def __call__(self, request):
+    def __call__(self, request: HttpRequest) -> HttpResponse:
         if self._is_async:
             return self.__acall__(request)
         return self._stamp(self.get_response(request))
 
-    async def __acall__(self, request):
+    async def __acall__(self, request: HttpRequest) -> HttpResponse:
         response = await self.get_response(request)
         return self._stamp(response)
 
     @staticmethod
-    def _stamp(response):
+    def _stamp(response: HttpResponse) -> HttpResponse:
         response["X-Served-By"]  = _HOSTNAME
         response["X-Worker-Pid"] = str(os.getpid())
         response["X-Thread-Id"]  = str(threading.get_ident())

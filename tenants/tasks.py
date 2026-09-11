@@ -21,6 +21,8 @@ The generic fan-out scheduler infrastructure (fanout_dispatch / sub_dispatch / t
 due-check) lives in tenants/celery/dispatch.py — imported at the bottom of THIS module so
 Celery autodiscover (which imports `<app>.tasks`) registers those tasks too.
 """
+from typing import Any
+
 from celery import Task, shared_task
 from celery.utils.log import get_task_logger
 from django.core.management import call_command
@@ -33,7 +35,7 @@ logger = get_task_logger(__name__)
 
 
 @shared_task(bind=True, queue=task_queue("service"), acks_late=True, max_retries=0)
-def provision_tenant(self, tenant_id):
+def provision_tenant(self, tenant_id: int) -> dict[str, Any]:
     tenant = Tenant.objects.select_related("shard").get(pk=tenant_id)
 
     if tenant.status != Tenant.Status.NEW:
@@ -55,7 +57,7 @@ def provision_tenant(self, tenant_id):
 
 
 @shared_task(queue=task_queue("service"), acks_late=True, max_retries=0)
-def drop_tenant_schema_task(database, schema):
+def drop_tenant_schema_task(database: str, schema: str) -> dict[str, Any]:
     """Drop an orphaned tenant schema on `database` (shard alias).
 
     Enqueued by the tenant DELETE flow when the operator ticks "also drop the
@@ -84,7 +86,7 @@ def drop_tenant_schema_task(database, schema):
 # treg:warm_pending NX marker in trigger_warm). Spelled out via task_queue() rather than left
 # to CELERY_TASK_DEFAULT_QUEUE so the choice is visible — it reads like an omission otherwise.
 @shared_task(base=Task, queue=task_queue("fast"), acks_late=True, max_retries=0)
-def reconcile_host_registry_task():
+def reconcile_host_registry_task() -> dict[str, Any]:
     from tenants.resolver import host_registry
     return {"reconciled": host_registry.run_locked()}
 

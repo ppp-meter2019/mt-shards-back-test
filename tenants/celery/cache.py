@@ -5,14 +5,15 @@ This is the WORKER-LOCAL (per-process) L1 in the schema-resolution tiering
 (global schema-snap → this L1 → DB); see tenants.celery.task.get_tenant_for_schema.
 """
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 
-def _now():
+def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 class _CacheEntry:
-    def __init__(self, key, value, expires_at):
+    def __init__(self, key: str, value: Any, expires_at: datetime) -> None:
         self.key, self.value, self.expires_at = key, value, expires_at
 
 
@@ -23,10 +24,10 @@ class SimpleCache:
     # is shared per worker process, so this size trigger works across the per-call instances.
     _PURGE_AT = 1024
 
-    def __init__(self, storage=None):
+    def __init__(self, storage: dict[str, _CacheEntry] | None = None) -> None:
         self.__items = storage if storage is not None else {}
 
-    def get(self, key, default):
+    def get(self, key: str, default: Any) -> Any:
         item = self.__items.get(key)
         if item is None:
             return default
@@ -35,7 +36,7 @@ class SimpleCache:
             return default
         return item.value
 
-    def set(self, key, value, expire_seconds):
+    def set(self, key: str, value: Any, expire_seconds: float) -> None:
         items = self.__items
         if len(items) >= self._PURGE_AT:              # opportunistic sweep of expired entries
             now = _now()

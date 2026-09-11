@@ -17,7 +17,7 @@ __all__ = [
 ]
 
 
-def current_schema_name():
+def current_schema_name() -> str:
     """Schema on the connection of the CURRENT shard (active_alias → default if unset).
 
     Fails LOUD on an unexpected error (a bad alias / connection state = a bug): silently

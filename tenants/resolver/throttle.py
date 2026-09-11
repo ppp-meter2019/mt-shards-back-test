@@ -14,6 +14,8 @@ No-op at concurrency 1; dedups at concurrency > 1.
 """
 import threading
 import time
+from collections.abc import Callable
+from typing import Any
 
 from redis.exceptions import RedisError
 
@@ -24,12 +26,12 @@ from .config import resolve_cfg
 class _LocalBucket:
     """Per-pod token bucket — the fallback when the global Redis counter is unreachable."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._tokens = 0.0
         self._ts = time.monotonic()
         self._lock = threading.Lock()
 
-    def allow(self, rate):
+    def allow(self, rate: float) -> bool:
         cap = max(1.0, float(rate))
         with self._lock:                       # uncontended at concurrency 1
             now = time.monotonic()
@@ -55,14 +57,14 @@ class FillCap:
     _local = _LocalBucket()
 
     @property
-    def _limit(self):
+    def _limit(self) -> int:
         return resolve_cfg.FILLCAP_PER_SEC
 
     @property
-    def _local_rate(self):
+    def _local_rate(self) -> int:
         return resolve_cfg.FILLCAP_LOCAL_PER_SEC
 
-    def allow(self):
+    def allow(self) -> bool:
         """True => a flag-absent DB resolve may proceed; False => reject fast (no DB)."""
         try:
             c = resolve_cache.get_redis_raw_client()
@@ -85,7 +87,7 @@ _inflight_lock = threading.Lock()
 _UNSET = object()   # leader produced no value (aborted via control-flow / crash)
 
 
-def single_flight(key, resolver, wait_timeout=5.0):
+def single_flight(key: str, resolver: Callable[[], Any], wait_timeout: float = 5.0) -> Any:
     """Run ``resolver()`` once per ``key`` across concurrent callers in THIS process.
     The leader runs it; followers wait and share its result or its (real) exception. If the
     leader is slower than ``wait_timeout`` a follower falls back to its own resolve (no

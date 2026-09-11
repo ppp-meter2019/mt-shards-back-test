@@ -1,3 +1,5 @@
+from typing import Any
+
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connections, transaction
 from django_tenants.utils import get_public_schema_name
@@ -41,7 +43,7 @@ class ShardSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
 
-    def get_tenant_count(self, obj):
+    def get_tenant_count(self, obj: Shard) -> int | None:
         return getattr(obj, "tenant_count", None)
 
 
@@ -112,7 +114,7 @@ class TenantSerializer(serializers.ModelSerializer):
             "schema_exists", "is_public", "last_migration",
         ]
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         # update-write ONLY: instance present AND bound to input data (DRF sets
         # initial_data only when data= was passed). This excludes retrieve/list
@@ -157,7 +159,7 @@ class TenantSerializer(serializers.ModelSerializer):
         """True for the public/management tenant (listed but read-only)."""
         return obj.schema_name == get_public_schema_name()
 
-    def get_last_migration(self, obj: Tenant):
+    def get_last_migration(self, obj: Tenant) -> dict[str, Any] | None:
         """{"app","name","applied"} of the latest migration in the tenant's
         schema, or None. Read from context["last_migrations"] (pre-computed per
         shard in the viewset); None when used outside the viewset.
@@ -211,7 +213,7 @@ class TenantSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(f"Domain '{value}' is already in use.")
         return value
 
-    def validate(self, attrs):
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         """On create, reject a schema that PHYSICALLY exists on the chosen shard.
 
         validate_schema_name only checks the Tenant table; an orphan schema left
@@ -241,14 +243,14 @@ class TenantSerializer(serializers.ModelSerializer):
                         })
         return attrs
 
-    def create(self, validated_data):
+    def create(self, validated_data: dict[str, Any]) -> Tenant:
         domain = validated_data.pop("domain")
         with transaction.atomic():
             tenant = Tenant.objects.create(**validated_data)
             Domain.objects.create(domain=domain, tenant=tenant, is_primary=True)
         return tenant
 
-    def update(self, instance, validated_data):
+    def update(self, instance: Tenant, validated_data: dict[str, Any]) -> Tenant:
         """Update company_name/description and, if `domain` is given, repoint the
         tenant's PRIMARY domain. schema_name/shard are read-only here (see __init__).
         """
@@ -286,7 +288,7 @@ class ReservedHostRuleSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "created_on", "modified"]
 
-    def validate(self, attrs):
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         attrs = super().validate(attrs)
         # Support PATCH: fall back to the instance's current values.
         match_type = attrs.get(

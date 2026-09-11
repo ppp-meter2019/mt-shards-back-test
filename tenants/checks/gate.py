@@ -1,12 +1,16 @@
 """Resolve-gate flag invariants. Full design: deploy/resolve_gate_design.md."""
-from django.core.checks import Error, register
+from typing import Any
+
+from django.apps import AppConfig
+from django.core.checks import CheckMessage, Error, register
 
 from .base import mt_check
 
 
 @register()
 @mt_check
-def gate_requires_warm(app_configs, **kwargs):
+def gate_requires_warm(app_configs: list[AppConfig] | None,
+                       **kwargs: Any) -> list[CheckMessage]:
     """tenants.E001 — TENANT_REGISTRY['GATE_ENABLED'] requires ['WARM_ENABLED']. Reads the
     RAW dict (NOT registry_cfg.gate_enabled) so the fail-safe can't hide the misconfig.
 

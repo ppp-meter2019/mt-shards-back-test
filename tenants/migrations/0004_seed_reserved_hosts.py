@@ -10,6 +10,8 @@
 Idempotent-ish: uses get_or_create keyed on the unique (match_type, value,
 base_domain). Reverse removes exactly these seeded rows.
 """
+from typing import Any
+
 from django.db import migrations
 
 GLOBAL_LABELS = [
@@ -19,7 +21,7 @@ GLOBAL_LABELS = [
 APEX_DOMAINS = ["routegenie.com", "isi-technology.com"]
 
 
-def seed(apps, schema_editor):
+def seed(apps: Any, schema_editor: Any) -> None:
     ReservedHostRule = apps.get_model("tenants", "ReservedHostRule")
     for label in GLOBAL_LABELS:
         ReservedHostRule.objects.get_or_create(
@@ -33,7 +35,7 @@ def seed(apps, schema_editor):
         )
 
 
-def unseed(apps, schema_editor):
+def unseed(apps: Any, schema_editor: Any) -> None:
     ReservedHostRule = apps.get_model("tenants", "ReservedHostRule")
     ReservedHostRule.objects.filter(
         match_type="label", value__in=GLOBAL_LABELS, base_domain="",

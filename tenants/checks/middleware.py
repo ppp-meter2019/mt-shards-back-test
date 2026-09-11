@@ -1,13 +1,17 @@
 """MT middleware presence & order invariant. See settings_multitenant.py (_MT_INSERTS)."""
+from typing import Any
+
+from django.apps import AppConfig
 from django.conf import settings
-from django.core.checks import Error, register
+from django.core.checks import CheckMessage, Error, register
 
 from .base import mt_check
 
 
 @register()
 @mt_check
-def mt_middleware_order(app_configs, **kwargs):
+def mt_middleware_order(app_configs: list[AppConfig] | None,
+                        **kwargs: Any) -> list[CheckMessage]:
     """tenants.E004 — under multi-tenant, the tenant middlewares must be PRESENT and in the
     right RELATIVE order (not necessarily adjacent). settings_multitenant.py builds MIDDLEWARE
     as a delta over the standalone base, so this guards against (a) an anchor/insert getting

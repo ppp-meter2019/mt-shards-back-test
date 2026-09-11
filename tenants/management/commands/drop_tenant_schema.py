@@ -19,8 +19,11 @@ Runs DROP SCHEMA "<schema>" CASCADE on the shard's connection (the app role owns
 schemas, so it may drop them). The identifier goes through tenants.validators.quote_schema,
 which validates and quotes in one call.
 """
+
+from typing import Any
+
 from django.conf import settings
-from django.core.management.base import CommandError
+from django.core.management.base import CommandError, CommandParser
 
 from commons.platform.commands import TenantCommand
 from django.db import connections
@@ -33,13 +36,13 @@ from tenants.validators import normalize_schema_name, quote_schema
 class Command(TenantCommand):
     help = "Drop an orphaned tenant schema on a given shard."
 
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument("--database", required=True, help="Shard alias (DATABASES key).")
         parser.add_argument("--schema", required=True, help="Schema name to drop.")
         parser.add_argument("--no-input", action="store_true",
                             help="Skip the interactive confirmation prompt.")
 
-    def handle(self, *args, **opts):
+    def handle(self, *args: Any, **opts: Any) -> None:
         alias = opts["database"]
         # Same normalization the creation path applies, so `--schema=Foo-Bar` targets the
         # row that was actually stored as `foo_bar` instead of silently missing it.

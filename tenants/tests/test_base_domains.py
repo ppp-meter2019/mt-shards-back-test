@@ -7,12 +7,12 @@ from tenants.console.views import BaseDomainsView
 
 class BaseDomainsPayloadTests(SimpleTestCase):
     @override_settings(TENANT_BASE_DOMAINS=("routegenie.com", "isi-technology.com"))
-    def test_returns_configured_bases(self):
+    def test_returns_configured_bases(self) -> None:
         # Call get() directly (bypasses permissions) — this asserts the wiring:
         # the endpoint reflects settings.TENANT_BASE_DOMAINS, in order, as a list.
         resp = BaseDomainsView().get(None)
         self.assertEqual(resp.data, {"base_domains": ["routegenie.com", "isi-technology.com"]})
 
     @override_settings(TENANT_BASE_DOMAINS=())
-    def test_empty_when_unset(self):
+    def test_empty_when_unset(self) -> None:
         self.assertEqual(BaseDomainsView().get(None).data, {"base_domains": []})

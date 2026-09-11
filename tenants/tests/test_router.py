@@ -9,35 +9,35 @@ from tenants.routers import TenantDatabaseRouter
 
 
 class RouterStrictGuardTests(SimpleTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.r = TenantDatabaseRouter()
 
-    def test_business_model_unset_context_raises(self):
+    def test_business_model_unset_context_raises(self) -> None:
         from products.models import Product
         with self.assertRaises(RuntimeError):
             self.r.db_for_read(Product)          # current_db unset (None) → strict raise
 
-    def test_business_model_with_context_routes_to_shard(self):
+    def test_business_model_with_context_routes_to_shard(self) -> None:
         from products.models import Product
         with use_alias("shard_x"):
             self.assertEqual(self.r.db_for_read(Product), "shard_x")
             self.assertEqual(self.r.db_for_write(Product), "shard_x")
 
-    def test_users_model_unset_context_raises(self):
+    def test_users_model_unset_context_raises(self) -> None:
         from users.models import User
         with self.assertRaises(RuntimeError):
             self.r.db_for_read(User)             # users is strict → contextless query raises
 
-    def test_users_model_with_context_routes_to_shard(self):
+    def test_users_model_with_context_routes_to_shard(self) -> None:
         from users.models import User
         with use_alias("shard_x"):
             self.assertEqual(self.r.db_for_read(User), "shard_x")
             self.assertEqual(self.r.db_for_write(User), "shard_x")
 
-    def test_contrib_tenant_model_unset_defaults_without_raise(self):
+    def test_contrib_tenant_model_unset_defaults_without_raise(self) -> None:
         from django.contrib.contenttypes.models import ContentType
         self.assertEqual(self.r.db_for_read(ContentType), "default")   # quasi-shared → benign
 
-    def test_shared_only_model_is_default(self):
+    def test_shared_only_model_is_default(self) -> None:
         from tenants.models import Tenant
         self.assertEqual(self.r.db_for_read(Tenant), "default")        # SHARED-only branch

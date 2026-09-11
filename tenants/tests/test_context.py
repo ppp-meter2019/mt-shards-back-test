@@ -5,6 +5,7 @@ that record the schema switch.
 
 NB: current_db's unset sentinel is None (no routing context); a with-block restores to None
 at the top level. An explicit alias (incl. schema_context("public") → "default") is a real set."""
+from typing import Any
 import types
 from unittest import mock
 
@@ -19,30 +20,30 @@ from tenants.context import (
 
 class _FakeConn:
     """Records the django_tenants schema-switch surface _switch() drives."""
-    def __init__(self, tenant=None):
+    def __init__(self, tenant: Any = None) -> None:
         self.tenant = tenant
         self.schema = None
 
-    def set_tenant(self, t):
+    def set_tenant(self, t: Any) -> None:
         self.tenant = t
 
-    def set_schema(self, name):
+    def set_schema(self, name: str) -> None:
         self.schema = name
 
-    def set_schema_to_public(self):
+    def set_schema_to_public(self) -> None:
         self.tenant = None
         self.schema = "public"
 
 
-def _tenant(alias):
+def _tenant(alias: str) -> Any:
     return types.SimpleNamespace(shard=types.SimpleNamespace(alias=alias))
 
 
 class TenantContextTests(SimpleTestCase):
-    def _conns(self, *aliases):
+    def _conns(self, *aliases: str) -> dict[str, Any]:
         return {a: _FakeConn() for a in aliases}
 
-    def test_sets_and_restores_current_db(self):
+    def test_sets_and_restores_current_db(self) -> None:
         conns = self._conns("shard_a")
         with mock.patch("tenants.context.connections", conns):
             self.assertIsNone(bound_alias())                 # unset at top level
@@ -52,7 +53,7 @@ class TenantContextTests(SimpleTestCase):
             self.assertIsNone(bound_alias())                 # restored to unset
             self.assertIsNone(conns["shard_a"].tenant)          # restored (prev was None)
 
-    def test_nested_different_shards_restore_lifo(self):
+    def test_nested_different_shards_restore_lifo(self) -> None:
         conns = self._conns("shard_a", "shard_b")
         with mock.patch("tenants.context.connections", conns):
             with tenant_context(_tenant("shard_a")):
@@ -61,7 +62,7 @@ class TenantContextTests(SimpleTestCase):
                 self.assertEqual(bound_alias(), "shard_a")   # inner exit restored to A
             self.assertIsNone(bound_alias())
 
-    def test_nested_SAME_shard_restores_prev_tenant(self):
+    def test_nested_SAME_shard_restores_prev_tenant(self) -> None:
         # The reentrancy clobber the class version was vulnerable to: reused state would make
         # the inner exit restore the WRONG previous tenant. Generator frames keep it correct.
         conns = self._conns("shard_a")
@@ -74,7 +75,7 @@ class TenantContextTests(SimpleTestCase):
                 self.assertIs(conns["shard_a"].tenant, t1)      # ← restored to t1, not clobbered
             self.assertIsNone(conns["shard_a"].tenant)
 
-    def test_restores_on_exception(self):
+    def test_restores_on_exception(self) -> None:
         conns = self._conns("shard_a")
         with mock.patch("tenants.context.connections", conns):
             with self.assertRaises(ValueError):
@@ -83,7 +84,7 @@ class TenantContextTests(SimpleTestCase):
             self.assertIsNone(bound_alias())                 # finally ran despite the raise
             self.assertIsNone(conns["shard_a"].tenant)
 
-    def test_explicit_database_overrides_shard(self):
+    def test_explicit_database_overrides_shard(self) -> None:
         conns = self._conns("override")
         with mock.patch("tenants.context.connections", conns):
             with tenant_context(_tenant("shard_a"), database="override"):
@@ -91,7 +92,7 @@ class TenantContextTests(SimpleTestCase):
 
 
 class SchemaContextTests(SimpleTestCase):
-    def test_public_short_circuits_to_default(self):
+    def test_public_short_circuits_to_default(self) -> None:
         conns = {"default": _FakeConn()}
         with mock.patch("tenants.context.connections", conns):
             with schema_context("public"):
@@ -99,14 +100,14 @@ class SchemaContextTests(SimpleTestCase):
                 self.assertEqual(conns["default"].schema, "public")
             self.assertIsNone(bound_alias())                 # restored to unset
 
-    def test_explicit_database_sets_schema(self):
+    def test_explicit_database_sets_schema(self) -> None:
         conns = {"shard_x": _FakeConn()}
         with mock.patch("tenants.context.connections", conns):
             with schema_context("acme", database="shard_x"):
                 self.assertEqual(bound_alias(), "shard_x")
                 self.assertEqual(conns["shard_x"].schema, "acme")
 
-    def test_unknown_schema_raises_with_hint(self):
+    def test_unknown_schema_raises_with_hint(self) -> None:
         from tenants.models import Tenant
         with mock.patch("tenants.models.Tenant.objects") as objs:
             objs.select_related.return_value.get.side_effect = Tenant.DoesNotExist
@@ -116,7 +117,7 @@ class SchemaContextTests(SimpleTestCase):
 
 
 class UseAliasTests(SimpleTestCase):
-    def test_sets_and_restores(self):
+    def test_sets_and_restores(self) -> None:
         self.assertIsNone(bound_alias())
         with use_alias("shard_z"):
             self.assertEqual(bound_alias(), "shard_z")
@@ -124,7 +125,7 @@ class UseAliasTests(SimpleTestCase):
 
 
 class ActiveAliasTests(SimpleTestCase):
-    def test_none_coalesces_to_default(self):
+    def test_none_coalesces_to_default(self) -> None:
         self.assertIsNone(bound_alias())
         self.assertEqual(active_alias(), "default")             # unset → default (for readers)
         with use_alias("shard_q"):
@@ -141,23 +142,23 @@ class RoutingMiddlewareTests(SimpleTestCase):
     class _Conns(dict):
         """connections[...] that raises like Django's, so the unknown-alias path is faithful."""
 
-        def __getitem__(self, key):
+        def __getitem__(self, key: str) -> Any:
             if key not in self:
                 raise ConnectionDoesNotExist(key)
             return dict.__getitem__(self, key)
 
-    def _run(self, tenant, conns, get_response):
+    def _run(self, tenant: Any, conns: dict[str, Any], get_response: Any) -> Any:
         mw = middleware.TenantShardRoutingMiddleware(get_response)
         request = types.SimpleNamespace(tenant=tenant)
         with mock.patch.object(middleware, "connections", conns), \
                 mock.patch("tenants.context.connections", conns):
             return mw(request)
 
-    def test_shard_request_wires_both_axes_and_unwinds(self):
+    def test_shard_request_wires_both_axes_and_unwinds(self) -> None:
         conns = self._Conns(shard_a=_FakeConn())
         seen = {}
 
-        def view(request):
+        def view(request: Any) -> str:
             seen["axis1"] = bound_alias()
             seen["axis2"] = conns["shard_a"].tenant
             return "resp"
@@ -168,10 +169,10 @@ class RoutingMiddlewareTests(SimpleTestCase):
         self.assertIsNone(bound_alias())                  # router axis unwound
         self.assertEqual(conns["shard_a"].schema, "public")  # schema axis unwound
 
-    def test_axes_unwind_when_the_view_raises(self):
+    def test_axes_unwind_when_the_view_raises(self) -> None:
         conns = self._Conns(shard_a=_FakeConn())
 
-        def boom(request):
+        def boom(request: Any) -> None:
             raise RuntimeError("view exploded")
 
         with self.assertRaises(RuntimeError):
@@ -179,13 +180,13 @@ class RoutingMiddlewareTests(SimpleTestCase):
         self.assertIsNone(bound_alias())
         self.assertEqual(conns["shard_a"].schema, "public")
 
-    def test_public_tenant_pins_router_axis_only(self):
+    def test_public_tenant_pins_router_axis_only(self) -> None:
         """shard.alias == "default": ShardAwareTenantMiddleware already owns the schema there
         (and re-resets it at the START of each request), so axis 2 must be left alone."""
         conns = self._Conns(default=_FakeConn())
         seen = {}
 
-        def view(request):
+        def view(request: Any) -> str:
             seen["axis1"] = bound_alias()
             return "resp"
 
@@ -194,7 +195,7 @@ class RoutingMiddlewareTests(SimpleTestCase):
         self.assertIsNone(conns["default"].schema)           # axis 2 untouched
         self.assertIsNone(bound_alias())
 
-    def test_unknown_alias_does_not_leak_current_db(self):
+    def test_unknown_alias_does_not_leak_current_db(self) -> None:
         """Regression: the alias is resolved BEFORE either axis is touched. The previous
         hand-rolled version set current_db first, so a Shard row whose alias had been dropped
         from settings.DATABASES left the router axis pinned for the life of the thread."""
@@ -203,7 +204,7 @@ class RoutingMiddlewareTests(SimpleTestCase):
             self._run(_tenant("ghost"), conns, lambda r: "resp")
         self.assertIsNone(bound_alias())
 
-    def test_exit_forces_public_over_a_foreign_tenant(self):
+    def test_exit_forces_public_over_a_foreign_tenant(self) -> None:
         """The exit reset is deliberately NOT delegated to tenant_context, which restores the
         connection's PREVIOUS tenant. If a foreign tenant were somehow left on this shard
         connection, restoring it would hand the next caller another tenant's schema; forcing

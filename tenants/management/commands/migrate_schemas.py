@@ -36,7 +36,9 @@ Executor flags (--fake, --plan, --list, --check, --prune, --run-syncdb,
 --fake-initial, app_label, migration_name) are forwarded to the executor.
 """
 
-from django.core.management.base import CommandError
+from typing import Any
+
+from django.core.management.base import CommandError, CommandParser
 from django.db import connections
 from django.db.models import F
 from django.utils import timezone
@@ -81,7 +83,7 @@ class Command(TenantCommand, UpstreamCommand):
     # ------------------------------------------------------------------
     # CLI
     # ------------------------------------------------------------------
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         super().add_arguments(parser)
         # Strip the upstream default of --database='default' so we can
         # distinguish "not specified" from "explicitly default".
@@ -97,7 +99,7 @@ class Command(TenantCommand, UpstreamCommand):
     # ------------------------------------------------------------------
     # Main flow
     # ------------------------------------------------------------------
-    def handle(self, *args, **options):
+    def handle(self, *args: Any, **options: Any) -> None:
         # SyncCommon parses --shared/--tenant/--schema_name/--executor and sets
         # self.sync_public, self.sync_tenant, self.schema_name, self.executor.
         SyncCommon.handle(self, *args, **options)
@@ -177,7 +179,7 @@ class Command(TenantCommand, UpstreamCommand):
                         self._migrate_all_on_shard(shard_alias)
 
     # ------------------------------------------------------------------
-    def _migrate_all_on_shard(self, db_alias):
+    def _migrate_all_on_shard(self, db_alias: str) -> None:
         """Iterate claimable tenants on a specific shard and migrate each."""
         # Defense in depth: tenant migrations must never target 'default'.
         if db_alias == "default":
@@ -206,7 +208,7 @@ class Command(TenantCommand, UpstreamCommand):
             self._migrate_one(t)
 
     # ------------------------------------------------------------------
-    def _migrate_one(self, tenant):
+    def _migrate_one(self, tenant: Tenant) -> None:
         """Atomic claim -> ensure schema exists -> run migrations -> finalize.
 
         For tenants whose previous_status was NEW and whose schema does not
@@ -313,6 +315,6 @@ class Command(TenantCommand, UpstreamCommand):
         self._notice(f"OK   {tenant.schema_name} -> {new_status}")
 
     # ------------------------------------------------------------------
-    def _get_executor(self):
+    def _get_executor(self) -> Any:
         # Recreate per shard - options['database'] is mutated between calls.
         return GET_EXECUTOR_FUNCTION(codename=self.executor)(self.args, self.options)

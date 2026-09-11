@@ -1,4 +1,6 @@
 import logging
+from collections.abc import Sequence
+from typing import Any
 
 from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
@@ -11,7 +13,9 @@ from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from django_tenants.utils import get_public_schema_name
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.serializers import BaseSerializer
 from rest_framework.views import APIView
 
 from users.models import User
@@ -40,11 +44,11 @@ class BaseDomainsView(APIView):
 
     permission_classes = [IsTenantAdminOnPublic]
 
-    def get(self, request):
+    def get(self, request: Request) -> Response:
         return Response({"base_domains": list(getattr(settings, "TENANT_BASE_DOMAINS", ()))})
 
 
-def _psql_aligned(headers, rows, title):
+def _psql_aligned(headers: Sequence[str], rows: Sequence[Sequence[Any]], title: str) -> str:
     """Render rows as psql's aligned table (centered title + headers, '+' line
     continuation for multi-line cells, '(N rows)' footer). Cosmetic — to make
     the API response read like real \\dn+ console output.
@@ -61,11 +65,11 @@ def _psql_aligned(headers, rows, title):
                 widths[i] = max(widths[i], len(ln))
         grid.append(cells)
 
-    def hcell(text, w):                       # header: centered, 1 space padding
+    def hcell(text: str, w: int) -> str:                       # header: centered, 1 space padding
         pad = w - len(text)
         return " " + " " * (pad // 2) + text + " " * (pad - pad // 2) + " "
 
-    def dcell(text, w, cont):                 # data: left-aligned; '+' if continued
+    def dcell(text: str, w: int, cont: bool) -> str:                 # data: left-aligned; '+' if continued
         return " " + text.ljust(w) + ("+" if cont else " ")
 
     header = "|".join(hcell(headers[i], widths[i]) for i in range(ncols))
@@ -108,12 +112,12 @@ class ShardViewSet(mixins.ListModelMixin,
     permission_classes = [IsTenantAdminOnPublic]
 
     @staticmethod
-    def _guard_default(shard):
+    def _guard_default(shard: Shard) -> None:
         if shard.is_default:
             raise PermissionDenied("The default shard is read-only.")
 
     @action(detail=True, methods=["get"])
-    def schemas(self, request, pk=None):
+    def schemas(self, request: Request, pk: str | None = None) -> Response:
         """Low-level peek: schemas on this shard's DB, rendered like psql `\\dn+`.
 
         Read-only, fixed catalog query on the shard's own connection (no user
@@ -141,7 +145,7 @@ class ShardViewSet(mixins.ListModelMixin,
         return Response({"shard": shard.alias, "output": output})
 
     @action(detail=True, methods=["post"])
-    def activate(self, request, pk=None):
+    def activate(self, request: Request, pk: str | None = None) -> Response:
         """Activate a deactivated shard."""
         shard = self.get_object()
         self._guard_default(shard)
@@ -153,7 +157,7 @@ class ShardViewSet(mixins.ListModelMixin,
         return Response(self.get_serializer(shard).data)
 
     @action(detail=True, methods=["post"])
-    def deactivate(self, request, pk=None):
+    def deactivate(self, request: Request, pk: str | None = None) -> Response:
         """Deactivate a shard that hosts no tenants."""
         shard = self.get_object()
         self._guard_default(shard)
@@ -171,7 +175,7 @@ class ShardViewSet(mixins.ListModelMixin,
         shard.save(update_fields=["is_active", "modified"])
         return Response(self.get_serializer(shard).data)
 
-    def destroy(self, request, *args, **kwargs):
+    def destroy(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         """Delete a deactivated shard (default shard / active shard rejected)."""
         shard = self.get_object()
         self._guard_default(shard)
@@ -207,16 +211,16 @@ class TenantViewSet(viewsets.ModelViewSet):
     permission_classes = [IsTenantAdminOnPublic]
 
     @staticmethod
-    def _guard_public(tenant):
+    def _guard_public(tenant: Tenant) -> None:
         """Reject any write targeting the public tenant."""
         if tenant.schema_name == get_public_schema_name():
             raise PermissionDenied("The public tenant is read-only.")
 
-    def perform_update(self, serializer):
+    def perform_update(self, serializer: BaseSerializer) -> None:
         self._guard_public(serializer.instance)
         serializer.save()
 
-    def perform_destroy(self, instance):
+    def perform_destroy(self, instance: Tenant) -> None:
         self._guard_public(instance)
         # Optional: also drop the tenant's schema (DELETE ?drop_schema=true).
         # Deleting the row leaves the schema (auto_drop_schema=False); when the
@@ -239,7 +243,7 @@ class TenantViewSet(viewsets.ModelViewSet):
     # Physical-state pre-fetch (tenants.console.probes)
     # -------------------------------------------------------------------
 
-    def get_serializer_context(self):
+    def get_serializer_context(self) -> dict[str, Any]:
         """Pre-compute schema_exists/last_migration (physical state) so the serializer
         doesn't N+1.
 
@@ -276,7 +280,7 @@ class TenantViewSet(viewsets.ModelViewSet):
     # -------------------------------------------------------------------
 
     @action(detail=True, methods=["post"])
-    def provision(self, request, pk=None):
+    def provision(self, request: Request, pk: str | None = None) -> Response:
         """Queue async provisioning (create schema + migrate) for a NEW tenant.
 
         Enqueues provision_tenant on the `service` queue (it is a management
@@ -310,7 +314,7 @@ class TenantViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=["post"], url_path="create-admin")
-    def create_admin(self, request, pk=None):
+    def create_admin(self, request: Request, pk: str | None = None) -> Response:
         """Bootstrap the first `company_admin` user inside the chosen tenant.
 
         Equivalent to `manage.py bootstrap_tenant --admin-username=... --admin-password=...`,
@@ -368,7 +372,7 @@ class TenantViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=["post"])
-    def deactivate(self, request, pk=None):
+    def deactivate(self, request: Request, pk: str | None = None) -> Response:
         """Transition ACTIVE -> DEACTIVATED via atomic UPDATE WHERE.
 
         The serializer's status field is read-only, so this dedicated action
@@ -382,7 +386,7 @@ class TenantViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=["post"])
-    def activate(self, request, pk=None):
+    def activate(self, request: Request, pk: str | None = None) -> Response:
         """Transition DEACTIVATED -> ACTIVE via atomic UPDATE WHERE."""
         return self._transition(
             pk,
@@ -390,7 +394,7 @@ class TenantViewSet(viewsets.ModelViewSet):
             to_status=Tenant.Status.ACTIVE,
         )
 
-    def _transition(self, pk, *, from_status: str, to_status: str):
+    def _transition(self, pk: str, *, from_status: str, to_status: str) -> Response:
         tenant = self.get_object()
         self._guard_public(tenant)
         updated = Tenant.objects.filter(pk=tenant.pk, status=from_status).update(
@@ -441,7 +445,7 @@ class ReservedHostRuleViewSet(viewsets.ModelViewSet):
     CONFLICTS_SAMPLE = 200
 
     @action(detail=True, methods=["get"])
-    def conflicts(self, request, pk=None):
+    def conflicts(self, request: Request, pk: str | None = None) -> Response:
         """Report EXISTING (non-public) tenant domains this rule already reserves.
 
         Lets an operator see, before relying on a rule, which live hosts it would

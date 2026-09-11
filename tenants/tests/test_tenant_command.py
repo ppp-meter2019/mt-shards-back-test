@@ -1,6 +1,7 @@
 """Shard-aware tenant_command override — runs the wrapped sub-command inside tenant_context,
 so its ORM routes to the tenant's SHARD (current_db), not the default DB. DB-free: tenant
 resolution is mocked and `connections` is faked (like test_context)."""
+from typing import Any
 import types
 from unittest import mock
 
@@ -10,30 +11,30 @@ from tenants.context import bound_alias
 
 
 class _FakeConn:
-    def __init__(self):
+    def __init__(self) -> None:
         self.tenant = None
 
-    def set_tenant(self, t):
+    def set_tenant(self, t: Any) -> None:
         self.tenant = t
 
-    def set_schema(self, name):
+    def set_schema(self, name: str) -> None:
         pass
 
-    def set_schema_to_public(self):
+    def set_schema_to_public(self) -> None:
         self.tenant = None
 
 
-def _tenant(alias, schema="acme"):
+def _tenant(alias: str, schema: str = "acme") -> Any:
     return types.SimpleNamespace(shard=types.SimpleNamespace(alias=alias), schema_name=schema)
 
 
 class TenantCommandShardTests(SimpleTestCase):
-    def test_handle_runs_subcommand_on_the_shard(self):
+    def test_handle_runs_subcommand_on_the_shard(self) -> None:
         from tenants.management.commands import tenant_command as tc
         seen = {}
         t = _tenant("shard_7")
 
-        def spy(name, *a, **kw):
+        def spy(name: str, *a: Any, **kw: Any) -> None:
             seen["db"] = bound_alias()          # where the sub-command's ORM would route
             seen["name"] = name
 
@@ -47,13 +48,13 @@ class TenantCommandShardTests(SimpleTestCase):
         self.assertEqual(seen["db"], "shard_7")        # routed to the tenant's shard, not default
         self.assertIsNone(bound_alias())            # restored to unset after the command
 
-    def test_run_from_argv_wraps_in_tenant_context(self):
+    def test_run_from_argv_wraps_in_tenant_context(self) -> None:
         from tenants.management.commands import tenant_command as tc
         seen = {}
         t = _tenant("shard_9", schema="beta")
 
         class _Klass:
-            def run_from_argv(self, args):
+            def run_from_argv(self, args: list[str]) -> None:
                 seen["db"] = bound_alias()
 
         cmd = tc.Command()

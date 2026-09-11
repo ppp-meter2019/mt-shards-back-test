@@ -6,8 +6,11 @@ Inherits django-tenants TenantSyncRouter:
                       and replaces ONLY the single-DB guard with our multi-DB guard.
 """
 
+from typing import Any
+
 from django.conf import settings
 from django.db import connections
+from django.db.models import Model
 from django_tenants.routers import TenantSyncRouter
 from django_tenants.utils import (
     get_public_schema_name,
@@ -20,7 +23,7 @@ from .context import bound_alias
 
 class TenantDatabaseRouter(TenantSyncRouter):
 
-    def db_for_read(self, model, **hints):
+    def db_for_read(self, model: type[Model], **hints: Any) -> str | None:
         label = model._meta.app_label
         # Shared-only apps (Tenant/Shard/Domain registry, sessions, ...)
         # always live on the default database.
@@ -41,10 +44,11 @@ class TenantDatabaseRouter(TenantSyncRouter):
             return "default"                      # quasi-shared (contenttypes/auth/admin) — benign
         return alias
 
-    def db_for_write(self, model, **hints):
+    def db_for_write(self, model: type[Model], **hints: Any) -> str | None:
         return self.db_for_read(model, **hints)
 
-    def allow_migrate(self, db, app_label, model_name=None, **hints):
+    def allow_migrate(self, db: str, app_label: str, model_name: str | None = None,
+                      **hints: Any) -> bool | None:
         """Combines the upstream schema-based decision with a multi-DB guard.
 
         Upstream rejects any db != get_tenant_database_alias() (i.e. != 'default'),

@@ -10,9 +10,11 @@ Example:
         --admin-password adminpass
 """
 
+from typing import Any
+
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
-from django.core.management.base import CommandError
+from django.core.management.base import CommandError, CommandParser
 from django_tenants.utils import get_public_schema_name
 
 from commons.platform.commands import TenantCommand
@@ -31,7 +33,7 @@ from users.models import User
 class Command(TenantCommand):
     help = "Create a tenant + its primary domain + a company-admin user."
 
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument("--schema", required=True)
         parser.add_argument(
             "--company-name", "--name", dest="company_name", required=True,
@@ -52,7 +54,7 @@ class Command(TenantCommand):
                  "prints what it overrode.",
         )
 
-    def _check_reserved(self, schema, domain, *, force):
+    def _check_reserved(self, schema: str, domain: str, *, force: bool) -> None:
         """Enforce the same reserved-host/schema rules as the API/admin.
 
         Without --force a violation aborts with a CommandError pointing at --force.
@@ -75,7 +77,7 @@ class Command(TenantCommand):
         else:
             raise CommandError(f"{joined} Use --force to override.")
 
-    def handle(self, *args, **opts):
+    def handle(self, *args: Any, **opts: Any) -> None:
         # Validate + normalize EXPLICITLY rather than letting Tenant.clean() do it: the
         # row is created with .create() (which bypasses clean()), and an operator who
         # passed --schema deserves a loud error instead of a silent rewrite. The result is

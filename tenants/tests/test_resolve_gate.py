@@ -1,6 +1,7 @@
 """Tenant-resolve gate (WARM/GATE stages). DB-free: fake domain model + fake nx cache,
 host_registry.check / fill_cap.allow patched or fed a fake Redis. See
 deploy/resolve_gate_design.md."""
+from typing import Any
 from unittest import mock
 
 from django.test import SimpleTestCase, override_settings
@@ -20,41 +21,41 @@ from ._support import FakeNxCache, make_domain_model, make_tenant, use_resolve_c
 class _FakeRedis:
     """Minimal pipeline supporting host_registry.check()."""
 
-    def __init__(self, exists, member):
+    def __init__(self, exists: bool, member: bool) -> None:
         self._exists, self._member = exists, member
 
-    def pipeline(self):
+    def pipeline(self) -> Any:
         outer = self
 
         class _Pipe:
-            def exists(self, *a):
+            def exists(self, *a: Any) -> Any:
                 return self
 
-            def sismember(self, *a):
+            def sismember(self, *a: Any) -> Any:
                 return self
 
-            def execute(self):
+            def execute(self) -> list[int]:
                 return [1 if outer._exists else 0, 1 if outer._member else 0]
 
         return _Pipe()
 
 
 class HostRegistryCheckTests(SimpleTestCase):
-    def _verdict(self, exists, member):
+    def _verdict(self, exists: bool, member: bool) -> object:
         with mock.patch.object(resolve_cache, "get_redis_raw_client",
                                return_value=_FakeRedis(exists, member)):
             return host_registry.check("h")
 
-    def test_member(self):
+    def test_member(self) -> None:
         self.assertIs(self._verdict(exists=True, member=True), HostRegistry.MEMBER)
 
-    def test_nonmember(self):
+    def test_nonmember(self) -> None:
         self.assertIs(self._verdict(exists=True, member=False), HostRegistry.NONMEMBER)
 
-    def test_set_absent_is_unknown(self):
+    def test_set_absent_is_unknown(self) -> None:
         self.assertIs(self._verdict(exists=False, member=False), HostRegistry.UNKNOWN)
 
-    def test_redis_error_is_unknown(self):
+    def test_redis_error_is_unknown(self) -> None:
         boom = mock.Mock(side_effect=RedisError("redis down"))
         with mock.patch.object(resolve_cache, "get_redis_raw_client", boom):
             self.assertIs(host_registry.check("h"), HostRegistry.UNKNOWN)
@@ -62,24 +63,24 @@ class HostRegistryCheckTests(SimpleTestCase):
 
 @override_settings(TENANT_REGISTRY={"GATE_ENABLED": True, "WARM_ENABLED": True})
 class GateMiddlewareTests(SimpleTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.mw = mw.ShardAwareTenantMiddleware(lambda r: None)
         # trigger_warm must never touch Redis/celery in these unit tests
         self._tw = mock.patch.object(host_registry, "trigger_warm", lambda: None)
         self._tw.start()
         self.addCleanup(self._tw.stop)
 
-    def _check(self, verdict):
+    def _check(self, verdict: object) -> Any:
         return mock.patch.object(host_registry, "check", lambda h: verdict)
 
-    def test_member_resolves_from_db(self):
+    def test_member_resolves_from_db(self) -> None:
         dm = make_domain_model(make_tenant())
         with use_resolve_cache(FakeNxCache()), self._check(HostRegistry.MEMBER):
             got = self.mw.get_tenant(dm, "known")
         self.assertEqual(got.schema_name, "alpha")
         self.assertEqual(dm.db_calls["n"], 1)
 
-    def test_nonmember_hard_reject_no_db_no_negative(self):
+    def test_nonmember_hard_reject_no_db_no_negative(self) -> None:
         dm = make_domain_model(make_tenant())      # tenant exists in DB, but SET says non-member
         fake = FakeNxCache()
         with use_resolve_cache(fake), self._check(HostRegistry.NONMEMBER):
@@ -88,7 +89,7 @@ class GateMiddlewareTests(SimpleTestCase):
         self.assertEqual(dm.db_calls["n"], 0)       # rejected WITHOUT touching the DB
         self.assertNotIn("known", fake.store)       # and WITHOUT writing a negative
 
-    def test_unknown_with_budget_falls_open_to_db(self):
+    def test_unknown_with_budget_falls_open_to_db(self) -> None:
         dm = make_domain_model(make_tenant())
         with use_resolve_cache(FakeNxCache()), self._check(HostRegistry.UNKNOWN), \
                 mock.patch.object(fill_cap, "allow", lambda: True):
@@ -96,7 +97,7 @@ class GateMiddlewareTests(SimpleTestCase):
         self.assertEqual(got.schema_name, "alpha")
         self.assertEqual(dm.db_calls["n"], 1)
 
-    def test_unknown_without_budget_defers_no_db(self):
+    def test_unknown_without_budget_defers_no_db(self) -> None:
         """Flag-absent + budget spent => ResolveDeferred, NOT DoesNotExist.
 
         The gate never established that the host is unknown (that is what UNKNOWN means),
@@ -112,7 +113,7 @@ class GateMiddlewareTests(SimpleTestCase):
         self.assertEqual(dm.db_calls["n"], 0)        # declined WITHOUT touching the DB
         self.assertNotIn("known", fake.store)        # and WITHOUT writing a negative
 
-    def test_deferred_is_not_a_not_found(self):
+    def test_deferred_is_not_a_not_found(self) -> None:
         """A deferral must never be mistakable for 'no such tenant' by an except clause."""
         dm = make_domain_model(make_tenant())
         self.assertFalse(issubclass(ResolveDeferred, dm.DoesNotExist))
@@ -120,13 +121,14 @@ class GateMiddlewareTests(SimpleTestCase):
 
 class StoreTtlByStatusTests(SimpleTestCase):
     class _RecCache:
-        def __init__(self):
+        def __init__(self) -> None:
             self.calls = []
 
-        def get(self, k, default=None):
+        def get(self, k: str, default: Any = None) -> Any:
             return default
 
-        def set(self, key, value, timeout=None, nx=False, **kw):
+        def set(self, key: str, value: Any, timeout: int | None = None, nx: bool = False,
+                **kw: Any) -> bool:
             self.calls.append((key, timeout, nx))
             return True
 
@@ -134,7 +136,7 @@ class StoreTtlByStatusTests(SimpleTestCase):
         TENANT_REGISTRY={"WARM_ENABLED": True},
         TENANT_RESOLVE={"WARM_TTL_BY_STATUS": {"active": None, "deactivated": 3600}},
     )
-    def test_active_no_ttl_deactivated_ttl(self):
+    def test_active_no_ttl_deactivated_ttl(self) -> None:
         from tenants.models import Tenant
         rc = TenantResolveCache(cache=self._RecCache())
         rc.put("h1", make_tenant(status=Tenant.Status.ACTIVE))
@@ -144,7 +146,7 @@ class StoreTtlByStatusTests(SimpleTestCase):
         self.assertEqual(by_key[rc._snap_key("h2")], (3600, True))   # DEACTIVATED → 1h
 
     @override_settings(TENANT_REGISTRY={"WARM_ENABLED": False}, TENANT_RESOLVE={"POSITIVE_CACHE_SECONDS": 3600})
-    def test_legacy_flat_ttl_when_warm_off(self):
+    def test_legacy_flat_ttl_when_warm_off(self) -> None:
         rc = TenantResolveCache(cache=self._RecCache())
         rc.put("h", make_tenant())
         self.assertEqual(rc.cache.calls[0][1], 3600)    # flat _pos_ttl
@@ -155,17 +157,18 @@ class PutManyTests(SimpleTestCase):
     force semantics (no nx, no hold-check)."""
 
     class _ManyCache:
-        def __init__(self):
+        def __init__(self) -> None:
             self.calls = []                             # (set-of-keys, timeout)
 
-        def set_many(self, mapping, timeout=None, **kw):
+        def set_many(self, mapping: dict[str, Any], timeout: int | None = None,
+                    **kw: Any) -> None:
             self.calls.append((set(mapping), timeout))
 
     @override_settings(
         TENANT_REGISTRY={"WARM_ENABLED": True},
         TENANT_RESOLVE={"WARM_TTL_BY_STATUS": {"active": None, "deactivated": 3600}},
     )
-    def test_groups_by_ttl_one_set_many_each(self):
+    def test_groups_by_ttl_one_set_many_each(self) -> None:
         from tenants.models import Tenant
         rc = TenantResolveCache(cache=self._ManyCache())
         n = rc.put_many([
@@ -183,7 +186,7 @@ class PutManyTests(SimpleTestCase):
         TENANT_REGISTRY={"WARM_ENABLED": True},
         TENANT_RESOLVE={"WARM_TTL_BY_STATUS": {"active": None, "deactivated": 3600}},
     )
-    def test_schema_side_groups_by_ttl_too(self):
+    def test_schema_side_groups_by_ttl_too(self) -> None:
         """The schema-keyed sibling must group by TTL identically — both wrappers share
         _put_many_by_ttl, and without this the shared core is only guarded on the host side."""
         from tenants.models import Tenant
@@ -205,22 +208,22 @@ class CacheEnabledFlagTests(SimpleTestCase):
     WARM: under WARM positives are written via ttl_by_status, so a zero flat TTL must NOT
     make the cache look disabled (finding #4)."""
 
-    def _rc(self):
+    def _rc(self) -> TenantResolveCache:
         return TenantResolveCache(cache=FakeNxCache())
 
     @override_settings(TENANT_RESOLVE={"POSITIVE_CACHE_SECONDS": 3600, "MISS_CACHE_SECONDS": 60},
                        TENANT_REGISTRY={"WARM_ENABLED": False})
-    def test_enabled_with_flat_ttl(self):
+    def test_enabled_with_flat_ttl(self) -> None:
         self.assertTrue(self._rc().enabled)
 
     @override_settings(TENANT_RESOLVE={"POSITIVE_CACHE_SECONDS": 0, "MISS_CACHE_SECONDS": 0},
                        TENANT_REGISTRY={"WARM_ENABLED": False})
-    def test_disabled_when_everything_off(self):
+    def test_disabled_when_everything_off(self) -> None:
         self.assertFalse(self._rc().enabled)
 
     @override_settings(TENANT_RESOLVE={"POSITIVE_CACHE_SECONDS": 0, "MISS_CACHE_SECONDS": 0},
                        TENANT_REGISTRY={"WARM_ENABLED": True})
-    def test_enabled_under_warm_even_with_zero_flat_ttl(self):
+    def test_enabled_under_warm_even_with_zero_flat_ttl(self) -> None:
         self.assertTrue(self._rc().enabled)             # #4: WARM keeps the cache in use
 
 
@@ -228,17 +231,17 @@ class _FakeLock:
     """Stand-in for redis-py's Lock: records acquire/release; release() can raise LockError
     to simulate a lock that expired mid-reconcile (no longer ours)."""
 
-    def __init__(self, acquired=True, release_raises=False):
+    def __init__(self, acquired: bool = True, release_raises: bool = False) -> None:
         self._acquired = acquired
         self._release_raises = release_raises
         self.acquire_calls = 0
         self.release_calls = 0
 
-    def acquire(self, blocking=True, **kw):
+    def acquire(self, blocking: bool = True, **kw: Any) -> bool:
         self.acquire_calls += 1
         return self._acquired
 
-    def release(self):
+    def release(self) -> None:
         self.release_calls += 1
         if self._release_raises:
             from redis.exceptions import LockError
@@ -248,24 +251,24 @@ class _FakeLock:
 class _FakeLockRedis:
     """Returns a preset _FakeLock from .lock(); records the lock() call args."""
 
-    def __init__(self, lock):
+    def __init__(self, lock: Any) -> None:
         self._lock = lock
         self.lock_calls = []
 
-    def lock(self, name, timeout=None, **kw):
+    def lock(self, name: str, timeout: float | None = None, **kw: Any) -> Any:
         self.lock_calls.append((name, timeout))
         return self._lock
 
 
 @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True})
 class RunLockedFencingTests(SimpleTestCase):
-    def _patches(self, fake):
+    def _patches(self, fake: Any) -> tuple[Any, ...]:
         return (
             mock.patch.object(resolve_cache, "get_redis_raw_client", return_value=fake),
             mock.patch.object(resolve_cache, "redis_alive", return_value=True),
         )
 
-    def test_acquires_reconciles_and_releases(self):
+    def test_acquires_reconciles_and_releases(self) -> None:
         lock = _FakeLock(acquired=True)
         fake = _FakeLockRedis(lock)
         p1, p2 = self._patches(fake)
@@ -276,7 +279,7 @@ class RunLockedFencingTests(SimpleTestCase):
         self.assertEqual(lock.acquire_calls, 1)
         self.assertEqual(lock.release_calls, 1)                  # fenced release fires
 
-    def test_skips_when_lock_held(self):
+    def test_skips_when_lock_held(self) -> None:
         lock = _FakeLock(acquired=False)            # someone else holds it
         fake = _FakeLockRedis(lock)
         p1, p2 = self._patches(fake)
@@ -286,7 +289,7 @@ class RunLockedFencingTests(SimpleTestCase):
         rec.assert_not_called()
         self.assertEqual(lock.release_calls, 0)     # never release a lock we didn't take
 
-    def test_release_error_is_swallowed(self):
+    def test_release_error_is_swallowed(self) -> None:
         lock = _FakeLock(acquired=True, release_raises=True)     # expired mid-reconcile
         fake = _FakeLockRedis(lock)
         p1, p2 = self._patches(fake)
@@ -298,18 +301,18 @@ class RunLockedFencingTests(SimpleTestCase):
 @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True, "WARM_PENDING_SECONDS": 10})
 class TriggerWarmCoalesceTests(SimpleTestCase):
     class _FakePendingRedis:
-        def __init__(self):
+        def __init__(self) -> None:
             self.store = {}
             self.set_calls = []
 
-        def set(self, key, val, nx=False, ex=None):
+        def set(self, key: str, val: Any, nx: bool = False, ex: int | None = None) -> bool | None:
             self.set_calls.append((key, val, nx, ex))
             if nx and key in self.store:
                 return None
             self.store[key] = val
             return True
 
-    def test_coalesces_enqueue_with_self_expiring_marker(self):
+    def test_coalesces_enqueue_with_self_expiring_marker(self) -> None:
         import tenants.tasks as tasks_mod
         fake = self._FakePendingRedis()
         with mock.patch.object(resolve_cache, "get_redis_raw_client", return_value=fake), \
@@ -329,7 +332,7 @@ class ApplyMembershipTests(SimpleTestCase):
     always bumped (pipelined) with a bounded NX ttl."""
 
     class _FakeRedis:
-        def __init__(self, hosts_exists):
+        def __init__(self, hosts_exists: bool) -> None:
             self._hosts_exists = hosts_exists
             self.members = set()
             self.sadd_calls = 0
@@ -337,54 +340,54 @@ class ApplyMembershipTests(SimpleTestCase):
             self.incr_keys = []
             self.expire_calls = []
 
-        def exists(self, key):
+        def exists(self, key: str) -> int:
             return 1 if self._hosts_exists else 0
 
-        def sadd(self, key, member):
+        def sadd(self, key: str, member: str) -> None:
             self.sadd_calls += 1
             self.members.add(member)
 
-        def srem(self, key, member):
+        def srem(self, key: str, member: str) -> None:
             self.srem_calls += 1
             self.members.discard(member)
 
         # act as our own (no-op) pipeline for the dirty bump
-        def pipeline(self):
+        def pipeline(self) -> Any:
             return self
 
-        def incr(self, key):
+        def incr(self, key: str) -> Any:
             self.incr_keys.append(key)
             return self
 
-        def expire(self, key, ttl, nx=False):
+        def expire(self, key: str, ttl: int, nx: bool = False) -> Any:
             self.expire_calls.append((key, ttl, nx))
             return self
 
-        def execute(self):
+        def execute(self) -> list[Any]:
             return []
 
-    def _run(self, method, host, hosts_exists):
+    def _run(self, method: str, host: str, hosts_exists: bool) -> Any:
         fake = self._FakeRedis(hosts_exists)
         with mock.patch.object(resolve_cache, "get_redis_raw_client", return_value=fake):
             getattr(host_registry, method)(host)
         return fake
 
-    def test_add_when_set_present_adds_member(self):
+    def test_add_when_set_present_adds_member(self) -> None:
         fake = self._run("add", "h.example", hosts_exists=True)
         self.assertEqual(fake.sadd_calls, 1)
         self.assertIn("h.example", fake.members)
 
-    def test_add_when_set_absent_does_not_resurrect(self):
+    def test_add_when_set_absent_does_not_resurrect(self) -> None:
         fake = self._run("add", "h.example", hosts_exists=False)
         self.assertEqual(fake.sadd_calls, 0)     # EXISTS guard → no SADD
         self.assertEqual(fake.members, set())    # SET stays absent → gate fail-open
         self.assertIn(DIRTY_KEY, fake.incr_keys) # but dirty IS bumped
 
-    def test_remove_is_unconditional(self):
+    def test_remove_is_unconditional(self) -> None:
         fake = self._run("remove", "gone.example", hosts_exists=False)
         self.assertEqual(fake.srem_calls, 1)     # SREM issued even on an absent SET
 
-    def test_dirty_bumped_with_bounded_nx_ttl(self):
+    def test_dirty_bumped_with_bounded_nx_ttl(self) -> None:
         fake = self._run("add", "h.example", hosts_exists=True)
         self.assertIn(DIRTY_KEY, fake.incr_keys)
         self.assertTrue(
@@ -398,37 +401,37 @@ class GateRequiresWarmTests(SimpleTestCase):
 
     # --- runtime fail-safe: gate_enabled is effective ONLY with WARM on ---
     @override_settings(TENANT_REGISTRY={"GATE_ENABLED": True, "WARM_ENABLED": False})
-    def test_gate_without_warm_is_treated_as_off(self):
+    def test_gate_without_warm_is_treated_as_off(self) -> None:
         self.assertFalse(host_registry.gate_enabled)
 
     @override_settings(TENANT_REGISTRY={"GATE_ENABLED": True, "WARM_ENABLED": True})
-    def test_gate_with_warm_is_on(self):
+    def test_gate_with_warm_is_on(self) -> None:
         self.assertTrue(host_registry.gate_enabled)
 
     @override_settings(TENANT_REGISTRY={"GATE_ENABLED": False, "WARM_ENABLED": True})
-    def test_gate_off_stays_off(self):
+    def test_gate_off_stays_off(self) -> None:
         self.assertFalse(host_registry.gate_enabled)
 
     # --- deploy-time system check tenants.E001 ---
-    def _check(self):
+    def _check(self) -> list[Any]:
         from tenants.checks import gate_requires_warm
         return gate_requires_warm(app_configs=None)
 
     @override_settings(TENANT_REGISTRY={"GATE_ENABLED": True, "WARM_ENABLED": False})
-    def test_check_errors_on_gate_without_warm(self):
+    def test_check_errors_on_gate_without_warm(self) -> None:
         errs = self._check()
         self.assertEqual([e.id for e in errs], ["tenants.E001"])
 
     @override_settings(TENANT_REGISTRY={"GATE_ENABLED": True, "WARM_ENABLED": True})
-    def test_check_ok_when_both_on(self):
+    def test_check_ok_when_both_on(self) -> None:
         self.assertEqual(self._check(), [])
 
     @override_settings(TENANT_REGISTRY={"GATE_ENABLED": False, "WARM_ENABLED": True})
-    def test_check_ok_warm_only(self):        # valid rollout intermediate (Stage 1)
+    def test_check_ok_warm_only(self) -> None:        # valid rollout intermediate (Stage 1)
         self.assertEqual(self._check(), [])
 
     @override_settings(TENANT_REGISTRY={"GATE_ENABLED": False, "WARM_ENABLED": False})
-    def test_check_ok_both_off(self):         # today's default
+    def test_check_ok_both_off(self) -> None:         # today's default
         self.assertEqual(self._check(), [])
 
 
@@ -437,40 +440,40 @@ class SingleFlightTests(SimpleTestCase):
     exceptions (which belong to the leader thread); a follower left without a value
     self-resolves instead of returning a bogus None. White-box via throttle._inflight."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         from tenants.resolver import throttle
         self.t = throttle
         self.addCleanup(self.t._inflight.clear)
 
-    def _seat_follower(self, key, *, result, exc):
+    def _seat_follower(self, key: str, *, result: Any, exc: BaseException | None) -> None:
         # Pre-seat a completed slot so the next call takes the FOLLOWER branch.
         ev = __import__("threading").Event(); ev.set()
         self.t._inflight[key] = {"event": ev, "result": result, "exc": exc}
 
-    def test_leader_shares_real_exception(self):
+    def test_leader_shares_real_exception(self) -> None:
         with self.assertRaises(ValueError):
             self.t.single_flight("k", lambda: (_ for _ in ()).throw(ValueError("boom")))
         self.assertNotIn("k", self.t._inflight)         # slot cleaned in finally
 
-    def test_leader_control_flow_propagates_and_cleans_slot(self):
-        def boom():
+    def test_leader_control_flow_propagates_and_cleans_slot(self) -> None:
+        def boom() -> None:
             raise KeyboardInterrupt
         with self.assertRaises(KeyboardInterrupt):      # NOT swallowed
             self.t.single_flight("k", boom)
         self.assertNotIn("k", self.t._inflight)         # finally still cleaned up
 
-    def test_follower_inherits_real_exception(self):
+    def test_follower_inherits_real_exception(self) -> None:
         self._seat_follower("k", result=self.t._UNSET, exc=ValueError("shared"))
         with self.assertRaises(ValueError):
             self.t.single_flight("k", lambda: "own")
 
-    def test_follower_self_resolves_when_leader_left_no_value(self):
+    def test_follower_self_resolves_when_leader_left_no_value(self) -> None:
         # Leader aborted via control-flow → result stays _UNSET, exc None.
         self._seat_follower("k", result=self.t._UNSET, exc=None)
         got = self.t.single_flight("k", lambda: "own")
         self.assertEqual(got, "own")                    # self-resolved, NOT None
 
-    def test_follower_shares_leader_result(self):
+    def test_follower_shares_leader_result(self) -> None:
         self._seat_follower("k", result="leader-value", exc=None)
         got = self.t.single_flight("k", lambda: "own")
         self.assertEqual(got, "leader-value")           # took the shared result, no own resolve
@@ -480,7 +483,7 @@ class FailOpenLogThrottleTests(SimpleTestCase):
     """The fail-open branch logs at most one traceback per _FAIL_LOG_EVERY window and
     counts the rest — no one-traceback-per-request storm under a sustained cache failure."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         from tenants.resolver import service
         self.svc = service
         self.svc._fail_last = 0.0
@@ -488,7 +491,7 @@ class FailOpenLogThrottleTests(SimpleTestCase):
         self.addCleanup(setattr, self.svc, "_fail_last", 0.0)
         self.addCleanup(setattr, self.svc, "_fail_suppressed", 0)
 
-    def test_first_logs_then_suppresses_within_window(self):
+    def test_first_logs_then_suppresses_within_window(self) -> None:
         with mock.patch.object(self.svc.time, "monotonic", return_value=1000.0), \
                 mock.patch.object(self.svc.logger, "warning") as warn:
             for _ in range(5):
@@ -496,7 +499,7 @@ class FailOpenLogThrottleTests(SimpleTestCase):
         self.assertEqual(warn.call_count, 1)            # only the first within the window
         self.assertEqual(self.svc._fail_suppressed, 4)  # the other 4 counted
 
-    def test_emits_again_after_window_with_suppressed_count(self):
+    def test_emits_again_after_window_with_suppressed_count(self) -> None:
         self.svc._fail_last = 1000.0
         self.svc._fail_suppressed = 7
         after = 1000.0 + self.svc._FAIL_LOG_EVERY
@@ -513,24 +516,24 @@ class ConfigNamespaceTests(SimpleTestCase):
     """config._Namespace: per-key merge over DEFAULTS + robust __getattr__ (no recursion on
     a pre-init/copied instance, clear error on an unknown key)."""
 
-    def test_merge_over_defaults(self):
+    def test_merge_over_defaults(self) -> None:
         from tenants.resolver.config import resolve_cfg
         with override_settings(TENANT_RESOLVE={"HOLD_SECONDS": 8}):
             self.assertEqual(resolve_cfg.HOLD_SECONDS, 8)                 # user value
             self.assertEqual(resolve_cfg.POSITIVE_CACHE_SECONDS, 3600)    # falls to DEFAULTS
 
-    def test_unknown_key_raises_attributeerror(self):
+    def test_unknown_key_raises_attributeerror(self) -> None:
         from tenants.resolver.config import resolve_cfg
         with self.assertRaises(AttributeError):
             resolve_cfg.NOPE_KEY
 
-    def test_no_recursion_before_init(self):
+    def test_no_recursion_before_init(self) -> None:
         from tenants.resolver.config import _Namespace
         ns = _Namespace.__new__(_Namespace)          # bypass __init__ → _defaults NOT set
         self.assertFalse(hasattr(ns, "anything"))    # must not RecursionError
         self.assertFalse(hasattr(ns, "__deepcopy__"))
 
-    def test_deepcopy_ok(self):
+    def test_deepcopy_ok(self) -> None:
         import copy
         from tenants.resolver.config import resolve_cfg
         dup = copy.deepcopy(resolve_cfg)             # exercises __deepcopy__/reduce probes
@@ -545,7 +548,7 @@ class ResolveFailOpenRoutingTests(SimpleTestCase):
     class NotFound(Exception):
         pass
 
-    def _run(self, exc):
+    def _run(self, exc: BaseException) -> tuple[Any, ...]:
         from tenants.resolver import service
         sent = object()
         with mock.patch.object(service, "_via_cache", side_effect=exc), \
@@ -554,27 +557,27 @@ class ResolveFailOpenRoutingTests(SimpleTestCase):
             result = service.resolve("h", lambda: sent, self.NotFound)
         return result, sent, fail, bug
 
-    def test_not_found_propagates(self):
+    def test_not_found_propagates(self) -> None:
         from tenants.resolver import service
         with mock.patch.object(service, "_via_cache", side_effect=self.NotFound):
             with self.assertRaises(self.NotFound):
                 service.resolve("h", lambda: None, self.NotFound)
 
-    def test_operational_error_propagates(self):
+    def test_operational_error_propagates(self) -> None:
         from django.db import OperationalError
         from tenants.resolver import service
         with mock.patch.object(service, "_via_cache", side_effect=OperationalError):
             with self.assertRaises(OperationalError):
                 service.resolve("h", lambda: None, self.NotFound)
 
-    def test_redis_error_fails_open_quietly(self):
+    def test_redis_error_fails_open_quietly(self) -> None:
         from redis.exceptions import RedisError
         result, sent, fail, bug = self._run(RedisError("down"))
         self.assertIs(result, sent)          # fail-open to DB
         fail.assert_called_once()            # infra → WARNING path
         bug.assert_not_called()
 
-    def test_unexpected_bug_fails_open_loudly(self):
+    def test_unexpected_bug_fails_open_loudly(self) -> None:
         result, sent, fail, bug = self._run(TypeError("boom"))
         self.assertIs(result, sent)          # still fail-open (DB is correct)
         bug.assert_called_once()             # bug → ERROR path
@@ -584,7 +587,7 @@ class ResolveFailOpenRoutingTests(SimpleTestCase):
 class BugLogThrottleTests(SimpleTestCase):
     """_log_cache_bug throttles like _log_cache_fail but at ERROR level, with its OWN counter
     so a bug is never masked by infra-warning noise."""
-    def setUp(self):
+    def setUp(self) -> None:
         from tenants.resolver import service
         self.svc = service
         self.svc._bug_last = 0.0
@@ -592,7 +595,7 @@ class BugLogThrottleTests(SimpleTestCase):
         self.addCleanup(setattr, self.svc, "_bug_last", 0.0)
         self.addCleanup(setattr, self.svc, "_bug_suppressed", 0)
 
-    def test_first_logs_error_then_suppresses(self):
+    def test_first_logs_error_then_suppresses(self) -> None:
         with mock.patch.object(self.svc.time, "monotonic", return_value=2000.0), \
                 mock.patch.object(self.svc.logger, "error") as err:
             for _ in range(3):

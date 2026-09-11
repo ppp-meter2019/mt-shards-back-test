@@ -13,6 +13,8 @@ depend on this module's path.
 """
 import hashlib
 import json
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 from celery import Task, current_app, shared_task
 from celery.utils.log import get_task_logger
@@ -22,6 +24,9 @@ from django.utils import timezone
 from commons.platform.beat import FANOUT_TASK_NAME, beat_conf, task_queue
 from commons.platform.tenancy import active_target_schemas, active_tenants_with_tz
 from tenants.models import TaskRun
+
+if TYPE_CHECKING:                       # annotation-only: the runtime import is deliberately
+    from datetime import datetime       # local to _due_by_tenant_tz (cold path)
 
 logger = get_task_logger(__name__)
 
@@ -34,7 +39,7 @@ logger = get_task_logger(__name__)
 __all__ = ["argsig", "fanout_dispatch", "sub_dispatch"]
 
 
-def argsig(task_args):
+def argsig(task_args: Sequence[Any] | None) -> str:
     """Stable short signature of the task args, so two schedule entries that share a
     task name but differ by args (e.g. fetch(1) vs fetch(7)) get DISTINCT locks and
     DISTINCT TaskRun watermarks.
@@ -55,7 +60,7 @@ def argsig(task_args):
     return hashlib.md5(blob.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
-def _acquire_lock(task_name, args_sig):
+def _acquire_lock(task_name: str, args_sig: str) -> bool:
     """Overlap-lock (atomic cache.add == SETNX). Returns True if this wave may run; False if a
     previous wave of the SAME (task, args) still holds the lock (a deliberate skip). If the
     beat_lock Redis is DOWN, cache.add RAISES (IGNORE_EXCEPTIONS is off) and fanout_dispatch
@@ -68,7 +73,8 @@ def _acquire_lock(task_name, args_sig):
     return bool(caches["beat_lock"].add(key, "1", timeout=beat_conf("LOCK_SECONDS")))
 
 
-def _due_by_tenant_tz(task_name, args_sig, cron, now, grace):
+def _due_by_tenant_tz(task_name: str, args_sig: str, cron: str, now: "datetime",
+                      grace: float) -> list[str]:
     """Calendar due-check per tenant, evaluated in each tenant's own timezone
     (level-triggered). Considers ONLY the latest past occurrence of `cron` and fires it
     iff it is (a) newer than that tenant's last run (TaskRun) and (b) within `grace` of
@@ -106,8 +112,11 @@ def _due_by_tenant_tz(task_name, args_sig, cron, now, grace):
 
 @shared_task(name=FANOUT_TASK_NAME, base=Task,
              queue=task_queue("fanout"), acks_late=True, max_retries=0)
-def fanout_dispatch(task_name, scope="tenants", cron=None, grace=None,
-                    task_args=None, task_kwargs=None, task_options=None, batch_size=None):
+def fanout_dispatch(task_name: str, scope: str = "tenants", cron: str | None = None,
+                    grace: float | None = None, task_args: Sequence[Any] | None = None,
+                    task_kwargs: dict[str, Any] | None = None,
+                    task_options: dict[str, Any] | None = None,
+                    batch_size: int | None = None) -> dict[str, Any]:
     # ONE signature per wave, shared by the lock, the due-check and the watermark. Computing
     # it in each place instead would make three copies of "which schedule entry is this".
     args_sig = argsig(task_args)
@@ -135,8 +144,10 @@ def fanout_dispatch(task_name, scope="tenants", cron=None, grace=None,
 
 @shared_task(name="tenants.tasks.sub_dispatch", base=Task,
              queue=task_queue("fanout"), acks_late=True, max_retries=0)
-def sub_dispatch(task_name, schemas, task_args=None, task_kwargs=None,
-                 task_options=None, run_ts=None, args_sig=None):
+def sub_dispatch(task_name: str, schemas: Sequence[str], task_args: Sequence[Any] | None = None,
+                 task_kwargs: dict[str, Any] | None = None,
+                 task_options: dict[str, Any] | None = None, run_ts: str | None = None,
+                 args_sig: str | None = None) -> dict[str, Any]:
     # args_sig defaults to None so a message enqueued by a PREVIOUS release (before the
     # parameter existed) still runs instead of failing with a TypeError under acks_late +
     # max_retries=0. Recomputing locally is equivalent: task_args have already been through

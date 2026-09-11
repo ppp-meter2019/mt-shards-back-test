@@ -12,7 +12,11 @@ routing assumes NON-cooperative concurrency (prefork/solo/threads — each task 
 process or thread-context); under a cooperative pool, greenlets share one context and can
 cross tenant schemas.
 """
+from collections.abc import Sequence
+from typing import Any
+
 from celery import Celery
+from celery.result import AsyncResult
 from celery.signals import celeryd_init
 from django.core.exceptions import ImproperlyConfigured
 
@@ -22,7 +26,8 @@ _UNSAFE_POOLS = {"gevent", "eventlet"}
 
 
 @celeryd_init.connect
-def _guard_worker_pool(sender=None, instance=None, conf=None, options=None, **_):
+def _guard_worker_pool(sender: Any = None, instance: Any = None, conf: Any = None,
+                       options: dict[str, Any] | None = None, **_: Any) -> None:
     """Fail LOUD at worker start if the pool is cooperative — silent tenant crossover is a
     far worse outcome than a refused boot."""
     pool = (options or {}).get("pool") or getattr(conf, "worker_pool", None) or "prefork"
@@ -40,15 +45,16 @@ class CeleryApp(Celery):
     registry_cls = "tenants.celery.registry:TenantTaskRegistry"
     task_cls = "tenants.celery.task:TenantTask"
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         kwargs.setdefault("task_cls", self.task_cls)
         super().__init__(*args, **kwargs)
 
-    def create_task_cls(self):
+    def create_task_cls(self) -> type:
         return self.subclass_with_self(
             self.task_cls, abstract=True, name="TenantTask", attribute="_app",
         )
 
-    def send_task(self, name, args=None, kwargs=None, **options):
+    def send_task(self, name: str, args: Sequence[Any] | None = None,
+                  kwargs: dict[str, Any] | None = None, **options: Any) -> AsyncResult:
         options["headers"] = headers_with_schema(options.get("headers") or {})
         return super().send_task(name, args=args, kwargs=kwargs, **options)

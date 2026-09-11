@@ -15,17 +15,18 @@ must be set on the same connection/thread the ORM later uses):
      Must be listed AFTER ShardAwareTenantMiddleware.
 """
 import logging
+from collections.abc import Callable
 
 import psycopg
 
 from django.db import InterfaceError, OperationalError, connections
-from django.http import Http404, HttpResponse
+from django.http import Http404, HttpRequest, HttpResponse
 from django_tenants.middleware.main import TenantMainMiddleware
 from django_tenants.utils import get_public_schema_name
 
 from .context import tenant_context, use_alias
 from .errors import error_response
-from .models import Tenant
+from .models import Domain, Tenant
 from .resolver import ResolveDeferred, TenantSnapshot, resolve as resolve_tenant
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
     # ALLOWED_HOSTS. A static 200 skips both.
     HEALTH_PATHS = frozenset({"/api/health/"})
 
-    def process_request(self, request):
+    def process_request(self, request: HttpRequest) -> HttpResponse | None:
         if request.path in self.HEALTH_PATHS:
             return HttpResponse("ok", content_type="text/plain")
 
@@ -119,7 +120,7 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
                     )
         return None
 
-    def get_tenant(self, domain_model, hostname):
+    def get_tenant(self, domain_model: type[Domain], hostname: str) -> TenantSnapshot:
         # All resolve policy (cache, gate, fill_cap, coalescing, fail-open) lives in the
         # resolver service facade. The middleware only supplies the DB-resolver closure
         # (_resolve_tenant — the authoritative lookup) and the "not found" exception.
@@ -130,7 +131,7 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
         )
 
     @staticmethod
-    def _resolve_tenant(domain_model, hostname):
+    def _resolve_tenant(domain_model: type[Domain], hostname: str) -> TenantSnapshot:
         try:
             tenant = (
                 domain_model.objects
@@ -167,10 +168,10 @@ class TenantShardRoutingMiddleware:
     sync_capable = True
     async_capable = False
 
-    def __init__(self, get_response):
+    def __init__(self, get_response: Callable[[HttpRequest], HttpResponse]) -> None:
         self.get_response = get_response
 
-    def __call__(self, request):
+    def __call__(self, request: HttpRequest) -> HttpResponse:
         tenant = getattr(request, "tenant", None)
         if tenant is None or tenant.shard.alias == "default":
             # Public tenant, or no tenant at all: the schema on `default` was already set by

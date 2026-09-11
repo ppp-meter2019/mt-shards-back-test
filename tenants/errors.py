@@ -6,17 +6,21 @@ The error path must never itself raise: if a template is missing/broken, fall ba
 to a minimal inline page.
 """
 from django.conf import settings
-from django.http import HttpResponse, JsonResponse
+from typing import Any
+
+from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.template.loader import render_to_string
 from django.utils.html import escape
 
 
-def wants_json(request):
+def wants_json(request: HttpRequest) -> bool:
     return (request.path.startswith(settings.API_PATH_PREFIXES)
             or "application/json" in request.META.get("HTTP_ACCEPT", ""))
 
 
-def error_response(request, *, status, code, detail, template, retry_after=None, extra=None):
+def error_response(request: HttpRequest, *, status: int, code: str, detail: str, template: str,
+                   retry_after: int | None = None,
+                   extra: dict[str, Any] | None = None) -> HttpResponse:
     if wants_json(request):
         body = {"detail": detail, "code": code}
         if extra:

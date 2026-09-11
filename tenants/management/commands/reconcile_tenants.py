@@ -9,11 +9,13 @@ Strategy: conservative.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from django.conf import settings
+from django.core.management.base import CommandParser
 from commons.platform.commands import TenantCommand
 from django.db import connection, connections
+from django.db.models import QuerySet
 from django.db.migrations.loader import MigrationLoader
 from django.db.utils import ConnectionDoesNotExist
 from django.utils import timezone
@@ -35,7 +37,7 @@ class Decision:
 class Command(TenantCommand):
     help = "Reconcile Tenant.status with actual migration state on each shard."
 
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument("--dry-run", action="store_true",
                             help="Only print what would be changed; do not write.")
         parser.add_argument("--report", action="store_true",
@@ -44,7 +46,7 @@ class Command(TenantCommand):
                             help="Only inspect tenants whose status=pending.")
         parser.add_argument("--schema", help="Restrict to a single schema_name.")
 
-    def handle(self, *args, **opts):
+    def handle(self, *args: Any, **opts: Any) -> None:
         if opts["report"]:
             self._print_report(opts.get("schema"))
             return
@@ -83,7 +85,7 @@ class Command(TenantCommand):
             f"{changed} change(s), {warned} warning(s), {errored} error(s)."
         ))
 
-    def _build_queryset(self, opts):
+    def _build_queryset(self, opts: dict[str, Any]) -> QuerySet:
         qs = Tenant.objects.select_related("shard").exclude(schema_name=get_public_schema_name())
         if opts["only_pending"]:
             qs = qs.filter(status=Tenant.Status.PENDING)
@@ -94,7 +96,7 @@ class Command(TenantCommand):
     # ------------------------------------------------------------------
     # Decision logic - conservative
     # ------------------------------------------------------------------
-    def _evaluate(self, tenant) -> Decision:
+    def _evaluate(self, tenant: Tenant) -> Decision:
         # Sanity: alias must be in settings.DATABASES.
         try:
             conn = connections[tenant.shard.alias]
@@ -117,7 +119,7 @@ class Command(TenantCommand):
             return self._eval_fully_migrated(tenant)
         return self._eval_partial(tenant, applied, expected)
 
-    def _eval_no_schema(self, tenant) -> Decision:
+    def _eval_no_schema(self, tenant: Tenant) -> Decision:
         status = tenant.status
         if status == Tenant.Status.PENDING:
             # Claim succeeded but CREATE SCHEMA never ran. Roll the claim back.
@@ -133,7 +135,7 @@ class Command(TenantCommand):
             )
         return Decision(new_status=status, status_change=False)
 
-    def _eval_fully_migrated(self, tenant) -> Decision:
+    def _eval_fully_migrated(self, tenant: Tenant) -> Decision:
         status = tenant.status
         if status == Tenant.Status.PENDING:
             # Migrations completed but the final status flip was lost.
@@ -153,7 +155,7 @@ class Command(TenantCommand):
             )
         return Decision(new_status=status, status_change=False)
 
-    def _eval_partial(self, tenant, applied, expected) -> Decision:
+    def _eval_partial(self, tenant: Tenant, applied: int, expected: int) -> Decision:
         status = tenant.status
         progress = f"{applied}/{expected}"
 
@@ -186,7 +188,7 @@ class Command(TenantCommand):
         return Decision(new_status=status, status_change=False)
 
     # ------------------------------------------------------------------
-    def _apply_status(self, tenant, new_status, reason):
+    def _apply_status(self, tenant: Tenant, new_status: str, reason: str) -> None:
         update_fields = {
             "status": new_status,
             "status_changed_at": timezone.now(),
@@ -202,7 +204,7 @@ class Command(TenantCommand):
     # ------------------------------------------------------------------
     # Migration introspection
     # ------------------------------------------------------------------
-    def _applied(self, conn, schema_name) -> int:
+    def _applied(self, conn: Any, schema_name: str) -> int:
         labels = self._tenant_app_labels()
         if not labels:
             return 0
@@ -236,7 +238,7 @@ class Command(TenantCommand):
     # ------------------------------------------------------------------
     # Report mode
     # ------------------------------------------------------------------
-    def _print_report(self, single_schema: Optional[str] = None):
+    def _print_report(self, single_schema: Optional[str] = None) -> None:
         qs = Tenant.objects.select_related("shard").exclude(schema_name=get_public_schema_name())
         if single_schema:
             qs = qs.filter(schema_name=single_schema)

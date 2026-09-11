@@ -1,7 +1,10 @@
 """Celery beat-schedule + fanout-dispatch contract invariants.
 Full design: deploy/celery_fanout_design.md."""
+from typing import Any
+
+from django.apps import AppConfig
 from django.conf import settings
-from django.core.checks import Error, register
+from django.core.checks import CheckMessage, Error, register
 
 from commons.platform.beat import FANOUT_TASK_NAME, beat_conf, scope_of
 
@@ -10,7 +13,8 @@ from .base import mt_check
 
 @register()
 @mt_check
-def beat_grace_ge_fanout_period(app_configs, **kwargs):
+def beat_grace_ge_fanout_period(app_configs: list[AppConfig] | None,
+                                **kwargs: Any) -> list[CheckMessage]:
     """tenants.E002 — for each CALENDAR (tz) fanout entry, `grace` must be ≥ its
     `fanout_period` (the beat tick). Otherwise a tick can land outside a fresh
     occurrence's grace window and skip it. No-op until CELERY_BEAT_SCHEDULE is
@@ -44,7 +48,8 @@ def beat_grace_ge_fanout_period(app_configs, **kwargs):
 
 @register()
 @mt_check
-def beat_entries_wrapped(app_configs, **kwargs):
+def beat_entries_wrapped(app_configs: list[AppConfig] | None,
+                         **kwargs: Any) -> list[CheckMessage]:
     """tenants.E003 — every CELERY_BEAT_SCHEDULE entry must be wrapped with
     commons.platform.beat.scoped_schedule, so its SCOPE is explicit and we know where it runs:
       scoped_schedule(entry, scope="public")   -> runs ONCE (e.g. the public schema)
@@ -67,7 +72,8 @@ def beat_entries_wrapped(app_configs, **kwargs):
 
 @register()
 @mt_check
-def fanout_task_registered(app_configs, **kwargs):
+def fanout_task_registered(app_configs: list[AppConfig] | None,
+                           **kwargs: Any) -> list[CheckMessage]:
     """tenants.E005 — the fan-out task name emitted by scoped_schedule
     (commons.platform.beat.FANOUT_TASK_NAME) must actually be REGISTERED in Celery via the
     normal autodiscover path. The PRODUCER (commons, mode-agnostic, settings-load) and the
@@ -99,7 +105,8 @@ def fanout_task_registered(app_configs, **kwargs):
 
 @register()
 @mt_check
-def fanout_entries_are_unique(app_configs, **kwargs):
+def fanout_entries_are_unique(app_configs: list[AppConfig] | None,
+                              **kwargs: Any) -> list[CheckMessage]:
     """tenants.E006 — no two fanout entries may share (task_name, args).
 
     That pair IS the overlap-lock key (dispatch._acquire_lock builds

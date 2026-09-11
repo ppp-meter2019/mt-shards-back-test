@@ -30,17 +30,20 @@ SERVED, it just must not be able to break out of quotes. The bare `'{s}'` string
 are safe for the same reason (the floor excludes `'`).
 """
 import logging
+from collections.abc import Callable, Iterable
+from typing import Any
 
 from django.db import Error as DBError, connections
 from django.db.utils import ConnectionDoesNotExist
 
+from tenants.models import Tenant
 from tenants.validators import is_safe_schema_identifier, quote_schema
 from users.models import User
 
 logger = logging.getLogger(__name__)
 
 
-def _by_shard(tenants) -> dict:
+def _by_shard(tenants: Iterable[Tenant]) -> dict[str, set[str]]:
     """{shard_alias: {schema_name, ...}} — the grouping every probe starts from.
 
     `tenants` must be a materialized sequence, not a queryset: the caller runs all three
@@ -53,7 +56,8 @@ def _by_shard(tenants) -> dict:
     return out
 
 
-def _for_each_shard(tenants, probe, what):
+def _for_each_shard(tenants: Iterable[Tenant],
+                    probe: Callable[[Any, str, list[str]], None], what: str) -> None:
     """Run `probe(cursor, alias, schemas)` once per shard, degrading per shard.
 
     The grouping, the cursor, and the degrade-and-log cycle were copied in all three probes
@@ -70,7 +74,7 @@ def _for_each_shard(tenants, probe, what):
                            what, alias, exc_info=True)
 
 
-def existing_schemas(tenants) -> set:
+def existing_schemas(tenants: Iterable[Tenant]) -> set[tuple[str, str]]:
     """{(shard_alias, schema_name)} for schemas that PHYSICALLY exist. One query per shard.
 
     A tenant absent from the result is rendered as "not confirmed" — which covers both
@@ -79,7 +83,7 @@ def existing_schemas(tenants) -> set:
     """
     result: set = set()
 
-    def probe(cur, alias, schemas):
+    def probe(cur: Any, alias: str, schemas: list[str]) -> None:
         cur.execute(
             "SELECT schema_name FROM information_schema.schemata "
             "WHERE schema_name = ANY(%s)",
@@ -92,7 +96,7 @@ def existing_schemas(tenants) -> set:
     return result
 
 
-def last_migrations(tenants) -> dict:
+def last_migrations(tenants: Iterable[Tenant]) -> dict[tuple[str, str], dict[str, Any]]:
     """{(shard_alias, schema_name): {"app", "name", "applied"}} — the most recently applied
     migration per tenant schema. At most TWO queries per shard regardless of tenant count:
     one to find which target schemas actually carry a `django_migrations` table, then one
@@ -100,7 +104,7 @@ def last_migrations(tenants) -> dict:
     """
     result: dict = {}
 
-    def probe(cur, alias, schemas):
+    def probe(cur: Any, alias: str, schemas: list[str]) -> None:
         cur.execute(
             "SELECT table_schema FROM information_schema.tables "
             "WHERE table_name = 'django_migrations' AND table_schema = ANY(%s)",
@@ -132,7 +136,7 @@ def last_migrations(tenants) -> dict:
     return result
 
 
-def admins(tenants) -> dict:
+def admins(tenants: Iterable[Tenant]) -> dict[tuple[str, str], list[dict[str, Any]]]:
     """{(shard_alias, schema_name): [{"id", "username", "is_active"}, ...]} — the
     `company_admin` users inside each tenant schema. Two queries per shard, same shape as
     last_migrations(): find which schemas carry the table, then one UNION ALL over those.
@@ -150,7 +154,7 @@ def admins(tenants) -> dict:
            for f in ("id", "username", "is_active", "role")}
     result: dict = {}
 
-    def probe(cur, alias, schemas):
+    def probe(cur: Any, alias: str, schemas: list[str]) -> None:
         cur.execute(
             "SELECT table_schema FROM information_schema.tables "
             "WHERE table_name = %s AND table_schema = ANY(%s)",

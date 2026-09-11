@@ -9,8 +9,10 @@ Example:
         --password rootpass
 """
 
+from typing import Any
+
 from django.core.exceptions import ValidationError
-from django.core.management.base import CommandError
+from django.core.management.base import CommandError, CommandParser
 from django_tenants.utils import get_public_schema_name
 
 from commons.platform.commands import TenantCommand
@@ -24,13 +26,13 @@ from users.models import User
 class Command(TenantCommand):
     help = "Create the public tenant + a tenant-admin user."
 
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument("--domain", default="localhost")
         parser.add_argument("--username", default="root")
         parser.add_argument("--password", default="rootpass")
         parser.add_argument("--email", default="root@example.com")
 
-    def handle(self, *args, **opts):
+    def handle(self, *args: Any, **opts: Any) -> None:
         try:
             default_shard = Shard.objects.get(is_default=True)
         except Shard.DoesNotExist:

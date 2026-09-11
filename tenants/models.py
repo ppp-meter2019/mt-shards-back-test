@@ -19,6 +19,10 @@ These models are never what a request or a task holds: `request.tenant` and the 
 tenant are a tenants.resolver.TenantSnapshot, which has no save()/delete() to guard.
 """
 
+from collections.abc import Iterable, Sequence
+from datetime import datetime
+from typing import Any
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
@@ -54,10 +58,10 @@ class Shard(models.Model):
             ),
         ]
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.name or self.alias} [{self.alias}]"
 
-    def clean(self):
+    def clean(self) -> None:
         super().clean()
         if self.pk is not None:
             old_alias = Shard.objects.filter(pk=self.pk).values_list("alias", flat=True).first()
@@ -79,7 +83,7 @@ class Shard(models.Model):
                 "alias": "The 'default' database is reserved for the public schema."
             })
 
-    def delete(self, *args, **kwargs):
+    def delete(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, int]]:
         """Protect the default shard.
 
         Combined with Tenant.shard on_delete=PROTECT, a real shard can only be
@@ -93,7 +97,7 @@ class Shard(models.Model):
         return super().delete(*args, **kwargs)
 
 
-def _validate_timezone(value):
+def _validate_timezone(value: str | None) -> None:
     """Validate an IANA timezone name; NULL/empty is allowed (the 'unset' sentinel)."""
     if not value:
         return
@@ -152,14 +156,14 @@ class Tenant(TenantMixin):
     auto_create_schema = False
     auto_drop_schema   = False
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.company_name
 
     @property
     def db_alias(self) -> str:
         return self.shard.alias
 
-    def clean(self):
+    def clean(self) -> None:
         """Enforce: public schema on default shard; business tenants on non-default."""
         super().clean()
         public = get_public_schema_name()
@@ -186,7 +190,8 @@ class Tenant(TenantMixin):
                 validate_tenant_schema_name(self.schema_name)
 
     @classmethod
-    def from_db(cls, db, field_names, values):
+    def from_db(cls, db: str | None, field_names: Sequence[str],
+                values: Sequence[Any]) -> "Tenant":
         """Snapshot the status as loaded, so save() can tell a real transition from any
         other edit. Guarded on field_names because a deferred load (.only()/.defer())
         would otherwise trigger a refetch right here."""
@@ -195,7 +200,7 @@ class Tenant(TenantMixin):
             obj._loaded_status = obj.status
         return obj
 
-    def save(self, *args, **kwargs):
+    def save(self, *args: Any, **kwargs: Any) -> None:
         # status_changed_at tracks the STATUS, not the row — so stamp it here iff the status
         # actually moved. This keeps every .save() path correct (the admin status change
         # included) without each caller remembering, and stops an unrelated edit
@@ -211,7 +216,7 @@ class Tenant(TenantMixin):
                 kwargs["update_fields"] = {*update_fields, "status_changed_at"}
         return super().save(*args, **kwargs)
 
-    def delete(self, *args, **kwargs):
+    def delete(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, int]]:
         """Protect the public tenant."""
         if self.schema_name == get_public_schema_name():
             raise ProtectedError(
@@ -250,7 +255,7 @@ class Domain(DomainMixin):
             ),
         ]
 
-    def clean(self):
+    def clean(self) -> None:
         """Validate format + reserved-host rules for business-tenant domains.
 
         The public/management tenant is EXEMPT: its hosts are set by
@@ -265,7 +270,7 @@ class Domain(DomainMixin):
             return
         self.domain = validate_tenant_domain(self.domain)
 
-    def save(self, *args, **kwargs):
+    def save(self, *args: Any, **kwargs: Any) -> None:
         """Canonicalize the hostname on EVERY save path, then defer to DomainMixin.
 
         clean() is not enough: it only runs under full_clean() (admin form, explicit
@@ -323,14 +328,14 @@ class ReservedHostRule(models.Model):
             ),
         ]
 
-    def __str__(self):
+    def __str__(self) -> str:
         if self.match_type == self.MatchType.LABEL:
             scope = f" under {self.base_domain}" if self.base_domain else " (global)"
             return f"label '{self.value}'{scope}"
         return f"{self.match_type} '{self.value}'"
 
     @classmethod
-    def normalize(cls, match_type, value, base_domain=""):
+    def normalize(cls, match_type: str, value: str, base_domain: str = "") -> tuple[str, str]:
         """Normalize + validate (value, base_domain) for a match_type; return the pair.
 
         SINGLE source of truth for rule normalization, shared by clean() (admin) and
@@ -349,7 +354,7 @@ class ReservedHostRule(models.Model):
             raise ValidationError(f"Unknown match type: {match_type!r}.")
         return value, base_domain
 
-    def clean(self):
+    def clean(self) -> None:
         """Normalize + validate value/base_domain according to match_type."""
         super().clean()
         self.value, self.base_domain = self.normalize(
@@ -372,7 +377,7 @@ class ReservedHostRule(models.Model):
             return not base or host == base or host.endswith("." + base)
         return False
 
-    def candidate_q(self):
+    def candidate_q(self) -> models.Q:
         """A Q() returning a SUPERSET of the domains this rule matches — cheap to run
         in SQL so matches() (the authority) confirms only a narrowed set.
 
@@ -439,14 +444,14 @@ class TaskRun(models.Model):
         # x.report not fire for tenant Y") across every args variant of a task.
         indexes = [models.Index(fields=["task"], name="tenants_taskrun_task_idx")]
 
-    def __str__(self):
+    def __str__(self) -> str:
         # The signature is shown only when there is one — for a no-args entry ("") it would
         # be a constant in the operator's face on every row.
         sig = f"[{self.args_sig}]" if self.args_sig else ""
         return f"{self.task}{sig}@{self.schema} last={self.last_run_at:%Y-%m-%d %H:%M:%SZ}"
 
     @classmethod
-    def load_map(cls, task, args_sig):
+    def load_map(cls, task: str, args_sig: str) -> dict[str, datetime]:
         """{schema: last_run_at} for ONE schedule entry — one query per tick. Scoped by
         args_sig as well as task: another entry for the same task with different args keeps
         its own watermark."""
@@ -456,7 +461,8 @@ class TaskRun(models.Model):
         )
 
     @classmethod
-    def mark_ran(cls, task, args_sig, schemas, run_ts):
+    def mark_ran(cls, task: str, args_sig: str, schemas: Iterable[str],
+                 run_ts: datetime | str) -> None:
         """Bulk-upsert last_run_at=run_ts for the given schemas (after successful send)."""
         if not schemas:
             return
@@ -472,7 +478,7 @@ class TaskRun(models.Model):
         )
 
 
-def sync_tenant_timezone(schema_name, tz):
+def sync_tenant_timezone(schema_name: str, tz: str | None) -> int:
     """Set a tenant's IANA timezone on its PUBLIC Tenant row (default.public).
 
     The single writer of Tenant.timezone — intended for the in-schema settings singleton's

@@ -1,6 +1,8 @@
 from django.db import connection
 from django_tenants.utils import get_public_schema_name
 from rest_framework.permissions import BasePermission
+from rest_framework.request import Request
+from rest_framework.views import APIView
 
 from users.models import User
 
@@ -13,7 +15,7 @@ class IsTenantAdminOnPublic(BasePermission):
 
     message = "Only tenant administrators on the management host may access this."
 
-    def has_permission(self, request, view) -> bool:
+    def has_permission(self, request: Request, view: APIView) -> bool:
         if not request.user or not request.user.is_authenticated:
             return False
         # get_public_schema_name(), not the literal "public": this module lives in the

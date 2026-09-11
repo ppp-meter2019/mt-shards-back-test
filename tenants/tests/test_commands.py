@@ -27,7 +27,7 @@ TENANT_COMMANDS = [
 class TenantCommandGuardTests(SimpleTestCase):
     """USE_MULTITENANT guard on tenant-management commands (commons.platform.commands)."""
 
-    def test_all_tenant_commands_are_tenant_commands(self):
+    def test_all_tenant_commands_are_tenant_commands(self) -> None:
         for name in TENANT_COMMANDS:
             cmd = load_command_class("tenants", name)
             self.assertIsInstance(
@@ -36,7 +36,7 @@ class TenantCommandGuardTests(SimpleTestCase):
             )
 
     @override_settings(USE_MULTITENANT=False)
-    def test_refused_in_standalone(self):
+    def test_refused_in_standalone(self) -> None:
         # The guard is the first thing execute() does, so it raises before any
         # argument/DB work — calling execute() with no options is enough.
         for name in TENANT_COMMANDS:
@@ -47,12 +47,12 @@ class TenantCommandGuardTests(SimpleTestCase):
 
 
 class WarmCommandTests(SimpleTestCase):
-    def test_errors_when_redis_down(self):
+    def test_errors_when_redis_down(self) -> None:
         with mock.patch.object(rc_mod.resolve_cache, "redis_alive", return_value=False):
             with self.assertRaises(CommandError):
                 call_command("warm_resolve_cache")
 
-    def test_fill_and_force(self):
+    def test_fill_and_force(self) -> None:
         with mock.patch.object(rc_mod.resolve_cache, "redis_alive", return_value=True), \
              mock.patch.object(rc_mod.resolve_cache, "warm", return_value=3) as warm:
             call_command("warm_resolve_cache")
@@ -62,17 +62,17 @@ class WarmCommandTests(SimpleTestCase):
 
 
 class InvalidateCommandTests(SimpleTestCase):
-    def test_errors_when_redis_down(self):
+    def test_errors_when_redis_down(self) -> None:
         with mock.patch.object(rc_mod.resolve_cache, "redis_alive", return_value=False):
             with self.assertRaises(CommandError):
                 call_command("invalidate_resolve_cache", all=True)
 
-    def test_requires_a_target(self):
+    def test_requires_a_target(self) -> None:
         with mock.patch.object(rc_mod.resolve_cache, "redis_alive", return_value=True):
             with self.assertRaises(CommandError):
                 call_command("invalidate_resolve_cache")
 
-    def test_dispatch_to_ids_names_all(self):
+    def test_dispatch_to_ids_names_all(self) -> None:
         with mock.patch.object(rc_mod.resolve_cache, "redis_alive", return_value=True), \
              mock.patch.object(rc_mod.resolve_cache, "forget_ids", return_value=2) as fi, \
              mock.patch.object(rc_mod.resolve_cache, "forget_schemas", return_value=1) as fn, \

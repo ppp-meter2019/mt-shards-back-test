@@ -6,28 +6,28 @@ from tenants.errors import error_response, wants_json
 
 
 class ErrorResponseHelperTests(SimpleTestCase):
-    def setUp(self):
+    def setUp(self) -> None:
         self.rf = RequestFactory()
 
-    def test_wants_json_by_path_or_accept(self):
+    def test_wants_json_by_path_or_accept(self) -> None:
         self.assertTrue(wants_json(self.rf.get("/api/v1/x")))
         self.assertTrue(wants_json(self.rf.get("/", HTTP_ACCEPT="application/json")))
         self.assertFalse(wants_json(self.rf.get("/", HTTP_ACCEPT="text/html")))
 
-    def test_no_store_and_retry_after(self):
+    def test_no_store_and_retry_after(self) -> None:
         r = error_response(self.rf.get("/api/v1/x"), status=503, code="c", detail="d",
                            template="tenants/errors/not_ready.html", retry_after=300)
         self.assertEqual(r["Cache-Control"], "no-store")
         self.assertEqual(r["Retry-After"], "300")
 
-    def test_missing_template_falls_back_without_raising(self):
+    def test_missing_template_falls_back_without_raising(self) -> None:
         r = error_response(self.rf.get("/", HTTP_ACCEPT="text/html"), status=500, code="c",
                            detail="Boom", template="tenants/errors/__does_not_exist__.html")
         self.assertEqual(r.status_code, 500)
         self.assertIn(b"Boom", r.content)          # fallback rendered
         self.assertEqual(r["Cache-Control"], "no-store")
 
-    def test_extra_merged_into_json_body(self):
+    def test_extra_merged_into_json_body(self) -> None:
         import json
         r = error_response(self.rf.get("/api/v1/x"), status=503, code="tenant_not_ready",
                            detail="d", template="x", extra={"status": "new"})
@@ -37,7 +37,7 @@ class ErrorResponseHelperTests(SimpleTestCase):
 class ErrorTemplateRenderTests(SimpleTestCase):
     """Each branded page extends _base.html and renders (catches a broken base/blocks)."""
 
-    def test_all_pages_render_with_base(self):
+    def test_all_pages_render_with_base(self) -> None:
         from django.template.loader import render_to_string
         cases = {
             "tenants/errors/deactivated.html": "Account unavailable",

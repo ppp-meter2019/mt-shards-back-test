@@ -5,7 +5,7 @@ class TenantsConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "tenants"
 
-    def ready(self):
+    def ready(self) -> None:
         # Safety net for THIRD-PARTY / django_tenants code that pulls the context helpers out of
         # django_tenants.utils (e.g. django_tenants' own `collectstatic_schemas` command) — such
         # LATE importers (command modules load after ready()) then get our shard-aware versions

@@ -1,6 +1,9 @@
 """Bootstrap helper: create Shard rows for aliases declared in settings.DATABASES."""
 
+from typing import Any
+
 from django.conf import settings
+from django.core.management.base import CommandParser
 from commons.platform.commands import TenantCommand
 
 from tenants.models import Shard
@@ -9,13 +12,13 @@ from tenants.models import Shard
 class Command(TenantCommand):
     help = "Create Shard rows for any settings.DATABASES aliases that aren't yet registered."
 
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument(
             "--activate", action="store_true",
             help="Mark new non-default shards as is_active=True.",
         )
 
-    def handle(self, *args, **opts):
+    def handle(self, *args: Any, **opts: Any) -> None:
         existing = set(Shard.objects.values_list("alias", flat=True))
         created = 0
         for alias in settings.DATABASES:

@@ -12,7 +12,10 @@ unchanged, those hosts re-fill), so they are safe under the gate as-is.
 
 Fails loudly (CommandError) if Redis is unreachable, even under IGNORE_EXCEPTIONS.
 """
-from django.core.management.base import CommandError
+
+from typing import Any
+
+from django.core.management.base import CommandError, CommandParser
 
 from commons.platform.commands import TenantCommand
 
@@ -22,13 +25,13 @@ from tenants.resolver import CacheUnavailable, flags, resolve_cache
 class Command(TenantCommand):
     help = "Invalidate tenant-resolution cache entries (by id, by schema_name, or all)."
 
-    def add_arguments(self, parser):
+    def add_arguments(self, parser: CommandParser) -> None:
         group = parser.add_mutually_exclusive_group(required=True)
         group.add_argument("--ids", nargs="+", type=int, help="Tenant pk(s).")
         group.add_argument("--schemas", nargs="+", help="Tenant schema_name(s).")
         group.add_argument("--all", action="store_true", help="Invalidate ALL entries.")
 
-    def handle(self, *args, **opts):
+    def handle(self, *args: Any, **opts: Any) -> None:
         if not resolve_cache.redis_alive():
             raise CommandError("tenant_resolve Redis is not reachable")
         try:
