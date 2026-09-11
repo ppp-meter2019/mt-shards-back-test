@@ -706,7 +706,8 @@ When you need a fourth Aurora cluster (`tenant_3`):
 | Context | `tenants/context.py` | ContextVar `current_db` + `use_alias` + shard-aware `schema_context`/`tenant_context` (drop-in replacements for the django-tenants ones; also monkeypatched over them in `apps.ready()`) |
 | Models | `tenants/models.py` | Shard, Tenant (status FSM), Domain + protections |
 | Admin | `tenants/console/admin.py` | `public_admin_site` + Shard/Tenant/Domain/ReservedHostRule (`tenants/admin.py` is a one-line shim — Django autodiscovers `<app>.admin` by name) |
-| Router | `tenants/routers.py` | TenantSyncRouter + multi-DB guard |
+| Router | `tenants/routers.py` | TenantSyncRouter + multi-DB guard + the public data-migration filter |
+| **Merge seam** | `tenants_back/settings_base.py` | `_PUBLIC_MODEL_ALLOWLIST` — the models that may be USED on the public schema. The one thing the host merge edits: every per-tenant app already has its tables there (`settings_multitenant.py` splices all of `_BUSINESS_APPS` into `SHARED_APPS`, so every FK target of the identity model exists by construction — no closure to compute and get wrong), and `tenants/routers.py` refuses any query against a non-allowlisted tenant model on public (`PUBLIC_MODEL_GUARD` = raise\|warn\|off — `warn` is the merge measurement mode) and skips their data migrations there. `test_settings_invariants.MergeSeamContractTests` pins the contract |
 | Middleware | `tenants/middleware.py` | `ShardAwareTenantMiddleware` + `TenantShardRoutingMiddleware` (sync; tenant + shard routing) |
 | Views (runtime) | `tenants/views.py` | `health` only — imported by BOTH URLconfs |
 | Console | `tenants/console/` | Operator UI/API: Tenant/Shard/ReservedHostRule viewsets, serializers, admin, physical-state `probes.py`. Subpackage, not an app (no models); one-way boundary guarded by `scripts/ci_guard_console_boundary.sh` |

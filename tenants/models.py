@@ -156,6 +156,38 @@ class Tenant(TenantMixin):
     auto_create_schema = False
     auto_drop_schema   = False
 
+    class Meta:
+        indexes = [
+            # Both beat reads served by ONE partial, covering index:
+            #   interval fanout  ->  WHERE status='active' AND schema_name <> 'public'
+            #   calendar fanout  ->  ... AND timezone IS NOT NULL
+            # (commons.platform.tenancy.active_target_schemas / active_tenants_with_tz —
+            # re-read fresh on EVERY tick, deliberately uncached, so this is the read that
+            # repeats forever.)
+            #
+            # PARTIAL on status: the index holds only the rows beat ever looks at.
+            # COVERING (schema_name, timezone): those are the only two columns either query
+            # selects, so both are index-ONLY scans — the second predicate and the public
+            # exclusion are both answered from the index key without touching the heap.
+            #
+            # Conditioning on `timezone IS NOT NULL` instead would serve the calendar query
+            # and leave the interval one on a seq scan; conditioning on status serves both.
+            #
+            # NB the condition is the LITERAL "active", not Status.ACTIVE: a nested class
+            # body does not see the enclosing class body's namespace, so the enum name is
+            # unresolvable here (and `Tenant` is not bound yet either). It is also what the
+            # migration serializes either way. test_models pins the two together.
+            #
+            # NB2 PostgreSQL uses a partial index only when it can PROVE the query predicate
+            # implies the index predicate. `status = 'active'` matches literally; a future
+            # `status__in=[ACTIVE, ...]` would not, and the index would silently go unused.
+            models.Index(
+                fields=["schema_name", "timezone"],
+                name="tenants_tenant_active_idx",
+                condition=models.Q(status="active"),
+            ),
+        ]
+
     def __str__(self) -> str:
         return self.company_name
 

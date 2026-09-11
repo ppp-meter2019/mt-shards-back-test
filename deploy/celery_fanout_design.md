@@ -205,7 +205,7 @@ threaded through the lock, the due-check and `sub_dispatch`, so the three cannot
 entries take none, so a digest there would be a constant stamped on nearly every row and
 lock key while distinguishing nothing — and these rows are read by hand when asking why a
 task did not fire for a tenant. Uniqueness is unaffected (`""` cannot collide with 12 hex
-chars), and migration `0008_taskrun_args_sig` backfills existing rows with `""`, which is
+chars), and `args_sig` defaults to `""` for the no-args majority, which is
 the identity they already had.
 
 Enumeration helpers (`commons/platform/tenancy.py`), both EXCLUDE the public schema:

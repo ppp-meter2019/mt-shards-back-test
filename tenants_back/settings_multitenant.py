@@ -21,7 +21,12 @@ from commons.platform.beat import scoped_schedule
 # REST_FRAMEWORK, CELERY_BROKER_URL, CELERY_BEAT_SCHEDULE, ...); the second import is only
 # for the underscore-prefixed app blocks, which `import *` deliberately skips.
 from .settings_base import *  # noqa: F401,F403
-from .settings_base import _DJANGO_APPS, _THIRD_PARTY_APPS, _BUSINESS_APPS
+from .settings_base import (
+    _BUSINESS_APPS,
+    _DJANGO_APPS,
+    _PUBLIC_MODEL_ALLOWLIST,
+    _THIRD_PARTY_APPS,
+)
 
 # ---------------------------------------------------------------------------
 # Apps — reassemble the SHARED_APPS + TENANT_APPS union (django-tenants requires the
@@ -34,7 +39,10 @@ SHARED_APPS = [
     "django_tenants",
     *_DJANGO_APPS,
     *_THIRD_PARTY_APPS,
-    "users",
+    # EVERY per-tenant app, so that every FK target exists when the identity table is created
+    # here. Their tables stay empty: only settings_base._PUBLIC_MODEL_ALLOWLIST may be
+    # touched on this schema, and tenants.routers refuses the rest.
+    *_BUSINESS_APPS,
 ]
 
 # Apps that need a table in EVERY tenant schema. A deliberate SUBSET of contrib
@@ -45,8 +53,9 @@ TENANT_APPS = [
     "django.contrib.auth",
     "django.contrib.admin",
 
-    "users",
-
+    # The SAME list as in SHARED_APPS above, and the duplication is the mechanism: present in
+    # both schemas, the identity table SHADOWS — `search_path = [tenant, public]` resolves it
+    # to the tenant's own copy, so public's operators stay invisible from inside a tenant.
     *_BUSINESS_APPS,
 ]
 
@@ -80,12 +89,35 @@ DATABASE_ROUTERS = [
 # using the default DB (wrong shard). django.contrib contenttypes/auth/admin are TENANT apps
 # too but quasi-shared, and Django queries them from contexts we don't fully control (shell,
 # createsuperuser, internals) → they stay on the benign default and are NOT listed here.
-# `users` (the custom User model) IS strict: all its query sites were audited to run under a
+# The IDENTITY app is strict too: all its query sites were audited to run under a
 # routing context — request path (middleware), Celery (TenantTask), bootstrap_tenant
 # (tenant_context), bootstrap_public (public schema_context), and superuser/changepassword via
 # `tenant_command <cmd> --schema=<schema>`. A bare, contextless User query now raises loudly
 # (the router message points at tenant_command) instead of silently hitting the wrong shard.
-TENANT_STRICT_ROUTE_APPS = frozenset(_BUSINESS_APPS) | {"users"}
+# Exactly _BUSINESS_APPS, identity included: every per-tenant app is shard-partitioned, so a
+# contextless query to any of them is the same bug and earns the same loud refusal. A
+# frozenset because the router tests membership on EVERY db_for_read (O(1), not a scan), and
+# because a setting nothing may mutate at runtime is the honest type for it.
+TENANT_STRICT_ROUTE_APPS = frozenset(_BUSINESS_APPS)
+
+# Runtime-readable promotion of the merge-seam list (settings_base). Underscored at the
+# source because it is a settings-build INGREDIENT; public here because the ROUTER reads it
+# per call, in tenants.routers._guard_public. Immutable: nothing may rewrite it at runtime.
+#
+# The other half of that guard — WHICH apps it polices — is TENANT_STRICT_ROUTE_APPS above.
+# One set, three router behaviours: refuse a contextless query, skip data migrations on
+# public, refuse a query on public.
+PUBLIC_MODEL_ALLOWLIST = frozenset(_PUBLIC_MODEL_ALLOWLIST)
+
+# How tenants.routers._guard_public reacts to a tenant-model query aimed at the public
+# schema: "raise" | "warn" | "off".
+#
+# "raise" is the default because the allowlist above is complete for this repo, and a silent
+# empty answer from an empty table is the failure this whole arrangement exists to prevent.
+# Switch to "warn" for the MEASUREMENT pass at merge — run createsuperuser / login / the
+# admin against public and read the log instead of guessing what the host's identity save
+# path touches — then put it back.
+PUBLIC_MODEL_GUARD = "raise"
 
 # django-tenants backend (adds the schema_name connection attribute; wraps PostGIS via
 # ORIGINAL_BACKEND). DERIVES from the base DATABASES["default"] (plain PostGIS) WITHOUT
@@ -97,7 +129,7 @@ ORIGINAL_BACKEND = "django.contrib.gis.db.backends.postgis"
 
 # Platform base domains, for reference / future base-scoped rules. NOT read on the request
 # path — tenant resolution is by full Host. Reserved-host enforcement lives entirely in
-# tenants.ReservedHostRule (seeded in migration 0004): the service subdomains
+# tenants.ReservedHostRule (seeded in migration 0002): the service subdomains
 # (www/api/admin/...) are reserved GLOBALLY, and the apexes below as EXACT rules. Kept here
 # so the set of bases has one documented home.
 TENANT_BASE_DOMAINS = ("routegenie.com", "isi-technology.com")

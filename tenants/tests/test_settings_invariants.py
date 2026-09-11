@@ -176,3 +176,71 @@ class SettingsLocalContractTests(SimpleTestCase):
         for name in ("_aurora_db_options", "_proxy_db_options"):
             with self.subTest(name=name):
                 self.assertTrue(callable(getattr(dispatcher, name, None)))
+
+
+class MergeSeamContractTests(SimpleTestCase):
+    """_PUBLIC_MODEL_ALLOWLIST (settings_base) and its runtime promotion.
+
+    Every per-tenant app has its tables in the public schema, so the only per-model decision
+    left is which of them may be touched there. Each test pins a mistake that is otherwise
+    only discoverable by running against a real cluster.
+    """
+
+    def test_business_apps_are_in_both_app_lists(self) -> None:
+        """SHARED_APPS gets them so that every FK target exists when the identity table is
+        created in public; TENANT_APPS gets them because that is where their data lives.
+        SHARED-only would mean no tenant data at all; TENANT-only would fail
+        `migrate_schemas --shared` at CREATE TABLE."""
+        from tenants_back import settings_base
+        business = set(settings_base._BUSINESS_APPS)
+        self.assertLessEqual(business, set(settings.SHARED_APPS))
+        self.assertLessEqual(business, set(settings.TENANT_APPS))
+
+    def test_identity_app_is_a_business_app(self) -> None:
+        """The app owning AUTH_USER_MODEL is per-tenant like the rest — each schema has its
+        own users — and being in both lists is what makes the identity table SHADOW:
+        `search_path = [tenant, public]` resolves it to the tenant's own copy, so platform
+        operators are unreachable from inside a tenant. Structural, not a permission check.
+
+        Derived from AUTH_USER_MODEL rather than from a separate identity constant: naming
+        the identity app twice is itself the drift this pins."""
+        from tenants_back import settings_base
+        self.assertIn(settings.AUTH_USER_MODEL.split(".", 1)[0], settings_base._BUSINESS_APPS)
+
+    def test_identity_model_is_allowed_on_public(self) -> None:
+        """The platform operator IS a row in the identity table on public — that is what the
+        public admin authenticates. Drop the model from the allowlist and the guard refuses
+        the one query the whole arrangement exists to permit."""
+        self.assertIn(settings.AUTH_USER_MODEL.lower(), settings.PUBLIC_MODEL_ALLOWLIST)
+
+    def test_allowlisted_models_have_a_table_in_public(self) -> None:
+        """Allowing a model whose table is not in public is not a looser permission — every
+        query it permits is a ProgrammingError.
+
+        SHARED_APPS is the right bar, and it is wider than the per-tenant apps on purpose: a
+        genuinely shared app (django.contrib.*, third-party) has its tables there anyway. At
+        merge django_password_history is exactly that — UserPasswordHistory needs rows, and
+        the app rides in on _THIRD_PARTY_APPS.
+        """
+        shared = set(settings.SHARED_APPS)
+        for label in settings.PUBLIC_MODEL_ALLOWLIST:
+            self.assertIn(
+                label.split(".", 1)[0], shared,
+                f"{label!r} is allowed on public, but its app has no tables there.",
+            )
+
+    def test_runtime_promotion_matches_its_source(self) -> None:
+        """The router reads the public setting; the merge edits the private list. Nothing
+        stops the two from drifting except this."""
+        from tenants_back import settings_base
+        self.assertEqual(frozenset(settings_base._PUBLIC_MODEL_ALLOWLIST),
+                         settings.PUBLIC_MODEL_ALLOWLIST)
+
+    def test_model_labels_are_lower_cased_and_well_formed(self) -> None:
+        """Model._meta.label_lower is the form the guard compares against, so an entry in any
+        other form silently never matches — the guard would then refuse a model the allowlist
+        was written to permit."""
+        for label in settings.PUBLIC_MODEL_ALLOWLIST:
+            self.assertEqual(label, label.lower(), f"{label!r} must be lower-cased")
+            self.assertEqual(label.count("."), 1,
+                             f"{label!r} must be exactly 'app_label.modelname'")

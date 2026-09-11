@@ -91,7 +91,11 @@ _THIRD_PARTY_APPS = [
     "corsheaders",
 ]
 
+# ALL apps whose data is per-tenant — `users` included, since every schema has its own
+# users table. Under multitenant these go into BOTH app lists: a real populated copy per
+# tenant schema, and an empty structural copy in public (see _PUBLIC_MODEL_ALLOWLIST).
 _BUSINESS_APPS = [
+    "users",
     "customers",
     "drivers",
     "cars",
@@ -100,10 +104,55 @@ _BUSINESS_APPS = [
     "routes",
 ]
 
+# ---------------------------------------------------------------------------
+# The MERGE seam — the one list the host merge edits.
+# ---------------------------------------------------------------------------
+
+# Models that may be USED on the public schema.
+#
+# EVERY per-tenant app has its tables in public (settings_multitenant.py splices all of
+# _BUSINESS_APPS into SHARED_APPS), because the platform operator is a row in the
+# AUTH_USER_MODEL table and Django cannot create that table without every app its model
+# reaches through a relation. Marking only the FK closure would work too, but the closure has
+# to be COMPUTED and can be computed WRONG — and a half closure does not misbehave, it fails
+# `migrate_schemas --shared` at CREATE TABLE on a real cluster. Sharing all of them makes the
+# question disappear: every FK target is present by construction.
+#
+# The price is empty tables in public (~311 models at merge instead of ~236) and the
+# contenttype / permission rows that come with them. They cost nothing to hold; the one real
+# cost is that the public admin's permission widgets list them, which is a display filter to
+# be written, not a correctness problem.
+#
+# So the ONLY thing that still has to be decided per model is this: which of those tables may
+# actually be touched on public. Everything absent from this list is structure, and a query
+# against it there is a bug the router refuses (tenants.routers._guard_public).
+#
+# Today: the operator's identity plus the two through tables its group / permission
+# assignments live in (the public admin registers Group, so those rows are real).
+#
+# An entry's app need not be per-tenant at all — a genuinely shared app (django.contrib.*,
+# third-party) has its tables in public anyway. At merge django_password_history is that case:
+# UserPasswordHistory needs rows, and the app rides in on _THIRD_PARTY_APPS.
+#
+# The merge set is a MEASUREMENT, not a decision: run createsuperuser / login / the admin
+# against public with PUBLIC_MODEL_GUARD="warn" and read off what it logs. Known starting
+# points: accounts.driverprofile (User.save() probes it), accounts.staffprofile
+# (create_superuser), commons.change (the post_save audit hook).
+#
+# Lower-cased "app_label.modelname" — the form Model._meta.label_lower returns.
+_PUBLIC_MODEL_ALLOWLIST = [
+    "users.user",
+    "users.user_groups",
+    "users.user_user_permissions",
+]
+
+
 # Standalone base (the larger host project's mode): one default DB, no schemas — NO
 # 'tenants' / 'django_tenants'. Multi-tenant REASSEMBLES these blocks into a
 # SHARED_APPS+TENANT_APPS union (incl. tenants + django_tenants) in settings_multitenant.py.
-INSTALLED_APPS = [*_DJANGO_APPS, *_THIRD_PARTY_APPS, "users", *_BUSINESS_APPS]
+# In standalone there is one schema, so none of the public/tenant split applies: these are
+# ordinary installed apps.
+INSTALLED_APPS = [*_DJANGO_APPS, *_THIRD_PARTY_APPS, *_BUSINESS_APPS]
 
 
 # ---------------------------------------------------------------------------

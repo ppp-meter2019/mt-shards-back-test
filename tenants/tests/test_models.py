@@ -120,3 +120,23 @@ class StatusChangedAtTests(SimpleTestCase):
         f = Tenant._meta.get_field("status_changed_at")
         self.assertFalse(f.auto_now)           # see the class docstring: auto_now inverts this
         self.assertFalse(f.auto_now_add)
+
+
+class BeatIndexTests(SimpleTestCase):
+    """The partial index behind the two uncached beat reads (Tenant.Meta)."""
+
+    def test_condition_tracks_the_status_enum(self) -> None:
+        """Meta carries the literal "active" because a nested class body cannot see the
+        enclosing class body's namespace — Status.ACTIVE is unresolvable there. Nothing else
+        ties the two together, and a drifted value does not fail: the index simply matches no
+        row, both beat queries quietly become sequential scans, and only a slow tick shows
+        it."""
+        idx = next(i for i in Tenant._meta.indexes if i.name == "tenants_tenant_active_idx")
+        self.assertEqual(idx.condition, models.Q(status=Tenant.Status.ACTIVE))
+
+    def test_index_covers_both_beat_reads(self) -> None:
+        """Both reads select only these two columns, so an index carrying both answers them
+        without touching the heap. Drop `timezone` from the index and the calendar read still
+        works — just with a heap fetch per row, silently."""
+        idx = next(i for i in Tenant._meta.indexes if i.name == "tenants_tenant_active_idx")
+        self.assertEqual(idx.fields, ["schema_name", "timezone"])
