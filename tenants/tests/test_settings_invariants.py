@@ -8,6 +8,8 @@ from collections.abc import Sequence
 from django.conf import settings
 from django.test import SimpleTestCase
 
+from ._settings_ast import assert_literal_assignment
+
 
 class InstalledAppsInvariantTests(SimpleTestCase):
     def test_tenants_before_django_tenants(self) -> None:
@@ -127,27 +129,32 @@ class BootstrapFloatTests(SimpleTestCase):
 
 
 class SettingsLocalContractTests(SimpleTestCase):
-    """What a DEPLOYED settings_local.py may import from `tenants_back.settings`.
+    """What a DEPLOYED settings_local_multitenant.py may import from `tenants_back.settings`.
 
-    settings_local.py is gitignored and lives on the servers, so it cannot be migrated
-    together with the code — whatever it imports today must keep resolving. The trap is that
-    settings.py is a DISPATCHER built out of `import *`, and `import *` silently skips
-    underscore-prefixed names: the _aurora_db_options / _proxy_db_options helpers only reach
-    it because the dispatcher re-exports them EXPLICITLY.
+    That file is gitignored and lives on the servers, so it cannot be migrated together with
+    the code — whatever it imports today must keep resolving. The trap is that settings.py is
+    a DISPATCHER built out of `import *`, and `import *` silently skips underscore-prefixed
+    names: the _aurora_db_options / _proxy_db_options helpers (defined in
+    settings_multitenant.py) only reach it because the dispatcher re-exports them EXPLICITLY.
 
-    The failure is silent and total: a missing name raises ImportError inside
-    `try: from .settings_local import *`, the except swallows it, and the process boots on dev
-    defaults — DEBUG=True, ALLOWED_HOSTS=["*"], the insecure SECRET_KEY, localhost DB. It
-    happened for real when settings.py was split into base + dispatcher.
+    The failure used to be silent and total: a missing name raised ImportError inside
+    `try: from .settings_local import *`, a bare `except ImportError` swallowed it, and the
+    process booted on dev defaults — DEBUG=True, ALLOWED_HOSTS=["*"], the insecure SECRET_KEY,
+    localhost DB. It happened for real when settings.py was split into base + dispatcher. The
+    dispatcher's except is now narrowed to "this exact module does not exist", so the same
+    mistake is loud — but the re-export still has to be there for the file to load at all.
 
-    The expected names are parsed from the TRACKED settings_local.py.example, so the two
-    cannot drift: add an import there and this test starts requiring it.
+    The expected names are parsed from the TRACKED .example, so the two cannot drift: add an
+    import there and this test starts requiring it.
     """
 
-    def _example_imports(self) -> list[str]:
+    MT_EXAMPLE = "settings_local_multitenant.py.example"
+    STANDALONE_EXAMPLE = "settings_local.py.example"
+
+    def _example_imports(self, filename: str) -> list[str]:
         import ast
-        example = (settings.BASE_DIR / "tenants_back" / "settings_local.py.example")
-        self.assertTrue(example.exists(), "settings_local.py.example is missing")
+        example = settings.BASE_DIR / "tenants_back" / filename
+        self.assertTrue(example.exists(), f"{filename} is missing")
         return [
             alias.name
             for node in ast.walk(ast.parse(example.read_text(encoding="utf-8")))
@@ -157,16 +164,16 @@ class SettingsLocalContractTests(SimpleTestCase):
 
     def test_dispatcher_exports_everything_the_example_imports(self) -> None:
         import tenants_back.settings as dispatcher
-        names = self._example_imports()
+        names = self._example_imports(self.MT_EXAMPLE)
         self.assertTrue(names, "the example no longer imports from .settings — update this test")
         for name in names:
             with self.subTest(name=name):
                 self.assertTrue(
                     hasattr(dispatcher, name),
-                    f"settings_local.py.example does `from .settings import {name}`, but the "
-                    f"dispatcher does not expose it. `import *` skips underscore names — "
-                    f"re-export it explicitly in tenants_back/settings.py, or a deployed "
-                    f"settings_local.py will fail to load SILENTLY.",
+                    f"{self.MT_EXAMPLE} does `from .settings import {name}`, but the dispatcher "
+                    f"does not expose it. `import *` skips underscore names — re-export it "
+                    f"explicitly in the multi-tenant branch of tenants_back/settings.py, or a "
+                    f"deployed settings_local_multitenant.py will fail to load.",
                 )
 
     def test_underscore_helpers_are_re_exported(self) -> None:
@@ -176,6 +183,44 @@ class SettingsLocalContractTests(SimpleTestCase):
         for name in ("_aurora_db_options", "_proxy_db_options"):
             with self.subTest(name=name):
                 self.assertTrue(callable(getattr(dispatcher, name, None)))
+
+    def test_standalone_example_does_not_import_the_aurora_helpers(self) -> None:
+        """The standalone branch of the dispatcher deliberately does NOT re-export them:
+        Aurora / RDS Proxy is multi-tenant deployment topology, and the helpers now live in
+        settings_multitenant.py. A standalone local file that imported one would raise
+        ImportError at boot — catch the drift here instead, in the .example."""
+        names = self._example_imports(self.STANDALONE_EXAMPLE)
+        for forbidden in ("_aurora_db_options", "_proxy_db_options", "AWS_RDS_CA"):
+            self.assertNotIn(
+                forbidden, names,
+                f"{self.STANDALONE_EXAMPLE} imports {forbidden}, which the standalone branch "
+                f"of tenants_back/settings.py does not expose. Spell the OPTIONS out inline "
+                f"instead, or move the helper — do not re-export the MT layer into standalone.",
+            )
+
+
+class MultitenantDatabasesContractTests(SimpleTestCase):
+    """settings_multitenant.py must BUILD DATABASES, never derive it from the base.
+
+    The base `default` is the STANDALONE database — in the host project, its real
+    single-tenant production DB. The overlay used to spread it (`{**DATABASES, "default":
+    {**DATABASES["default"], ...}}`), which meant flipping USE_MULTITENANT on would aim
+    django-tenants at whatever database the base happened to name. Source-level, because the
+    resolved setting says nothing: a local settings file overwrites DATABASES either way.
+    """
+
+    def test_databases_is_a_plain_literal(self) -> None:
+        assert_literal_assignment(self, "DATABASES")
+
+    def test_engine_is_the_django_tenants_backend(self) -> None:
+        """The backend is a property of the MODE, so it is declared in this layer and not
+        left to every deployed local settings file."""
+        self.assertEqual(
+            settings.DATABASES["default"]["ENGINE"], "django_tenants.postgresql_backend",
+        )
+        self.assertEqual(
+            settings.ORIGINAL_BACKEND, "django.contrib.gis.db.backends.postgis",
+        )
 
 
 class MergeSeamContractTests(SimpleTestCase):

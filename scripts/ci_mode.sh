@@ -6,9 +6,10 @@
 # The suite is entirely SimpleTestCase (no live DB). `makemigrations --check` and
 # `check` are DB-free too, so CI needs no Postgres service.
 #
-# NOTE: CI must NOT have tenants_back/settings_local.py (it is gitignored and pins
-# the django_tenants DB engine, which would mask the standalone backend). A clean
-# checkout satisfies this automatically.
+# The local settings files are per mode (settings_local_multitenant.py /
+# settings_local.py), so a stray multi-tenant one can no longer leak its
+# django_tenants DB engine into the standalone run. Both are gitignored, and a clean
+# checkout has neither.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

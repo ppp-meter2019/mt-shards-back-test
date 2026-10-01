@@ -55,7 +55,7 @@ base, selected by a single boot-time flag `USE_MULTITENANT`.
 ## 1. Mode resolver — DONE (Phase 1)
 
 `settings_base.py`, evaluated at import time (it gates INSTALLED_APPS / DB backend /
-middleware, so it cannot come from `settings_local` imported last, nor from the
+middleware, so it cannot come from a local settings file imported last, nor from the
 DB). The dispatcher `settings.py` calls the same resolver to pick its branch:
 
 ```python
@@ -88,9 +88,49 @@ else:
 | File | Role |
 |---|---|
 | `settings_base.py` | the **standalone/shared base** — complete on its own, no scattered `if USE_MULTITENANT` |
-| `settings_multitenant.py` | the MT overlay; **star-imports the base itself**, then augments it |
-| `settings.py` | a ~40-line **dispatcher**: picks one branch, then applies `settings_local` |
-| `settings_local.py` | production overrides, applied LAST so they win over base AND overlay |
+| `settings_multitenant.py` | the MT overlay; **star-imports the base itself**, then augments it — except `DATABASES`, which it REPLACES |
+| `settings.py` | the **dispatcher**: picks one branch, then applies that mode's local file |
+| `settings_local.py` / `settings_local_multitenant.py` | production overrides, **one per mode**, applied LAST so they win over base AND overlay |
+
+### 3.0 One local settings file PER MODE
+
+One local settings file shared by both modes could not work. A deployed multi-tenant one
+pins `ENGINE` to the django-tenants backend and declares the `tenant_*` shards, so loading it
+under `USE_MULTITENANT=0` produced a "standalone" config running on the multi-tenant backend.
+`scripts/ci_mode.sh` used to work around exactly that, by REQUIRING the file to be absent in
+CI. Two names make the separation structural.
+
+Standalone keeps the PLAIN name `settings_local.py`, because standalone is the host project's
+mode — the MT layer drops into a project that already has one, and nothing on that side needs
+renaming. Only the multi-tenant file carries a suffix: `settings_local_multitenant.py`.
+
+The load stays in the dispatcher rather than moving to the bottom of `settings_base.py` /
+`settings_multitenant.py`, for two reasons:
+
+1. A local file does `from .settings import DATABASES, …`, which resolves only because by
+   that point `tenants_back.settings` already has those names bound by its star-import.
+   Loaded from inside `settings_multitenant.py`, `tenants_back.settings` would still be a
+   **partially initialized** module holding nothing — `ImportError`. Same class of breakage
+   as the pre-split layout described below.
+2. `settings_base.py` would need an `if USE_MULTITENANT` at its bottom, or the overlay's
+   `from .settings_base import *` would drag the STANDALONE production overrides into MT.
+   Not having that `if` in the base is the whole point of the split.
+
+Both `except` clauses in the dispatcher are narrowed to "this exact module does not exist".
+An `ImportError` raised INSIDE a local file now propagates instead of being swallowed into a
+silent boot on dev defaults.
+
+### 3.0b Multi-tenant builds its own `DATABASES`
+
+`settings_multitenant.py` does **not** derive `DATABASES` from the base. The base `default`
+is the STANDALONE database — in the host project, its real single-tenant production DB — so
+the old `{**DATABASES, "default": {**DATABASES["default"], …}}` meant that flipping
+`USE_MULTITENANT` on aimed django-tenants at whatever database the base happened to name.
+The overlay now rebinds `DATABASES` to a literal dict: a localhost dev `default` on its own
+`NAME`, and nothing else. Every real cluster and every `tenant_*` shard is declared in
+`settings_local_multitenant.py`, which also makes the local file the sole source of the shard
+universe (`Shard.clean()` refuses an alias absent from `DATABASES`). Pinned by
+`test_settings_invariants.MultitenantDatabasesContractTests`.
 
 `DJANGO_SETTINGS_MODULE` stays `tenants_back.settings` everywhere (manage.py, wsgi, asgi,
 celery, `bin/gunicorn_start.sh`, `scripts/`) — the mode is chosen inside the dispatcher, not
@@ -106,10 +146,11 @@ base blocks (`_DJANGO_APPS`/`_THIRD_PARTY_APPS`/`_BUSINESS_APPS`) and the object
 `from .settings_base import *`, then reassembles the union INSTALLED_APPS + overrides the rest.
 
 > **Trap.** `import *` skips underscore-prefixed names, so the dispatcher must RE-EXPORT
-> `_aurora_db_options` / `_proxy_db_options` explicitly — a deployed `settings_local.py`
-> imports them from `.settings`. Without that line it raises ImportError, which the
-> dispatcher's `except` swallows into a SILENT boot on dev defaults (DEBUG=True,
-> ALLOWED_HOSTS=["*"], the insecure SECRET_KEY). Pinned by
+> `_aurora_db_options` / `_proxy_db_options` explicitly — a deployed
+> `settings_local_multitenant.py` imports them from `.settings`. Both helpers (and
+> `AWS_RDS_CA`) live in `settings_multitenant.py`, not in the base: Aurora + RDS Proxy is
+> multi-tenant deployment topology, and the standalone branch deliberately does NOT re-export
+> them. Without the re-export line the local file raises ImportError at boot. Pinned by
 > `test_settings_invariants.SettingsLocalContractTests`. The mode flag resolves via
 `commons/platform/mode.py::use_multitenant()` (settings-load-safe — does NOT read
 `django.conf.settings`, which would cache incomplete settings). Verified behavior-preserving:
@@ -143,15 +184,15 @@ not by preference:
 |---|---|---|---|---|
 | **bootstrap** | env var → `settings_mode.py` (gitignored) | settings-LOAD, before `django.conf.settings` exists | values consumed while `settings.py` runs — can't touch settings/DB yet | `USE_MULTITENANT`, `FANOUT_PERIOD_SECONDS` (both via `commons.platform.mode`) |
 | **runtime** | `settings.py` / `settings_multitenant.py` (django settings) | request / task runtime (`django.conf.settings`) | everything read after boot | `TENANT_BEAT` knobs, `CELERY_BEAT_SCHEDULE`, queues, caches |
-| **prod override** | `settings_local.py` (gitignored, loaded LAST) | settings-load, AFTER the two above | environment secrets/hosts that must win over base + MT overlay | DB creds, Redis URLs, bucket names |
+| **prod override** | `settings_local_<mode>.py` (gitignored, loaded LAST) | settings-load, AFTER the two above | environment secrets/hosts that must win over base + MT overlay | DB creds, Redis URLs, bucket names |
 
 Why the split is load-order, not taste:
-- A **bootstrap** value CANNOT live in `settings_local.py` or `TENANT_BEAT` — both are read too
+- A **bootstrap** value CANNOT live in a local settings file or `TENANT_BEAT` — both are read too
   late (the beat schedule is already baked at MT-overlay load; reading `django.conf.settings`
   mid-`settings.py` would cache an incomplete settings object). That is exactly why
   `FANOUT_PERIOD_SECONDS` is resolved by `commons.platform.mode.bootstrap_float()`
   (env → `settings_mode.py` → default), NOT a `TENANT_BEAT` key.
-- `settings_local.py` loads LAST so production wins over both base and the MT overlay.
+- The mode's local file loads LAST so production wins over both base and the MT overlay.
 - **runtime** knobs (`TENANT_BEAT`) fall back to in-code `BEAT_DEFAULTS`; ship `TENANT_BEAT = {}`
   and override only what differs (no duplication of defaults).
 
@@ -160,13 +201,31 @@ Why the split is load-order, not taste:
 Installed only in MT; absent in standalone: models (`Tenant/Shard/Domain/
 ReservedHostRule`), `middleware`, `routers`, `context`, `resolver/*`,
 `validators`, `admin` (`public_admin_site`), management commands, migrations,
-`celery/*`. Audit confirms nothing outside `tenants` imports it (the one
-exception, `users/admin.py`, was fixed via the facade).
+`celery/*`.
+
+Invariant 2 says business code reaches `tenants` only through `commons.platform`. What
+follows is the KNOWN STATE, not the result of a one-off audit — this paragraph used to say
+"audit confirms nothing outside `tenants` imports it", which was true when written and then
+went stale in silence:
+
+| Importer | Status |
+|---|---|
+| `users/admin.py` | **fixed** — goes through `commons.platform.admin.management_site()` |
+| `routes/management/commands/{list,loadtest}_offline_coordinates_s3.py` | **open, accepted** — `from tenants.models import Tenant`. Loadtest/ops tooling that does not migrate to the host project, so a facade entry is not worth it. Running either under `USE_MULTITENANT=0` fails at import with `AttributeError: 'Settings' object has no attribute 'TENANT_MODEL'` — an unhelpful message, but out of reach of anything that ships. |
+
+**No guard enforces this invariant.** The five static checks cover `connection.schema_name`,
+the routing axis, context imports, the console boundary and raw redis-py — not this one. A
+sixth rule in `scripts/ci_guard_ast.py` would be a few lines (an `ast.ImportFrom` whose module
+starts with `tenants.`, outside `tenants/`), and would need the two commands above in its
+allowlist.
 
 ## 5. `connection.schema_name` readers outside `tenants` — Phase 2
 
-Audited (`grep -rn connection.schema_name` minus `tenants/`). Each must be
-standalone-safe:
+Audited. The authoritative list is `SCHEMA_ALLOW` in `scripts/ci_guard_ast.py`; the table
+below mirrors it with the reasoning. It is no longer reproducible by grepping for
+`connection.schema_name`: the guard matches the ATTRIBUTE on any connection-bound name, so
+`conn.schema_name` after `from django.db import connection as conn` counts too — a form the
+old grep silently missed. Each entry must be standalone-safe:
 
 | File | Role | Standalone handling |
 |---|---|---|
@@ -176,6 +235,7 @@ standalone-safe:
 | `users/signals.py` | `stamp_tenant_schema` (login) | **FIX**: defensive `getattr(connection,"schema_name",None)` → no-op in standalone |
 | `users/permissions.py` | `_on_tenant()` — used by **all** business viewsets | **FIX**: mode-aware — returns `True` in standalone (no public/tenant split) |
 | `products/management/commands/seed_products.py` | dev seed | **FIX**: mode-safe reads; the "skip public" guard is MT-only |
+| `commons/platform/cache_keys.py` | Redis key token (`tenant:<schema>:…`) | **BRANCH**: the read sits inside `if settings.USE_MULTITENANT`, so it cannot execute on the plain PostGIS backend. Stronger than the rows above — in standalone the module is never imported at all, since no `KEY_FUNCTION` is wired there |
 
 `users/permissions.py` is the critical one: every business viewset
 (`cars/drivers/products/orders`) gates on `_on_tenant()`. Left unchanged,
@@ -237,23 +297,48 @@ registration goes through `management_site()` (done).
 ## 11. CI — Phase 3
 
 The CI logic is platform-agnostic shell, so the host project can wire it into
-whatever CI it uses (decided at merge time). Three steps:
+whatever CI it uses (decided at merge time). Two mode jobs plus the static guards:
 
 ```sh
-scripts/ci_guard_schema_name.sh    # §5 guard — connection.schema_name only in audited files
 scripts/ci_mode.sh mt              # USE_MULTITENANT=1: check + makemigrations --check + full suite
 scripts/ci_mode.sh standalone      # USE_MULTITENANT=0: check + makemigrations --check + business/users suite
+
+for g in scripts/ci_guard_*.sh; do "$g"; done   # all static guards; each is DB-free
 ```
 
+Two of the five (`ci_guard_schema_name.sh`, `ci_guard_redis_client.sh`) are now thin wrappers
+over `scripts/ci_guard_ast.py`, which parses SYNTAX instead of matching text. They used to be
+greps, and greps failed them three ways: they enumerated spellings (so `redis.from_url()` —
+one of the two documented ways to build a client — went unseen), they anchored on the literal
+name `connection` (so one `import connection as conn` disabled the schema rule entirely), and
+they treated source as text (so a file that merely MENTIONED a pattern in a docstring failed,
+which in settings modules that are over half prose was a matter of time). The allowlists live
+in that file. The other three are still greps and carry the same limitations.
+
+**Nothing runs the guards today.** There is no `.github/`, `Makefile`, `tox.ini`, pre-commit
+config or git hook in this repo, and `ci_mode.sh` does not invoke them — so until the host
+project wires the loop above, each guard is a check someone has to type. Treat the table
+below as "what this check REPORTS when run", not as an enforced invariant.
+
+| Guard | Reports |
+|---|---|
+| `ci_guard_schema_name.sh` | §5 — an un-audited read of the connection's `schema_name` outside `tenants/`, in ANY spelling the module's own imports allow, which breaks standalone (the attribute does not exist on the plain PostGIS backend). Model fields that share the name (`Tenant.schema_name`) are correctly ignored |
+| `ci_guard_context_import.sh` | context helpers imported from `django_tenants.utils` instead of `tenants.context` (the `apps.ready()` monkeypatch is partial by nature — `deploy/UPSTREAM_FORK.md` §4) |
+| `ci_guard_routing_axis.sh` | the routing axis escaping `tenants/context.py` |
+| `ci_guard_console_boundary.sh` | runtime code importing `tenants.console` (one-way boundary) |
+| `ci_guard_redis_client.sh` | anything that can yield a raw redis-py client outside the two sanctioned choke points, where `KEY_FUNCTION` cannot tenant-scope the keys (`deploy/redis_keys_design.md` §4). `from redis.exceptions import …` is correctly ignored — handling a Redis error is not acquiring a client |
+
 As a matrix: run `ci_mode.sh` with `mode ∈ {mt, standalone}` in parallel, plus the
-guard as its own job. (`PYTHON=…` overrides the interpreter.)
+guards as their own job. (`PYTHON=…` overrides the interpreter.)
 
 Notes:
 - **DB-free.** The whole suite is `SimpleTestCase`, and `check` /
   `makemigrations --check` do not connect — so CI needs **no Postgres service**.
   Add a PostGIS service only when DB-backed tests are introduced.
-- **No `settings_local.py` in CI.** It is gitignored and pins the django_tenants
-  DB engine, which would mask the standalone backend; a clean checkout has none.
+- **No local settings file in CI.** Both are gitignored and a clean checkout has
+  neither. Since the split into `settings_local.py` /
+  `settings_local_multitenant.py`, a stray multi-tenant one can no longer leak its
+  django_tenants DB engine into the standalone run.
 - **Standalone runs explicit labels** (`users` + business apps), never bare
   `manage.py test`: `tenants` is not installed, so importing `tenants/tests/*`
   (which import `tenants.models`) would fail at collection.

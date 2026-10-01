@@ -58,9 +58,15 @@ def bound_alias() -> str | None:
 
     That None is load-bearing and must not be collapsed: it is what lets TenantDatabaseRouter
     tell a genuinely context-free query (a bug — the strict guard raises) from one deliberately
-    routed to "default". The router is the only intended caller; every other reader wants
-    active_alias(). Both exist so that nothing outside this module has to touch the ContextVar
-    itself — enforced by scripts/ci_guard_routing_axis.sh.
+    routed to "default".
+
+    TWO intended callers, for the same reason: the router, and commons.platform.cache_keys.
+    A Redis key NAMES a tenant, so "no context" and "deliberately default" must not read the
+    same — django_tenants resets the schema at the start of process_request and never on
+    close, so between requests connections["default"] holds the tenant just served, and a
+    reader that coalesced would mint keys in that tenant's namespace. Every OTHER reader
+    wants active_alias(). Both exist so that nothing outside this module has to touch the
+    ContextVar itself — enforced by scripts/ci_guard_routing_axis.sh.
     """
     return current_db.get()
 

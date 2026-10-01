@@ -2,9 +2,9 @@
 
 This file is complete on its own: it IS the standalone configuration. The multi-tenant
 overlay (settings_multitenant.py) star-imports this module and augments it; `settings.py` is
-a thin dispatcher that picks one of the two and then applies settings_local.py. See the
-dispatcher's docstring for the layer order, and deploy/standalone_multitenant_design.md §3.1
-for why the tiers are what they are.
+a thin dispatcher that picks one of the two and then applies THAT MODE'S local settings file
+(settings_local.py here). See the dispatcher's docstring for the layer order, and
+deploy/standalone_multitenant_design.md §3.1 for why the tiers are what they are.
 
 Nothing here may import settings_multitenant: the dependency runs base <- overlay, one way.
 That is the point of the split. The alternative — the overlay importing individual names back
@@ -49,21 +49,10 @@ CSRF_TRUSTED_ORIGINS = [
     o.strip() for o in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if o.strip()
 ]
 
-# AWS RDS Certificate Authority bundle, used by psycopg's sslrootcert when
-# DB_SSL=1 to verify Aurora's TLS certificate. The file is vendored in the
-# repo at deploy/certs/ so deployment doesn't need to fetch it separately.
-# To refresh (AWS rotates CAs every few years):
-#   curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
-#        -o deploy/certs/aws-rds-global-bundle.pem
-AWS_RDS_CA = os.environ.get(
-    "AWS_RDS_CA",
-    str(BASE_DIR / "deploy" / "certs" / "aws-rds-global-bundle.pem"),
-)
-
 # TLS / reverse-proxy settings (SECURE_PROXY_SSL_HEADER, USE_X_FORWARDED_HOST,
 # SESSION_COOKIE_SECURE, CSRF_COOKIE_SECURE) are NOT set here - they would
 # break local dev where Django runs on plain http://localhost. Production
-# values live in settings_local.py (see settings_local.py.example).
+# values live in settings_local.py (see the .example).
 
 
 # ---------------------------------------------------------------------------
@@ -220,18 +209,22 @@ ASGI_APPLICATION = None
 
 
 # ---------------------------------------------------------------------------
-# Databases.
+# Databases - STANDALONE.
 #
-# Only the `default` alias is defined here, with dev defaults pointing at a
-# local Postgres. Production overrides this entry and adds the `tenant_*`
-# shards in settings_local.py - use the _aurora_db_options() helper there to
-# build per-cluster OPTIONS (connect_timeout + verify-full TLS against AWS
-# RDS CA).
+# Only the `default` alias, with dev defaults pointing at a local Postgres.
+# Production overrides it in settings_local.py.
+#
+# Multi-tenant does NOT inherit this entry: settings_multitenant.py REPLACES
+# DATABASES with its own literal dict. That is deliberate. This base is what the
+# standalone HOST PROJECT ships, so its `default` is that project's real,
+# single-tenant database - deriving the MT config from it would aim
+# django-tenants at a live production database the moment USE_MULTITENANT flips
+# on. The two modes must not share a DB definition, only a settings file.
 # ---------------------------------------------------------------------------
 DATABASES = {
     "default": {
-        # Standalone base: plain PostGIS. Multi-tenant overrides ENGINE to the
-        # django-tenants backend (+ ORIGINAL_BACKEND) in settings_multitenant.py.
+        # Standalone: plain PostGIS. Multi-tenant does not reuse this entry at all -
+        # settings_multitenant.py builds its own DATABASES from scratch.
         "ENGINE":             "django.contrib.gis.db.backends.postgis",
         "NAME":               "tenants_back",
         "USER":               "postgres",
@@ -244,53 +237,16 @@ DATABASES = {
         # sizing" in deploy/DATABASE_SETUP.md), so a non-zero value here would silently
         # multiply by a topology this file knows nothing about — and this same base is
         # what the standalone host project inherits. Production raises it where the
-        # topology and Aurora max_connections ARE known: settings_local.py sets
-        # CONN_MAX_AGE=60 per alias (see settings_local.py.example).
+        # topology and max_connections ARE known: settings_local.py sets
+        # CONN_MAX_AGE per alias (see the .example).
         "CONN_MAX_AGE":       0,
         # Kept True although it is INERT at CONN_MAX_AGE=0 (there is no reused connection
-        # to health-check): it must already be in place for the settings_local override
+        # to health-check): it must already be in place for the local-settings override
         # that raises CONN_MAX_AGE, where a stale pooled connection is a real failure mode.
         "CONN_HEALTH_CHECKS": True,
         "OPTIONS":            {"connect_timeout": 5},
     },
 }
-
-
-def _aurora_db_options(connect_timeout=5):
-    """Build the OPTIONS dict for an Aurora database entry.
-
-    Used in settings_local.py when defining production DATABASES entries.
-    Returns connect_timeout + verify-full TLS using the vendored AWS RDS CA.
-    """
-    return {
-        "connect_timeout": connect_timeout,
-        "sslmode":         "verify-full",
-        "sslrootcert":     AWS_RDS_CA,
-    }
-
-
-def _proxy_db_options(connect_timeout=5):
-    """Build the OPTIONS dict for a database entry that connects through RDS Proxy.
-
-    Unlike a direct Aurora connection, RDS Proxy presents an ACM certificate that
-    chains to the public Amazon Trust Services / Starfield roots - NOT the Amazon
-    RDS CA in AWS_RDS_CA. So verify-full must validate against the OS trust store,
-    which contains those roots.
-
-    We point sslrootcert at the OS bundle FILE, not the special value "system":
-    with the psycopg binary wheel (bundled libpq + OpenSSL), "system" resolves to
-    the wheel's compiled-in OpenSSL dir, NOT the distro's /etc/ssl/certs, so it
-    fails with "certificate verify failed". An explicit path is honored regardless
-    of impl. Override PROXY_CA_BUNDLE if the OS bundle lives elsewhere (RHEL:
-    /etc/pki/tls/certs/ca-bundle.crt). Used in settings_local.py for DATABASES
-    entries whose HOST is a *.proxy-*.rds.amazonaws.com endpoint.
-    """
-    return {
-        "connect_timeout": connect_timeout,
-        "sslmode":         "verify-full",
-        "sslrootcert":     os.environ.get(
-            "PROXY_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt"),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +287,12 @@ SIMPLE_JWT = {
 # Cache: a single Redis for the app cache + Django sessions. In production this
 # maps to one ElastiCache cluster (maxmemory-policy=allkeys-lru is fine — it's
 # a disposable cache; sessions also live in the DB via cached_db, see below).
+#
+# ONE alias, and that is the whole standalone story: with a single tenant there is nothing
+# to separate, so keys keep Django's own `<KEY_PREFIX>:<version>:<key>` layout and sessions
+# share this cache. Multi-tenant REPLACES this dict wholesale (it does not merge into it) —
+# see settings_multitenant.py, where `default` becomes tenant-scoped and the aliases that
+# must NOT be scoped are declared alongside it.
 # ---------------------------------------------------------------------------
 CACHES = {
     "default": {
@@ -339,6 +301,7 @@ CACHES = {
         "KEY_PREFIX": "app",
         "OPTIONS": {
             "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            # Fail-OPEN: a disposable cache must not turn a Redis blip into a 5xx.
             "IGNORE_EXCEPTIONS": True,
             "SOCKET_CONNECT_TIMEOUT": 1,
             "SOCKET_TIMEOUT": 1,
@@ -346,15 +309,15 @@ CACHES = {
     },
 }
 
-# Multi-tenant adds a dedicated `tenant_resolve` cache (host->Tenant+shard) and the
-# TENANT_RESOLVE / TENANT_REGISTRY resolver-config dicts — see settings_multitenant.py.
-
 # API path prefixes — request-handling code that treats API traffic as stateless/JSON:
 # the session guard (users.middleware) and error content negotiation (tenants.errors).
 # Single source of truth so the two stay in sync.
 API_PATH_PREFIXES = ("/api/v1/", "/open_api/api/v1/")
 
 SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"
+# Standalone: sessions ride the one cache there is. Multi-tenant moves them to a dedicated
+# unscoped alias, because there `default` carries a per-tenant KEY_FUNCTION while the session
+# table does not — see the SESSION_CACHE_ALIAS note in settings_multitenant.py.
 SESSION_CACHE_ALIAS = "default"
 
 
@@ -464,7 +427,7 @@ CELERY_BEAT_SCHEDULE = {}
 # coordinate storage off MongoDB (Jira IT-21249); objects are written under a
 # per-tenant (numeric id), date-partitioned prefix so downstream analytics
 # (Athena / Kinesis-Firehose, Jira IT-21374) can scan by tenant + day.
-# Bucket + region are environment-specific -> override in settings_local.py.
+# Bucket + region are environment-specific -> override in the mode's local settings file.
 # Credentials come from the instance / ECS-task IAM role (no keys in code).
 # ---------------------------------------------------------------------------
 AWS_S3_COORDINATES_BUCKET = os.environ.get("AWS_S3_COORDINATES_BUCKET", "")

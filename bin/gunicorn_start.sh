@@ -59,8 +59,10 @@ export PYTHONPATH=$DJANGODIR:$PYTHONPATH
 echo "export done"
 
 # All production-specific values (SECRET_KEY, ALLOWED_HOSTS, CSRF_TRUSTED_ORIGINS,
-# CORS rules, DB credentials, …) live in tenants_back/settings_local.py — copy it
-# from tenants_back/settings_local.py.example before first start.
+# CORS rules, DB credentials, …) live in the mode's local settings file —
+# tenants_back/settings_local_multitenant.py when USE_MULTITENANT is on, otherwise
+# tenants_back/settings_local.py. Copy it from the matching .example
+# before first start.
 
 # Create the run directory if it doesn't exist (tmpfs and reboots may wipe it)
 RUNDIR=$(dirname $SOCKFILE)

@@ -27,7 +27,7 @@ def use_multitenant() -> bool:
 def bootstrap_float(name: str, default: float) -> float:
     """Resolve a LOAD-TIME float knob the same way as use_multitenant(): env → settings_mode.py
     → default. For values consumed while settings.py is still executing (e.g. the fanout beat
-    tick baked into CELERY_BEAT_SCHEDULE), where django.conf.settings / settings_local.py are
+    tick baked into CELERY_BEAT_SCHEDULE), where django.conf.settings / the local settings file are
     not available yet. A malformed value fails LOUDLY (float() raises) — never silently ignored;
     an absent one falls through to `default`."""
     if name in os.environ:

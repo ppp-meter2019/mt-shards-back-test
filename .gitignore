@@ -1,5 +1,10 @@
-# Production overrides — never commit, always copy from settings_local.py.example
+# Production overrides — never commit, always copy from the matching .example.
+# One file PER MODE: settings_local.py is the STANDALONE one (the plain name, because
+# that is the host project's mode), settings_local_multitenant.py the MT one. The MT
+# file pins the django-tenants DB engine and the tenant_* shards, so it must never be
+# loaded by a standalone run.
 tenants_back/settings_local.py
+tenants_back/settings_local_multitenant.py
 
 # Run-mode selector (multi-tenant vs standalone) — copy from settings_mode.py.example
 tenants_back/settings_mode.py

@@ -9,7 +9,7 @@
 |---------------------------------------------------------------|--------------------------------------------------------------|
 | `nginx.example.conf`                                          | віртуальний хост (apex + wildcard сабдомени)                 |
 | **`../bin/gunicorn_start.sh`**                                | bash-launcher для supervisor — основний шлях                 |
-| **`../tenants_back/settings_local.py.example`**               | шаблон прод-overrides — копіюємо як `settings_local.py`      |
+| **`../tenants_back/settings_local_multitenant.py.example`**               | шаблон прод-overrides — копіюємо як `settings_local_multitenant.py`      |
 | `gunicorn.conf.py`                                            | конфіг gunicorn у Python-формі — для systemd-варіанту        |
 | `gunicorn.service`                                            | альтернатива через systemd                                   |
 
@@ -55,7 +55,7 @@ sudo install -d -o ubuntu -g www-data -m 2750 /home/ubuntu/tenants_back/run
 
 ## 3. Основний шлях — supervisor + `bin/gunicorn_start.sh`
 
-### 3.1 Прод-значення живуть у `settings_local.py`
+### 3.1 Прод-значення живуть у `settings_local_multitenant.py`
 
 `bin/gunicorn_start.sh` сам по собі **не містить** ні `SECRET_KEY`, ні
 `ALLOWED_HOSTS`, ні DB-кредів. Усе це йде в окремий Python-файл, який
@@ -63,22 +63,30 @@ sudo install -d -o ubuntu -g www-data -m 2750 /home/ubuntu/tenants_back/run
 
 ```python
 try:
-    from .settings_local import *
-except ImportError:
-    print("Can't load local settings!")
+    from .settings_local_multitenant import *
+except ModuleNotFoundError as exc:
+    if exc.name != f"{__package__}.settings_local_multitenant":
+        raise
+    print("Can't load local settings (settings_local_multitenant.py)!")
 ```
+
+Файл **свій на кожен режим**: `settings_local_multitenant.py` вантажиться лише
+при `USE_MULTITENANT`, інакше — `settings_local.py`. Один спільний
+файл не міг обслуговувати обидва режими: мультітенантний прибиває ENGINE до
+django-tenants і оголошує шарди `tenant_*`, і в standalone-прогоні це давало
+«standalone» на мультітенантному бекенді.
 
 Перед першим запуском скопіюй шаблон і відредагуй:
 
 ```bash
 cd /home/ubuntu/tenants_back
-cp tenants_back/settings_local.py.example tenants_back/settings_local.py
-nano tenants_back/settings_local.py           # SECRET_KEY, домен, DB_PASSWORD
+cp tenants_back/settings_local_multitenant.py.example tenants_back/settings_local_multitenant.py
+nano tenants_back/settings_local_multitenant.py           # SECRET_KEY, домен, DB_PASSWORD
 ```
 
-`settings_local.py` обов'язково додай у `.gitignore`:
+`settings_local_multitenant.py` обов'язково додай у `.gitignore`:
 ```
-tenants_back/tenants_back/settings_local.py
+tenants_back/tenants_back/settings_local_multitenant.py
 ```
 
 Прапори gunicorn у самому `exec` (див. `bin/gunicorn_start.sh`):
@@ -178,7 +186,7 @@ sudo ufw allow 8000/tcp     # відкрити публічний API-порт
   `https://<тенант>.example.com:8000/api/...`.
 - Django admin доступний на `https://<тенант>.example.com:8000/admin/`.
   Для tenant-адміна — `https://example.com:8000/admin/` (apex без сабдомена).
-  CSRF для цього порту покритий — у `settings_local.py`
+  CSRF для цього порту покритий — у `settings_local_multitenant.py`
   `CSRF_TRUSTED_ORIGINS` має `https://*.example.com:8000`.
 - Сайт-фронт чистіший: 443-ій порт не проксує **жодного** Django-шляху,
   не «знає» про `/admin/`, нічого зайвого не експонує.
@@ -207,7 +215,7 @@ sudo certbot certonly --dns-cloudflare \
 
 Якщо supervisor не використовуєте, є готовий юніт `gunicorn.service` +
 `gunicorn.conf.py`. Налаштування Django (`SECRET_KEY`, `ALLOWED_HOSTS`,
-DB, CORS) і тут живуть у `tenants_back/settings_local.py` — однаково з
+DB, CORS) і тут живуть у `tenants_back/settings_local_multitenant.py` — однаково з
 supervisor-варіантом.
 
 ```bash
@@ -261,10 +269,10 @@ sudo -u ubuntu venv/bin/python manage.py bootstrap_tenant \
 |---------------------------------------------|---------------------------------------------|-----------------------------------------------------------------------------------------------|
 | nginx → `502 Bad Gateway`                   | gunicorn стартував від `ubuntu`, не від root | supervisor БЕЗ `user=` (стартує від root); у `gunicorn_start.sh` стоять `--user=ubuntu --group=www-data` |
 | `Permission denied` на сокеті при старті    | теки `run/` нема або не та власність         | `install -d -o ubuntu -g www-data -m 2750 /home/ubuntu/tenants_back/run`                       |
-| `DisallowedHost` у логах                    | `ALLOWED_HOSTS` без потрібного host'а         | у `settings_local.py` додати `.example.com` (з крапкою → wildcard)                            |
+| `DisallowedHost` у логах                    | `ALLOWED_HOSTS` без потрібного host'а         | у `settings_local_multitenant.py` додати `.example.com` (з крапкою → wildcard)                            |
 | Свіжий код — старі воркери                  | gunicorn форкнувся при старті                | `sudo supervisorctl restart tenants_back` (для systemd: `systemctl reload`)                   |
 | `/static/` 404                              | забули `collectstatic`                       | `manage.py collectstatic --noinput`                                                            |
-| Admin: `CSRF verification failed`           | за TLS-проксі, Django про це не знає         | у `settings_local.py`: `SECURE_PROXY_SSL_HEADER` + `CSRF_TRUSTED_ORIGINS` (з `:8000`)         |
+| Admin: `CSRF verification failed`           | за TLS-проксі, Django про це не знає         | у `settings_local_multitenant.py`: `SECURE_PROXY_SSL_HEADER` + `CSRF_TRUSTED_ORIGINS` (з `:8000`)         |
 | `502` лише на сабдоменах                    | nginx не передає `Host`                      | `proxy_set_header Host $host;` (вже у шаблоні)                                                |
 | `Connection refused` до сокета              | сервіс не стартував                          | `tail /var/log/supervisor/tenants_back.log` (або `journalctl -u tenants_back -n 50`)          |
 | `ModuleNotFoundError: celery` на старті     | не встановлено celery, а `__init__` його імпортує | `pip install -r requirements.txt`                                                        |
@@ -274,7 +282,7 @@ sudo -u ubuntu venv/bin/python manage.py bootstrap_tenant \
 
 Фонові задачі (провіжн тенанта, періодичні job-и) виконує Celery. Брокер —
 **окремий** Redis (`CELERY_BROKER_URL`, дефолт у `settings_base.py`, оверайд у
-`settings_local.py`). Стан провіжну тримає `Tenant.status`, тож result backend
+`settings_local_multitenant.py`). Стан провіжну тримає `Tenant.status`, тож result backend
 не використовується.
 
 ### 9.1 Залежності + міграції

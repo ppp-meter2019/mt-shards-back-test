@@ -21,7 +21,7 @@ whether a step is *manual*, runs one of *our scripts*, a single *command*, or a
 | # | Step | Type | Command | Expected result | Details |
 |---|---|---|---|---|---|
 | 1 | Check the 3 databases exist & are reachable | **manual** | `psql -h $HOST -U postgres -c '\l'` (per cluster) | `tenants_back` is listed on each Aurora cluster (if missing, create it + PostGIS + app role) | [Step 2](#step-2---aurora-preparation-one-time) |
-| 2 | Fill in & place `settings_local.py` | **manual** | copy `settings_local.py.example`, edit endpoints/secrets, `install -m 600` onto the host | host knows the real per-shard DB/Redis endpoints + secrets | [Secrets](#secrets--credential-distribution) |
+| 2 | Fill in & place `settings_local_multitenant.py` | **manual** | copy `settings_local_multitenant.py.example`, edit endpoints/secrets, `install -m 600` onto the host | host knows the real per-shard DB/Redis endpoints + secrets | [Secrets](#secrets--credential-distribution) |
 | 3 | Generate the tenants migration (one-time) | command | `python manage.py makemigrations tenants` | `tenants/migrations/0001_initial.py` created (commit it) | [Step 3](#step-3---backend-host-bootstrap) |
 | 4 | Bootstrap the platform | **script** | `APP_DOMAIN=example.com BOOTSTRAP_ADMIN_PASSWORD=… bash deploy/bootstrap.sh` | script auto-runs: PostGIS → `migrate_schemas --shared` → `sync_shards --activate` → public `Tenant`+`Domain` → `admin` user. Ends with `Bootstrap complete.` | [Step 3](#step-3---backend-host-bootstrap) |
 | 5 | Smoke-test the host, then DNS/TLS | verify | `curl -s http://localhost/api/health/` then `curl -I https://example.com/api/health/` | `ok`, then `200 OK`; admin login loads over HTTPS | [Step 4](#step-4---dns-and-tls-verification) |
@@ -29,7 +29,7 @@ whether a step is *manual*, runs one of *our scripts*, a single *command*, or a
 | 7 | Create + verify the tenant admin | verify | `curl -X POST https://acme.example.com/api/auth/login/ -d '{"username":"acme_admin","password":"…"}'` | JWT `{access, refresh, role:"company_admin", schema:"acme"}` | [Step 5](#step-5---first-business-tenant) |
 
 So the only hands-on work is **#1 (check the DBs)** and **#2 (edit
-`settings_local.py`)**; from #3 onward the scripts and management commands do the
+`settings_local_multitenant.py`)**; from #3 onward the scripts and management commands do the
 rest.
 
 > **What happens under the hood:** for the mechanics behind each DB step —
@@ -168,25 +168,25 @@ The same `User` model is registered on both sites; each schema has its own
 
 Production secrets are the per-shard database credentials (`HOST`/`USER`/
 `PASSWORD` for each Aurora cluster) plus Django's `SECRET_KEY`. They live only
-in `settings_local.py`, which is gitignored. Each Aurora cluster has its **own**
+in `settings_local_multitenant.py`, which is gitignored. Each Aurora cluster has its **own**
 application role and password, so a leaked credential for one shard cannot reach
 another.
 
 ### MVP: manual distribution (default)
 
-For the MVP we author and copy `settings_local.py` by hand:
+For the MVP we author and copy `settings_local_multitenant.py` by hand:
 
-1. Copy `tenants_back/settings_local.py.example` to `settings_local.py` and fill
-   in the real endpoints + per-shard passwords (see `settings_local.py.example`
+1. Copy `tenants_back/settings_local_multitenant.py.example` to `settings_local_multitenant.py` and fill
+   in the real endpoints + per-shard passwords (see `settings_local_multitenant.py.example`
    for the `_AURORA_DEFAULTS` pattern; it uses `_aurora_db_options()` for
    verify-full TLS against the vendored CA at `deploy/certs/`).
 2. Copy it to each backend host, readable only by the service user:
    ```bash
-   scp settings_local.py backend-1:/tmp/
+   scp settings_local_multitenant.py backend-1:/tmp/
    ssh backend-1 'sudo install -o ubuntu -g ubuntu -m 600 \
-       /tmp/settings_local.py \
-       /home/ubuntu/tenants_back/tenants_back/settings_local.py && \
-       rm /tmp/settings_local.py'
+       /tmp/settings_local_multitenant.py \
+       /home/ubuntu/tenants_back/tenants_back/settings_local_multitenant.py && \
+       rm /tmp/settings_local_multitenant.py'
    ```
 3. Restart gunicorn so it picks up the file.
 
@@ -198,7 +198,7 @@ Manual copying is fine for one or two hosts, but it doesn't scale and leaves the
 secrets in a file you pass around. For production — and **mandatory** with an
 Auto Scaling Group, where hosts boot with no human in the loop — store the
 secrets in AWS SSM Parameter Store and have each instance fetch them at first
-boot. Nothing in the application code changes; only where `settings_local.py`
+boot. Nothing in the application code changes; only where `settings_local_multitenant.py`
 comes from.
 
 1. **Store one parameter per secret** (`SecureString` = KMS-encrypted at rest):
@@ -221,7 +221,7 @@ comes from.
    role.
 3. **Fetch at boot**: `deploy/user_data_backend.sh` already does this — for each
    name it calls `aws ssm get-parameter --with-decryption` and writes
-   `settings_local.py`. Adopting SSM means dropping the manual step above and
+   `settings_local_multitenant.py`. Adopting SSM means dropping the manual step above and
    running that script as EC2 user-data; provisioning becomes hands-off.
 
 ## Redis / ElastiCache
@@ -244,7 +244,7 @@ cache, so a single cluster is all that's needed.)
 ### Wiring
 
 ```python
-# settings_local.py — production points the cache at the cluster:
+# settings_local_multitenant.py — production points the cache at the cluster:
 CACHES["default"]["LOCATION"] = "redis://tenants-app.xxx.cache.amazonaws.com:6379/0"
 ```
 
@@ -405,12 +405,12 @@ pyenv is only needed to **build and create** the venv.
 7. **Route 53** alias records for `example.com` and `*.example.com` pointing
    at the ALB.
 8. **Secrets**: for the MVP these are distributed manually in
-   `settings_local.py` (per-shard DB credentials + `SECRET_KEY`) — see
+   `settings_local_multitenant.py` (per-shard DB credentials + `SECRET_KEY`) — see
    **Secrets & credential distribution** above. For the production SSM route,
    create the `/tenants/*` parameters described in that section.
 9. **Two backend EC2 instances** (`t4g.medium`) in private subnets, one per AZ.
    Attach to the `backend` target group on port 80. For the MVP, provision the
-   host (packages, venv, nginx, gunicorn) and place `settings_local.py`
+   host (packages, venv, nginx, gunicorn) and place `settings_local_multitenant.py`
    manually. For the hands-off SSM route, use `deploy/user_data_backend.sh` as
    user-data and grant the IAM role `ssm:GetParameter` on `/tenants/*`.
 10. **One frontend EC2 instance** (set up separately; out of scope for this
@@ -442,7 +442,7 @@ pyenv is only needed to **build and create** the venv.
    GRANT ALL PRIVILEGES ON DATABASE tenants_back TO tenants_app_default;
    SQL
    ```
-   These per-shard credentials are what go into `settings_local.py` (or SSM).
+   These per-shard credentials are what go into `settings_local_multitenant.py` (or SSM).
 4. Install the **PostGIS** extension in the new `tenants_back` database. This is
    done by the **master user** (it holds `rds_superuser`); the per-shard app role
    from step 3 *cannot* create extensions on RDS/Aurora. Django's PostGIS backend
@@ -480,10 +480,10 @@ pyenv is only needed to **build and create** the venv.
    sudo supervisorctl status default:api   # should be RUNNING
    ls /home/ubuntu/mt-shards-back-test/staticfiles/admin/   # should not be empty
    ```
-3. Place `settings_local.py` (MVP: copy it manually — see **Secrets &
+3. Place `settings_local_multitenant.py` (MVP: copy it manually — see **Secrets &
    credential distribution**; SSM route: generated by user-data) and verify it:
    ```bash
-   sudo cat /home/ubuntu/mt-shards-back-test/tenants_back/settings_local.py
+   sudo cat /home/ubuntu/mt-shards-back-test/tenants_back/settings_local_multitenant.py
    ```
 4. Generate initial migrations for the tenants app (one-time):
    ```bash
@@ -650,7 +650,7 @@ When you need a fourth Aurora cluster (`tenant_3`):
    GRANT ALL PRIVILEGES ON DATABASE tenants_back TO tenants_app_tenant3;
    SQL
    ```
-3. Update `settings_local.py` on every backend host, reusing the
+3. Update `settings_local_multitenant.py` on every backend host, reusing the
    `_AURORA_DEFAULTS` pattern (verify-full TLS via `_aurora_db_options()`
    against the vendored CA at `deploy/certs/` — do not hard-code the cert path):
    ```python
@@ -697,7 +697,7 @@ When you need a fourth Aurora cluster (`tenant_3`):
 
 | Component | Path | Purpose |
 |---|---|---|
-| Settings (entry) | `tenants_back/settings.py` | Dispatcher: picks the mode, then applies `settings_local` |
+| Settings (entry) | `tenants_back/settings.py` | Dispatcher: picks the mode, then applies that mode's `settings_local_*` |
 | Settings (base) | `tenants_back/settings_base.py` | Shared/standalone base — Multi-DB, Redis, middleware chain |
 | Settings (MT) | `tenants_back/settings_multitenant.py` | Multi-tenant overlay over the base |
 | WSGI | `tenants_back/wsgi.py` | gunicorn entry (sync prefork) |
@@ -708,6 +708,8 @@ When you need a fourth Aurora cluster (`tenant_3`):
 | Admin | `tenants/console/admin.py` | `public_admin_site` + Shard/Tenant/Domain/ReservedHostRule (`tenants/admin.py` is a one-line shim — Django autodiscovers `<app>.admin` by name) |
 | Router | `tenants/routers.py` | TenantSyncRouter + multi-DB guard + the public data-migration filter |
 | **Merge seam** | `tenants_back/settings_base.py` | `_PUBLIC_MODEL_ALLOWLIST` — the models that may be USED on the public schema. The one thing the host merge edits: every per-tenant app already has its tables there (`settings_multitenant.py` splices all of `_BUSINESS_APPS` into `SHARED_APPS`, so every FK target of the identity model exists by construction — no closure to compute and get wrong), and `tenants/routers.py` refuses any query against a non-allowlisted tenant model on public (`PUBLIC_MODEL_GUARD` = raise\|warn\|off — `warn` is the merge measurement mode) and skips their data migrations there. `test_settings_invariants.MergeSeamContractTests` pins the contract |
+| Cache keys | `commons/platform/cache_keys.py` | The tenant token + Redis key shape `tenant:<schema>:…` — `KEY_FUNCTION` for `CACHES['default']` plus `tenant_key()` for manual redis-py keys. Contract: `deploy/redis_keys_design.md`; deliberate non-use of the upstream helper: `deploy/UPSTREAM_FORK.md` §5 |
+| Redis (raw) | `commons/platform/redis_client.py` | `tenant_raw_client()` — the tenant-scoped choke point for direct redis-py. The other is `ResolveCache.get_redis_raw_client()` (tenant-agnostic); `scripts/ci_guard_redis_client.sh` is a static check (run by hand) that reports a third |
 | Middleware | `tenants/middleware.py` | `ShardAwareTenantMiddleware` + `TenantShardRoutingMiddleware` (sync; tenant + shard routing) |
 | Views (runtime) | `tenants/views.py` | `health` only — imported by BOTH URLconfs |
 | Console | `tenants/console/` | Operator UI/API: Tenant/Shard/ReservedHostRule viewsets, serializers, admin, physical-state `probes.py`. Subpackage, not an app (no models); one-way boundary guarded by `scripts/ci_guard_console_boundary.sh` |

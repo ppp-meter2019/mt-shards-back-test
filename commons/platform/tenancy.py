@@ -17,7 +17,8 @@ from django.conf import settings
 
 if settings.USE_MULTITENANT:
     from django_tenants.utils import get_public_schema_name
-    from tenants.context import schema_context, tenant_context, use_alias
+    from tenants.context import (active_alias, bound_alias, schema_context, tenant_context,
+                                 use_alias)
 
     def active_target_schemas(scope: str = "tenants") -> list[str]:
         """ACTIVE tenant schemas for the interval fanout (excludes the public schema).
@@ -60,6 +61,15 @@ else:
     def get_public_schema_name() -> str:
         return "public"
 
+    def active_alias() -> str:
+        # No shards in standalone: there is one connection and it is `default`.
+        return "default"
+
+    def bound_alias() -> str | None:
+        # Standalone has one connection and no routing axis to bind, so "unbound" is not a
+        # distinguishable state here — unlike MT, where None means nobody established context.
+        return "default"
+
     def active_target_schemas(scope: str = "tenants") -> list[str]:
         # No tenants in standalone; the fanout dispatcher is not used here.
         return []
@@ -69,6 +79,6 @@ else:
 
 
 __all__ = [
-    "schema_context", "tenant_context", "use_alias",
+    "schema_context", "tenant_context", "use_alias", "active_alias", "bound_alias",
     "get_public_schema_name", "active_target_schemas", "active_tenants_with_tz",
 ]

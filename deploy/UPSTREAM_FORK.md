@@ -102,6 +102,7 @@ return db != "default"                     # тенантські схеми —
 | `migrate_schemas.py` | `_notice()` з `SyncCommon` | зникне → `AttributeError` на першому ж виводі |
 | `apps.py:18-23` | monkeypatch модуля `django_tenants.utils` | **частковий за природою**: модуль, що імпортував helper ДО `ready()`, лишиться зі старою версією. Тому проєктний код зобов'язаний імпортувати з `tenants.context` — це статично стереже `scripts/ci_guard_context_import.sh` |
 | `middleware.py` | успадкований `hostname_from_request` зрізає префікс `www.` і порт | тихо змінить ключ кешу резолву й членство в `treg:hosts` |
+| `commons/platform/cache_keys.py` (standalone-гілка) | `django_redis.util.default_reverse_key` — аліасимо як `reverse_key` замість дублювати тіло (`key.split(":", 2)[2]`). Це **django-redis**, не django-tenants; пакет є в обох режимах (базовий `CACHES` backend). Неукрашений, і django_redis сам підставляє його dotted-path'ом як дефолт (`client/default.py`) — але це чужий внутрішній API | `ImportError` на імпорті `cache_keys` у **standalone**. Радіус: у standalone `KEY_FUNCTION` не підключений, тож сам кеш працює; впаде будь-який імпортер модуля. У MT ця гілка не виконується взагалі |
 
 ---
 
@@ -122,6 +123,19 @@ upstream'а, з яким вони могли б розійтись, не існ�
 | `commons/platform/beat.py` | `crontab._orig_minute` та інші `_orig_*` (приватні поля) |
 
 Через це в `requirements.txt` стоїть `celery>=5.4,<6` з мажорним cap'ом.
+
+**`commons/platform/cache_keys.py` — це не форк, а свідоме НЕВИКОРИСТАННЯ.** Апстрім-доки
+(`install.html`, розділ Caching) рекомендують `django_tenants.cache.make_key` /
+`reverse_key`. Ми їх не використовуємо: вони дають `<schema>:<prefix>:<version>:<key>` —
+схема попереду, але **без спільного провідного літерала**, за який можна глобити. Наша форма
+`tenant:<schema>:…` робить `tenant:<schema>:*` єдиним глобом на весь слід тенанта в Redis,
+включно з ручними redis-py ключами, які кеш-API не бачить взагалі. Від цього залежать
+потенантне видалення й облік пам'яті (`deploy/redis_keys_design.md` §D2).
+
+Ціна: два наші рядки замість двох апстрімівських, і `reverse_key` прив'язаний до п'яти
+сегментів. Ризику бампу тут **немає** (ми від цього API не залежимо), але є ризик
+«виправлення»: при бампі хтось може «повернутися до апстріму» і тихо зламати глобінг.
+Прибито `tenants/tests/test_cache_keys.py`.
 
 ---
 
@@ -170,8 +184,31 @@ DATABASE_ROUTERS   = ["tenants.routers.TenantDatabaseRouter"]
 4. Перевірити, що приватні атрибути з §4 на місці (насамперед `_notice`, `parser._actions`,
    сигнатура `SyncCommon.handle`).
 5. `manage.py check` в **обох** режимах + `scripts/ci_mode.sh mt` і `standalone`.
-6. `scripts/ci_guard_context_import.sh` — перевіряє, що ніхто не почав імпортувати
-   context-хелпери з `django_tenants.utils`.
+6. `for g in scripts/ci_guard_*.sh; do "$g"; done` — зокрема
+   `ci_guard_context_import.sh` (context-хелпери не з `django_tenants.utils`) і
+   `ci_guard_redis_client.sh` (прямий redis-py лише у двох точках входу).
+6a. Якщо в новій версії з'явився кеш-хелпер — **не** переходити на
+   `django_tenants.cache.make_key`: див. §5, наша форма навмисно інша.
+6b. **При бампі `django-redis`** (окремий від цього чекліста пакет): перевірити, що
+   `django_redis.util.default_reverse_key` на місці — standalone-гілка
+   `commons/platform/cache_keys.py` аліасить його (§4).
+6c. **При бампі `celery-redbeat` до 2.5.0** (пін `>=2.2,<3` це дозволяє): CHANGES.txt 2.4.2
+   каже «RedBeat 2.5.0 **will require** `redbeat_redis_url`» і прибирає fallback'и на
+   `broker_url` / `broker_transport_options`. Стан трьох `either_or` із fallback на брокер
+   (`schedulers.py:246,255,257`):
+   - `redbeat_redis_url` — задаємо **явно** в `tenants_back/celery.py` прямим присвоєнням у
+     `app.conf`. Через `CELERY_`-неймспейс цього **недостатньо**: `is_key_in_conf()` тестує
+     членство в `conf.keys()`, куди namespace-завантажені ключі не потрапляють. Апстрім
+     документує лише форму `celeryconfig.py` з `REDBEAT_REDIS_URL`, де ключ лягає в `keys()`
+     напряму; Django + `config_from_object(namespace=...)` поза задокументованим (див.
+     sibson/redbeat#169 — той самий розклад дає `conf.redis_url = None`).
+   - `redbeat_redis_options` — у нас резолвиться в `{}` (ми не задаємо
+     `CELERY_BROKER_TRANSPORT_OPTIONS`), тож попередження не стріляє і залежності немає.
+   - `redbeat_redis_use_ssl` — задаємо явно (`CELERY_REDBEAT_REDIS_USE_SSL` у
+     `settings_multitenant.py`). CHANGES згадує лише два fallback'и з трьох, тож третій треба
+     звірити по коду. Для `rediss://` він не критичний — гілка `get_redis()` стартує з власного
+     `ssl.CERT_REQUIRED` і лише оновлює його нашим значенням; критичний він для гілки
+     `redis-sentinel`, якої ми не використовуємо.
 7. **Обов'язково на живій БД** (DB-free набір цього не покриє):
    `migrate_schemas --shared`, `migrate_schemas --tenant`, `tenant_command <cmd> --schema=X`,
    і запит на тенантський хост — шард має бути правильний.

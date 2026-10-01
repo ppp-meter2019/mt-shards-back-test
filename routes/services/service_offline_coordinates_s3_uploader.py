@@ -105,7 +105,7 @@ def put_offline_coordinates_object(s3_key: str, body: bytes, content_type: str) 
     if not bucket_name:
         raise ValueError(
             "AWS_S3_COORDINATES_BUCKET is not configured "
-            "(set it in settings_local.py)."
+            "(set it in the mode's local settings file)."
         )
 
     try:
@@ -165,7 +165,7 @@ def list_offline_coordinates_objects(
     if not bucket_name:
         raise ValueError(
             "AWS_S3_COORDINATES_BUCKET is not configured "
-            "(set it in settings_local.py)."
+            "(set it in the mode's local settings file)."
         )
 
     if prefix is None:

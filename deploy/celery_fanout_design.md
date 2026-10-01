@@ -328,7 +328,7 @@ Beat must be a singleton (SPOF); HA = redundancy without duplicate firing.
 - `celery-redbeat` stays in the single universal `requirements.txt`, **inert** in
   standalone (activated only by the MT-only scheduler setting — same as `django-tenants`).
 - RedBeat Redis must be **noeviction** (broker URL by default, or a dedicated instance in
-  `settings_local.py`); never the eviction `tenant_resolve` cache.
+  `settings_local_multitenant.py`); never the eviction `tenant_resolve` cache.
 
 Layered dedup (makes HA safe): RedBeat lock → dispatcher overlap-lock → `TaskRun` +
 idempotent tasks absorb any rare double-fire.
@@ -391,7 +391,7 @@ if USE_MULTITENANT:
     CELERY_BEAT_SCHEDULER = "redbeat.RedBeatScheduler"
     CELERY_REDBEAT_KEY_PREFIX = "redbeat:"
     CELERY_REDBEAT_LOCK_TIMEOUT = ...            # ≥ beat loop interval; tune
-    # CELERY_REDBEAT_REDIS_URL -> settings_local (prod); default = broker_url
+    # CELERY_REDBEAT_REDIS_URL -> settings_local_multitenant (prod); default = broker_url
     CELERY_TASK_QUEUES = [Queue("fast"), Queue("slow"), Queue("service"), Queue("fanout")]
     CELERY_TASK_DEFAULT_QUEUE = "fast"
     TENANT_BEAT = {"TZ_GRACE_SECONDS": 300, "BATCH_SIZE": 100}   # runtime knobs (+ in-code DEFAULTS)
@@ -460,7 +460,7 @@ New dependency: `croniter` (universal requirements; used only by the MT tz path)
 - **E. HA — DONE.** `celery-redbeat` added (requirements). MT branch:
   `CELERY_BEAT_SCHEDULER="redbeat.RedBeatScheduler"`, `CELERY_REDBEAT_KEY_PREFIX`,
   `CELERY_REDBEAT_LOCK_TIMEOUT=90`, `CELERY_REDBEAT_REDIS_URL` (env `REDBEAT_REDIS_URL` →
-  broker; override to a dedicated noeviction Redis in settings_local). `celery.py` sets
+  broker; override to a dedicated noeviction Redis in settings_local_multitenant). `celery.py` sets
   `app.conf.redbeat_redis_url` directly in MT so RedBeat's `in`-based `is_key_in_conf`
   sees it (namespace-loaded keys aren't reported by `in`) — silences a spurious
   "set redbeat_redis_url explicitly" deprecation. `supervisor_celery.conf` updated: added

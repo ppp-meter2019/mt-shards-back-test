@@ -8,10 +8,10 @@ no HTTP / nginx / gunicorn in the way, so it isolates the caching layer itself.
 WHERE TO RUN
     On a host INSIDE the VPC (same security group) that can reach the staging
     tenant_resolve Redis (db2) AND the staging `default` Postgres, with the app
-    code + a STAGING settings_local.py importable. Do NOT run load ON a gunicorn
+    code + a STAGING settings_local_multitenant.py importable. Do NOT run load ON a gunicorn
     host (it steals CPU from the workers and skews numbers); use a sibling box.
     The tenant_resolve Redis / `default` DB are VPC-private (their endpoints come from
-    CACHES["tenant_resolve"] / DATABASES in settings_local.py) — the script cannot run
+    CACHES["tenant_resolve"] / DATABASES in settings_local_multitenant.py) — the script cannot run
     "from the internet".
 
 SAFETY (built for staging)

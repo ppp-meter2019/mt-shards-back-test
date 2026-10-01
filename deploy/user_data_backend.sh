@@ -16,7 +16,8 @@
 #
 # Note: the AWS RDS CA bundle is vendored in the repo at
 # `deploy/certs/aws-rds-global-bundle.pem`, so we do NOT download it here.
-# `settings_base.py` defaults AWS_RDS_CA to that vendored path.
+# `settings_multitenant.py` defaults AWS_RDS_CA to that vendored path (it is multi-tenant
+# deployment topology, so it lives in the MT layer, not in the shared base).
 
 set -e
 
@@ -47,9 +48,11 @@ TENANT_1_DB_PASSWORD=$(aws ssm get-parameter --name /tenants/tenant_1/db_passwor
 TENANT_2_DB_USER=$(aws ssm     get-parameter --name /tenants/tenant_2/db_user                      --query Parameter.Value --output text)
 TENANT_2_DB_PASSWORD=$(aws ssm get-parameter --name /tenants/tenant_2/db_password --with-decryption --query Parameter.Value --output text)
 
-# Generate settings_local.py with production hosts and secrets.
-cat > /home/ubuntu/tenants_back/tenants_back/settings_local.py <<EOF
-from .settings import DATABASES, CACHES, _aurora_db_options
+# Generate the MULTI-TENANT local settings with production hosts and secrets.
+# The filename is mode-specific: settings.py loads settings_local_multitenant.py only
+# when USE_MULTITENANT is on, and settings_local.py otherwise.
+cat > /home/ubuntu/tenants_back/tenants_back/settings_local_multitenant.py <<EOF
+from .settings import DATABASES, CACHES, _MT_DB_DEFAULTS, _aurora_db_options
 
 DEBUG = False
 SECRET_KEY = "${DJANGO_SECRET}"
@@ -68,12 +71,14 @@ CORS_ALLOWED_ORIGIN_REGEXES = [
     r"^https://([a-z0-9-]+\.)?example\.com(:\d+)?$",
 ]
 
+# Spread _MT_DB_DEFAULTS rather than restating it: the assignments below replace each
+# DATABASES entry wholesale, so the multi-tenant layer's own fields (the django-tenants
+# ENGINE today, more later) reach this host only through that spread.
 _AURORA_DEFAULTS = {
-    "ENGINE":             "django_tenants.postgresql_backend",
+    **_MT_DB_DEFAULTS,
     "NAME":               "tenants_back",
     "PORT":               "5432",
     "CONN_MAX_AGE":       60,
-    "CONN_HEALTH_CHECKS": True,
     "OPTIONS":            _aurora_db_options(),
 }
 

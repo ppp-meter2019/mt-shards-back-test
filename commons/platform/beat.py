@@ -40,7 +40,7 @@ FANOUT_TASK_NAME = "tenants.tasks.fanout_dispatch"
 
 # Load-time default for the calendar (tz) beat tick. NOT a runtime TENANT_BEAT knob:
 # scoped_schedule bakes it into the beat cadence during settings load (where it cannot read
-# settings.TENANT_BEAT / settings_local.py — both come later). Override it code-free the SAME
+# settings.TENANT_BEAT / the local settings file — both come later). Override it code-free the SAME
 # way as USE_MULTITENANT — env FANOUT_PERIOD_SECONDS → settings_mode.py → this default — or
 # per-entry via scoped_schedule(fanout_period=…).
 FANOUT_PERIOD_DEFAULT = bootstrap_float("FANOUT_PERIOD_SECONDS", 60.0)

@@ -65,7 +65,7 @@ done
 ## 3. Per-shard application roles & credentials
 
 Each cluster has its **own** application role and password (a deliberate
-decision — see `settings_local.py.example`). A compromised credential for one
+decision — see `settings_local_multitenant.py.example`). A compromised credential for one
 shard must not grant access to another.
 
 ### 3a. Create the role on each cluster
@@ -88,18 +88,18 @@ default for the MVP.)
 
 ### 3b. Distributing the credentials (MVP: manual)
 
-For the MVP we distribute `settings_local.py` by hand. The secrets (per-shard
+For the MVP we distribute `settings_local_multitenant.py` by hand. The secrets (per-shard
 `HOST`/`USER`/`PASSWORD` and `SECRET_KEY`) live only inside that file:
 
-1. Author `settings_local.py` once from `settings_local.py.example` (§5b),
+1. Author `settings_local_multitenant.py` once from `settings_local_multitenant.py.example` (§5b),
    filling in the real endpoints and the per-shard passwords from §3a.
 2. Copy it to each backend host, readable only by the service user:
    ```bash
-   scp settings_local.py backend-1:/tmp/
+   scp settings_local_multitenant.py backend-1:/tmp/
    ssh backend-1 'sudo install -o ubuntu -g ubuntu -m 600 \
-       /tmp/settings_local.py \
-       /home/ubuntu/tenants_back/tenants_back/settings_local.py && \
-       rm /tmp/settings_local.py'
+       /tmp/settings_local_multitenant.py \
+       /home/ubuntu/tenants_back/tenants_back/settings_local_multitenant.py && \
+       rm /tmp/settings_local_multitenant.py'
    ```
 3. Restart gunicorn so it picks up the file.
 
@@ -116,7 +116,7 @@ All production connections use `sslmode=verify-full` against the **vendored**
 AWS RDS CA bundle, so no certificate is fetched at deploy time:
 
 - Bundle path: `deploy/certs/aws-rds-global-bundle.pem` (committed to the repo).
-- `settings_base.py` exposes it as `AWS_RDS_CA` (overridable via the `AWS_RDS_CA`
+- `settings_multitenant.py` exposes it as `AWS_RDS_CA` (overridable via the `AWS_RDS_CA`
   env var).
 - `_aurora_db_options()` builds the per-cluster `OPTIONS`:
   `{"connect_timeout": 5, "sslmode": "verify-full", "sslrootcert": AWS_RDS_CA}`.
@@ -153,12 +153,12 @@ DATABASES = {
 }
 ```
 
-### 5b. Production override (`settings_local.py`)
+### 5b. Production override (`settings_local_multitenant.py`)
 
-`settings_local.py` re-imports `DATABASES` and `_aurora_db_options`, then
+`settings_local_multitenant.py` re-imports `DATABASES` and `_aurora_db_options`, then
 overrides `default` and adds the shards. Shared fields live in a local
 `_AURORA_DEFAULTS`; each entry adds its own `HOST`/`USER`/`PASSWORD`
-(per-shard credentials). See `settings_local.py.example` for the full template.
+(per-shard credentials). See `settings_local_multitenant.py.example` for the full template.
 For the MVP you author and copy this file manually (§3b); the
 `deploy/user_data_backend.sh` + SSM route (Appendix A) generates it
 automatically at boot once you adopt it.
@@ -166,7 +166,7 @@ automatically at boot once you adopt it.
 > **Critical:** the set of keys in `DATABASES` is the universe of possible
 > shard aliases. A `Shard` row can only reference an alias that exists in
 > `DATABASES` at process start (`Shard.clean()` enforces this). Adding a shard
-> therefore always means: edit `settings_local.py` **first**, restart, **then**
+> therefore always means: edit `settings_local_multitenant.py` **first**, restart, **then**
 > `sync_shards` (see §8).
 
 ---
@@ -324,7 +324,7 @@ drop-in replacement for the django-tenants helper (see README Step 5).
 
 1. Provision the cluster (§2) and create its application role (§3a) and SSM
    params (§3b / Appendix A).
-2. Add `DATABASES["tenant_3"]` to `settings_local.py` on **every** backend
+2. Add `DATABASES["tenant_3"]` to `settings_local_multitenant.py` on **every** backend
    host (use the `_AURORA_DEFAULTS` pattern), then restart gunicorn so the new
    alias is live.
 3. Register it:
@@ -417,7 +417,7 @@ leaves the secrets sitting in a file you pass around. For production — and
 **mandatory** once you use an Auto Scaling Group, where new hosts boot with no
 human in the loop — store the secrets in AWS SSM Parameter Store and let each
 instance fetch them at first boot. Nothing in the application code changes; only
-where `settings_local.py` comes from.
+where `settings_local_multitenant.py` comes from.
 
 ### A.1 Store one parameter per secret
 
@@ -455,9 +455,9 @@ key), scoped to `/tenants/*`:
 No AWS access keys are baked into the host — the instance authenticates as
 itself via its attached role.
 
-### A.3 Fetch at boot and generate settings_local.py
+### A.3 Fetch at boot and generate settings_local_multitenant.py
 
 This is exactly what `deploy/user_data_backend.sh` already does: for each name
 it calls `aws ssm get-parameter --with-decryption` and writes the resulting
-`settings_local.py`. To adopt SSM, drop the manual §3b step and run that script
+`settings_local_multitenant.py`. To adopt SSM, drop the manual §3b step and run that script
 as EC2 user-data — provisioning then becomes fully hands-off.

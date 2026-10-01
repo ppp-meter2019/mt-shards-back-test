@@ -8,4 +8,4 @@
 # suite, and does not touch the guards.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec "${PYTHON:-python}" scripts/ci_guard_ast.py schema
+exec "${PYTHON:-python}" scripts/ci_guard_ast.py redis
