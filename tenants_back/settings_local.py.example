@@ -1,20 +1,30 @@
 """
-Local production settings - copy this file as `settings_local.py`
-(gitignored) and edit. It is imported at the very end of `settings.py`:
+Local production settings for STANDALONE mode. Copy this file as
+`settings_local.py` (gitignored) and edit. settings.py imports it LAST,
+and only when USE_MULTITENANT is off:
 
-    try:
+    else:
+        from .settings_base import *
         from .settings_local import *
-    except ImportError:
-        print("Can't load local settings!")
 
-Anything you put here overrides the defaults from `settings.py`.
+The multi-tenant counterpart is settings_local_multitenant.py.example. The two are
+separate files on purpose: the multi-tenant one pins ENGINE to the django-tenants
+backend and declares tenant_* shards, which must never reach a standalone run.
+
+Anything here overrides the defaults from settings_base.py.
 
 Replace `example.com` with your real apex domain.
 Run `openssl rand -hex 50` to generate a SECRET_KEY.
 """
 
 # Re-import the names we mutate in-place (DATABASES, CACHES are dicts).
-from .settings import DATABASES, CACHES, _aurora_db_options
+#
+# NOTE: there are no _aurora_db_options / _proxy_db_options here. Those helpers are
+# multi-tenant deployment topology (Aurora + RDS Proxy) and live in
+# settings_multitenant.py; the standalone dispatcher branch does not re-export them.
+# If a standalone deployment ever does need verify-full TLS, spell the OPTIONS out
+# below rather than reaching into the MT layer.
+from .settings import DATABASES, CACHES
 
 
 # --------------------------------------------------------------------------
@@ -58,46 +68,30 @@ CORS_ALLOWED_ORIGIN_REGEXES = [
 
 
 # --------------------------------------------------------------------------
-# Multi-DB Aurora endpoints. Three clusters: default + tenant_1 + tenant_2.
+# Database - ONE database, no shards. The ENGINE stays the plain PostGIS
+# backend from settings_base.py: the django-tenants backend belongs to the
+# other mode and must not appear here.
 # --------------------------------------------------------------------------
 
-# Shared defaults — engine, schema name on each cluster, port, pool settings,
-# connection options. Per-shard entries below add HOST/USER/PASSWORD.
-_AURORA_DEFAULTS = {
-    "ENGINE":             "django_tenants.postgresql_backend",
-    "NAME":               "tenants_back",
-    "PORT":               "5432",
-    "CONN_MAX_AGE":       60,
-    "CONN_HEALTH_CHECKS": True,
-    "OPTIONS":            _aurora_db_options(),
-}
-
-# Each Aurora cluster has its own credentials. In real deployments load these
-# from AWS Secrets Manager (one secret per cluster) or SSM Parameter Store
-# (one parameter per field per cluster).
 DATABASES["default"] = {
-    **_AURORA_DEFAULTS,
-    "HOST":     "default.cluster-xxx.eu-west-1.rds.amazonaws.com",
-    "USER":     "default_app",
-    "PASSWORD": "replace-me-default",
-}
-DATABASES["tenant_1"] = {
-    **_AURORA_DEFAULTS,
-    "HOST":     "tenant1.cluster-yyy.eu-west-1.rds.amazonaws.com",
-    "USER":     "tenant1_app",
-    "PASSWORD": "replace-me-tenant1",
-}
-DATABASES["tenant_2"] = {
-    **_AURORA_DEFAULTS,
-    "HOST":     "tenant2.cluster-zzz.eu-west-1.rds.amazonaws.com",
-    "USER":     "tenant2_app",
-    "PASSWORD": "replace-me-tenant2",
+    **DATABASES["default"],
+    "NAME":         "tenants_back",
+    "USER":         "app",
+    "PASSWORD":     "replace-me",
+    "HOST":         "db.internal.example.com",
+    "PORT":         "5432",
+    # Raise only where the topology is known: the connection count the server sees
+    # is backend_hosts x gunicorn_workers. See "Connection sizing" in
+    # deploy/DATABASE_SETUP.md.
+    "CONN_MAX_AGE": 60,
 }
 
 
 # --------------------------------------------------------------------------
-# Redis (ElastiCache) - one cluster for the app cache + sessions.
+# Redis - one cluster for the app cache + sessions.
 # maxmemory-policy=allkeys-lru is fine (disposable cache).
 # --------------------------------------------------------------------------
 
-CACHES["default"]["LOCATION"] = "redis://tenants-app.xxx.cache.amazonaws.com:6379/0"
+# Standalone has ONE cache alias — sessions ride it too (there is no tenant scoping here,
+# so nothing to separate). Multi-tenant is where the alias list grows.
+CACHES["default"]["LOCATION"] = "redis://app.xxx.cache.amazonaws.com:6379/0"

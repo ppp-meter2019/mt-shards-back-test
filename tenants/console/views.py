@@ -3,6 +3,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connections
@@ -17,8 +18,6 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.serializers import BaseSerializer
 from rest_framework.views import APIView
-
-from users.models import User
 
 # Runtime layer — absolute imports ACROSS the console boundary (allowed direction:
 # console -> tenants; never the reverse. See tenants/console/__init__.py).
@@ -347,6 +346,10 @@ class TenantViewSet(viewsets.ModelViewSet):
         # AND sets the schema on that shard's connection, so the INSERT lands
         # in <shard>.<schema>.users_user, not public.users_user.
         with tenant_context(tenant):
+            # Resolved HERE, not at module level: AUTH_USER_MODEL is swappable, and importing
+            # users.models at the top closed the cycle tenants -> users -> commons.platform ->
+            # tenants. Hoisting this line out of the method trades that for AppRegistryNotReady.
+            User = get_user_model()
             if User.objects.filter(username=username).exists():
                 return Response(
                     {"username": f"User '{username}' already exists in tenant '{tenant.schema_name}'."},

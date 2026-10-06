@@ -7,12 +7,17 @@ tenants.context, and read the current schema from connections[current_db], not
 from `default`.
 """
 from django.db import connections
-from django_tenants.utils import get_public_schema_name, get_tenant_model
 
-from tenants.context import bound_alias, schema_context, tenant_context, use_alias  # shard-aware
+# get_public_schema_name comes from tenants.context, which defers the django_tenants.utils
+# import to call time; see the docstring there. Importing it from django_tenants.utils HERE
+# would re-arm exactly what that defers, because this module is on the import path of
+# tenants_back/__init__.py and therefore runs mid-settings-load.
+from tenants.context import (  # shard-aware
+    bound_alias, get_public_schema_name, schema_context, tenant_context, use_alias,
+)
 
 __all__ = [
-    "get_public_schema_name", "get_tenant_model",
+    "get_public_schema_name",
     "schema_context", "tenant_context", "use_alias", "current_schema_name",
 ]
 

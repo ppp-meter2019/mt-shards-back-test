@@ -12,6 +12,7 @@ Example:
 
 from typing import Any
 
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError, CommandParser
@@ -27,7 +28,6 @@ from tenants.validators import (
     validate_schema_name,
     validate_tenant_schema_name,
 )
-from users.models import User
 
 
 class Command(TenantCommand):
@@ -134,6 +134,10 @@ class Command(TenantCommand):
         # shard's connection), so the INSERT lands in <shard>.<schema>.users_user.
         tenant.refresh_from_db()
         with tenant_context(tenant):
+            # Resolved HERE, not at module level: AUTH_USER_MODEL is swappable, and importing
+            # users.models at the top closed the cycle tenants -> users -> commons.platform ->
+            # tenants. Hoisting this line out of handle() trades that for AppRegistryNotReady.
+            User = get_user_model()
             user, _ = User.objects.get_or_create(
                 username=opts["admin_username"],
                 defaults={

@@ -4,7 +4,11 @@ These tests only run in USE_MULTITENANT=True (the `tenants` app must be installe
 for its test suite to be discovered), which is exactly the mode the invariants
 apply to.
 """
+import os
+import subprocess
+import sys
 from collections.abc import Sequence
+
 from django.conf import settings
 from django.test import SimpleTestCase
 
@@ -289,3 +293,50 @@ class MergeSeamContractTests(SimpleTestCase):
             self.assertEqual(label, label.lower(), f"{label!r} must be lower-cased")
             self.assertEqual(label.count("."), 1,
                              f"{label!r} must be exactly 'app_label.modelname'")
+
+
+class SettingsLoadReentrancyTests(SimpleTestCase):
+    """Importing the project PACKAGE must not configure Django settings.
+
+    `tenants_back` is both the settings package and the Celery app package, so Django imports
+    it on the way to `tenants_back.settings`: `import_module("tenants_back.settings")` runs
+    `tenants_back/__init__.py` FIRST. Anything that reads django.conf.settings from there
+    re-enters the settings load, and Django answers the re-entrant `_setup()` by building a
+    SECOND Settings object from whatever the settings module has executed so far.
+
+    With DJANGO_SETTINGS_MODULE pointing at this package that is merely wasteful (the
+    submodule import completes on its own, both objects come out identical). Point it at a
+    wrapper OUTSIDE the package -- `prod_settings.py` doing `from tenants_back.settings
+    import *`, the shape half of Django projects deploy -- and the inner object is built from
+    a module that is still on the stack: global defaults only, DATABASES == {}, no
+    USE_MULTITENANT. It is transient, replaced once the outer load finishes, but every
+    settings read that happens inside that window silently gets the global default.
+
+    This cannot be asserted in-process (settings are configured before the suite runs), hence
+    the subprocess. It is also why `tenants/context.py` and `tenants/celery/compat.py` defer
+    their `django_tenants.utils` import: that module evaluates get_tenant_database_alias() in
+    two default args at import time, which was the one read inside the window.
+    """
+
+    def test_importing_the_project_package_does_not_configure_settings(self) -> None:
+        script = (
+            "import os, sys\n"
+            "os.environ['DJANGO_SETTINGS_MODULE'] = 'tenants_back.settings'\n"
+            "from django.conf import settings\n"
+            "import tenants_back\n"
+            "print('CONFIGURED' if settings.configured else 'CLEAN')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(settings.BASE_DIR),
+            env={**os.environ, "USE_MULTITENANT": "1"},
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, f"import failed:\n{proc.stderr}")
+        self.assertEqual(
+            proc.stdout.strip().splitlines()[-1], "CLEAN",
+            "importing tenants_back configured Django settings -- something on the Celery app "
+            "import chain now reads django.conf.settings at module level. Find it and defer "
+            "the read (or the import that causes it) to call time; see this class's docstring "
+            "and the comment at the top of tenants_back/celery.py.",
+        )

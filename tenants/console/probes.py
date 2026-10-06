@@ -33,12 +33,12 @@ import logging
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from django.contrib.auth import get_user_model
 from django.db import Error as DBError, connections
 from django.db.utils import ConnectionDoesNotExist
 
 from tenants.models import Tenant
 from tenants.validators import is_safe_schema_identifier, quote_schema
-from users.models import User
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +149,10 @@ def admins(tenants: Iterable[Tenant]) -> dict[tuple[str, str], list[dict[str, An
     logs a spurious degrade warning), which is what the pre-refactor code did.
     """
     tenants = [t for t in tenants if is_safe_schema_identifier(t.schema_name)]
+    # Resolved HERE, not at module level: AUTH_USER_MODEL is swappable, and importing
+    # users.models at the top closed the cycle tenants -> users -> commons.platform ->
+    # tenants. Hoisting this line out of the function trades that for AppRegistryNotReady.
+    User = get_user_model()
     table = User._meta.db_table
     col = {f: User._meta.get_field(f).column
            for f in ("id", "username", "is_active", "role")}

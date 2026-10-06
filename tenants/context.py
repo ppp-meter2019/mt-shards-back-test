@@ -32,11 +32,56 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 from django.db import connections
-from django_tenants.utils import get_public_schema_name
 
 if TYPE_CHECKING:                       # annotation-only: keeps this module free of the
     from .models import Tenant          # lazy-import cycle its runtime code avoids
     from .resolver import TenantSnapshot
+
+
+_upstream_public_schema_name = None      # resolved on first call, see below
+
+
+def get_public_schema_name() -> str:
+    """Upstream's helper, with the IMPORT deferred to call time. Same value, same source.
+
+    `import django_tenants.utils` evaluates get_tenant_database_alias() in the default args of
+    schema_exists()/schema_rename() (utils.py:193,212) at MODULE import, which reads
+    settings.TENANT_DB_ALIAS. This module sits on the import path of tenants_back/__init__.py
+    (`from .celery import app` -> CeleryApp(...) -> symbol_by_name(registry_cls) ->
+    tenants.celery.registry -> .task -> .compat -> here), so that read happens WHILE Django is
+    still executing the settings module — it RE-ENTERS the settings load. With
+    DJANGO_SETTINGS_MODULE pointing at this package it survives (the submodule import
+    completes on its own and both Settings objects come out identical); point it at a wrapper
+    module OUTSIDE the package, the `from tenants_back.settings import *` shape every second
+    Django project has, and the re-entrant load builds its Settings from a HALF-EXECUTED
+    module: 146 global defaults, DATABASES == {}, no USE_MULTITENANT. Nothing reads that
+    object today except this very call (which then bakes DEFAULT_DB_ALIAS into those two
+    upstream signatures for the life of the process), but the window stays open across the
+    whole Celery import chain and swallows any settings read added to it later.
+
+    Deferring the import moves the read past django.setup(). Do NOT reimplement the body:
+    tenants/tests/test_upstream_contract.py exists because this project tracks upstream rather
+    than forking it.
+
+    The resolved function is CACHED because re-running the import statement is not free —
+    measured on this box, 2M calls each: 367 ns bound at module level, 1220 ns re-importing
+    every call (x3.3), 419 ns with this cache (x1.14, i.e. the extra stack frame and nothing
+    else). The call sites are per-context-entry / per-task, not per-query, so even the x3.3
+    would have been lost in the noise; the cache is simply free. Note the hot path — cache key
+    construction — does NOT come through here: commons.platform.cache_keys takes its copy from
+    commons.platform.tenancy, which is not on the Celery import chain and binds at import.
+
+    Caching on FIRST CALL rather than at import also keeps this strictly better than the
+    module-level import it replaces: TenantsConfig.ready() monkeypatches django_tenants.utils
+    (today only schema_context/tenant_context), and ready() runs during django.setup(), before
+    anything here can be called — so a patch added to this name later would still be picked up.
+    """
+    global _upstream_public_schema_name
+    if _upstream_public_schema_name is None:
+        from django_tenants.utils import get_public_schema_name as _upstream
+        _upstream_public_schema_name = _upstream
+    return _upstream_public_schema_name()
+
 
 # default=None is the SENTINEL for "no routing context established" (distinct from an
 # explicit alias of "default"). Only middleware / use_alias / _switch set a real alias; when

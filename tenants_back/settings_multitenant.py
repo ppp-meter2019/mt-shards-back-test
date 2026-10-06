@@ -48,11 +48,25 @@ SHARED_APPS = [
 
 # Apps that need a table in EVERY tenant schema. A deliberate SUBSET of contrib
 # (only contenttypes/auth/admin) + users + business. NOT built from _DJANGO_APPS:
-# sessions/messages/staticfiles/gis live on the shared side only.
+# sessions/messages/staticfiles live on the shared side only.
 TENANT_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.auth",
     "django.contrib.admin",
+
+    # Here for ROUTING, not for tables — the one entry in this list that creates nothing.
+    # gis ships no migrations and no MANAGED models (verified: 2 models, 0 managed, 0
+    # migrations in the graph), so it adds nothing to a tenant schema. Its two models are
+    # unmanaged views over PostGIS's OWN catalog — spatial_ref_sys, geometry_columns — which
+    # exists on every shard because CREATE EXTENSION is per DATABASE, not per schema.
+    #
+    # Listed as shared-only it fell into db_for_read's early return (tenants/routers.py:46-49)
+    # and was pinned to `default`, so a tenant on shard_a would have read `default`'s catalog
+    # to answer a question about its own. Membership here is what lets it follow the bound
+    # alias instead. Nothing queries those models today — no .transform() anywhere, and
+    # orders.Order.delivery_point is a fixed srid=4326 geography — so this closes a trap
+    # rather than fixing a live bug, and it closes it without touching the router.
+    "django.contrib.gis",
 
     # The SAME list as in SHARED_APPS above, and the duplication is the mechanism: present in
     # both schemas, the identity table SHADOWS — `search_path = [tenant, public]` resolves it

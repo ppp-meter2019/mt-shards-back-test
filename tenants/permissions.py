@@ -1,10 +1,9 @@
+from django.contrib.auth import get_user_model
 from django.db import connection
 from django_tenants.utils import get_public_schema_name
 from rest_framework.permissions import BasePermission
 from rest_framework.request import Request
 from rest_framework.views import APIView
-
-from users.models import User
 
 
 class IsTenantAdminOnPublic(BasePermission):
@@ -25,4 +24,8 @@ class IsTenantAdminOnPublic(BasePermission):
         # importing django_tenants would break the standalone boot.
         if connection.schema_name != get_public_schema_name():
             return False
-        return request.user.role == User.Role.TENANT_ADMIN
+        # get_user_model(), not `from users.models import User`: AUTH_USER_MODEL is swappable,
+        # and that module-level import was the only thing making `tenants` depend on `users` —
+        # closing the cycle tenants -> users -> commons.platform -> tenants. The call must stay
+        # INSIDE a function: at module level the app registry is not ready yet.
+        return request.user.role == get_user_model().Role.TENANT_ADMIN

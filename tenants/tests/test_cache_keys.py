@@ -13,6 +13,7 @@ level, because this process cannot be in both modes at once.
 Contract: deploy/redis_keys_design.md.
 """
 import contextlib
+import threading
 import types
 from unittest import mock
 
@@ -151,6 +152,108 @@ class CacheKeyContextTests(SimpleTestCase):
                 cache_keys.tenant_key("coordinates_package")
 
 
+class CacheKeyThreadTests(SimpleTestCase):
+    """What a CHILD THREAD gets, pinned because it is a cross-tenant hazard and because the
+    docstring here used to claim the opposite ("a containment failure, never a leak").
+
+    Two independent mechanisms both point at `public`, so there is no fallback path:
+      * `current_db` is a ContextVar and `threading.Thread` starts with a fresh context, so
+        `bound_alias()` is None in the child;
+      * `django.db.connections` is thread-local, so even a carried-over context would find a
+        connection with no schema set on it.
+
+    These tests use the REAL ContextVar via `use_alias`, not a patched `bound_alias` — a
+    lambda would return the same value in any thread and would prove nothing.
+    """
+
+    @staticmethod
+    def _in_thread(fn):
+        out = {}
+        def run():
+            try:
+                out["value"] = fn()
+            except Exception as exc:          # noqa: BLE001 — recorded, re-raised by caller
+                out["exc"] = exc
+        t = threading.Thread(target=run)
+        t.start()
+        t.join()
+        return out
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _fake_shards():
+        conns = {
+            "t1": types.SimpleNamespace(schema_name="alpha"),
+            "t2": types.SimpleNamespace(schema_name="beta"),
+            "default": types.SimpleNamespace(schema_name="public"),
+        }
+        with mock.patch.object(cache_keys, "connections", conns):
+            yield
+
+    def test_two_tenants_collide_on_one_namespace_in_a_thread(self) -> None:
+        """THE leak. Not "each unbound caller gets a broken namespace of its own" — they all
+        get the SAME one, so two threads serving different tenants read each other's keys."""
+        from tenants.context import use_alias
+        keys = []
+        with self._fake_shards():
+            for alias in ("t1", "t2"):
+                with use_alias(alias):
+                    keys.append(self._in_thread(
+                        lambda: cache_keys.make_key("orders:open", "app", 1))["value"])
+        self.assertEqual(keys[0], keys[1], "the collision is the point of this test")
+        self.assertEqual(keys[0], "tenant:public:app:1:orders:open")
+
+    def test_carrying_the_context_over_is_what_separates_them(self) -> None:
+        """Sensitivity check: the collision above is caused by the ContextVar, not by some
+        incidental property of the fake connections. Capture the context in the PARENT and the
+        two tenants separate again.
+
+        Also pins the trap in that fix: `copy_context()` must run in the parent. Called inside
+        the thread target it copies the child's already-empty context and changes nothing —
+        a no-op that reads like a fix.
+        """
+        import contextvars
+        from tenants.context import use_alias
+
+        def key_from_thread(alias, *, capture_in_parent):
+            with self._fake_shards(), use_alias(alias):
+                out = {}
+                fn = lambda: out.setdefault(                      # noqa: E731
+                    "k", cache_keys.make_key("orders:open", "app", 1))
+                if capture_in_parent:
+                    ctx = contextvars.copy_context()
+                    target = lambda: ctx.run(fn)                  # noqa: E731
+                else:
+                    target = lambda: contextvars.copy_context().run(fn)   # noqa: E731
+                t = threading.Thread(target=target)
+                t.start()
+                t.join()
+                return out["k"]
+
+        self.assertEqual(key_from_thread("t1", capture_in_parent=True),
+                         "tenant:alpha:app:1:orders:open")
+        self.assertEqual(key_from_thread("t2", capture_in_parent=True),
+                         "tenant:beta:app:1:orders:open")
+        # the no-op form: both tenants still collide
+        self.assertEqual(key_from_thread("t1", capture_in_parent=False),
+                         key_from_thread("t2", capture_in_parent=False))
+
+    def test_make_key_degrades_silently_but_tenant_key_refuses(self) -> None:
+        """The asymmetry saves exactly half: the manual-key path is protected, the cache API
+        is not — and cannot be, because make_key is a KEY_FUNCTION and must stay total."""
+        from tenants.context import use_alias
+        with self._fake_shards(), use_alias("t1"):
+            self.assertEqual(cache_keys.make_key("k", "app", 1), "tenant:alpha:app:1:k")
+            self.assertEqual(
+                self._in_thread(lambda: cache_keys.make_key("k", "app", 1))["value"],
+                "tenant:public:app:1:k",
+            )
+            self.assertIsInstance(
+                self._in_thread(lambda: cache_keys.tenant_key("coords"))["exc"],
+                ImproperlyConfigured,
+            )
+
+
 class CachesWiringTests(SimpleTestCase):
     """WHICH aliases are tenant-scoped. Each assertion here is a real failure mode."""
 
@@ -163,8 +266,15 @@ class CachesWiringTests(SimpleTestCase):
                          self.REVERSE_FN)
 
     def test_reverse_key_function_is_present_whenever_key_function_is(self) -> None:
-        """django-redis needs both: with KEY_FUNCTION alone, keys()/delete_pattern()/
-        iter_keys() return mangled logical keys instead of failing, which is worse."""
+        """django-redis needs both: with KEY_FUNCTION alone, keys() and iter_keys() fall back
+        to default_reverse_key (`split(":", 2)[2]`), which on a five-segment key returns
+        `<prefix>:<version>:<key>` — a mangled logical key rather than a failure, which is
+        worse.
+
+        delete_pattern() is NOT in that set, contrary to what this docstring used to say: it
+        SCANs and deletes, returning a count, and never reverses a key. See the same
+        correction on cache_keys.reverse_key, and test_reverse_key_round_trips above, which
+        has had it right all along."""
         for alias, conf in settings.CACHES.items():
             with self.subTest(alias=alias):
                 if conf.get("KEY_FUNCTION"):

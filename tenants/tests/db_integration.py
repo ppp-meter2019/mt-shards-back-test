@@ -17,6 +17,7 @@ from datetime import timedelta
 from unittest import mock
 
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.db import IntegrityError, connections, transaction
@@ -35,7 +36,13 @@ from tenants.validators import (
 )
 from tenants.context import tenant_context
 from tenants.console.views import BaseDomainsView, TenantViewSet
-from users.models import User
+
+# get_user_model(), not `from users.models import User`: the runtime modules of this app
+# were moved off that import to break the cycle tenants -> users -> commons.platform ->
+# tenants, and a test module is still part of the `tenants` package, so a module-level
+# import here would put the edge straight back. Calling it at module scope IS safe in a
+# test module (Django has already set up the app registry by collection time).
+User = get_user_model()
 
 SEED_LABELS = {"www", "api", "admin", "mail", "staging",
                "dev", "test", "status", "docs", "support"}

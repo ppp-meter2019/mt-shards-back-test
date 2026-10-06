@@ -91,6 +91,43 @@ def _connection_aliases(tree: ast.AST) -> set[str]:
     return names
 
 
+def _db_module_paths(tree: ast.AST) -> set[str]:
+    """Dotted paths bound to the django.db MODULE itself, so `<path>.connection` counts too.
+
+    `import django.db` binds "django.db"; `import django.db as d` binds "d"; `from django
+    import db` binds "db". Without this the rule saw only the `from django.db import
+    connection` spelling, and `db.connection.schema_name` walked straight through it —
+    confirmed by running the guard against that exact file, which it passed.
+    """
+    paths = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "django.db":
+                    paths.add(a.asname or "django.db")
+        elif isinstance(node, ast.ImportFrom) and node.module == "django":
+            for a in node.names:
+                if a.name == "db":
+                    paths.add(a.asname or a.name)
+    return paths
+
+
+def _dotted(node: ast.AST) -> str | None:
+    """"a.b.c" for a Name/Attribute chain; None for anything else (a call, a subscript).
+
+    Deliberately partial: it answers "is this expression a plain dotted path, and which one",
+    which is all _db_module_paths needs. Anything more would be type inference.
+    """
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
 def schema_offenders(tree: ast.AST) -> list[str]:
     """`<connection-ish>.schema_name` in any spelling the module's own imports allow.
 
@@ -100,14 +137,18 @@ def schema_offenders(tree: ast.AST) -> list[str]:
     indirection actually happens) is skipped wholesale.
     """
     aliases = _connection_aliases(tree)
-    if not aliases:
+    db_paths = _db_module_paths(tree)
+    if not aliases and not db_paths:
         return []
 
     def is_conn(node: ast.AST) -> bool:
         if isinstance(node, ast.Name):
             return node.id in aliases
+        if isinstance(node, ast.Attribute) and node.attr in ("connection", "connections"):
+            return _dotted(node.value) in db_paths             # db.connection, django.db.connections
         if isinstance(node, ast.Subscript):                    # connections[alias]
-            return isinstance(node.value, ast.Name) and node.value.id in aliases
+            return (isinstance(node.value, ast.Name) and node.value.id in aliases) \
+                or is_conn(node.value)                         # db.connections[alias]
         return False
 
     hits = []
@@ -147,6 +188,12 @@ REDIS_HARMLESS_SUBMODULES = {"redis.exceptions", "redis.typing"}
 REDIS_CLIENT_NAMES = {"Redis", "StrictRedis", "ConnectionPool", "BlockingConnectionPool",
                       "from_url", "get_redis_connection"}
 
+# django_redis is NOT the redis package, but one of its exports is a raw-client door — and in
+# a django_redis project it is THE documented way in, so missing it left the rule's main hole.
+# Narrowed to that one name on purpose: `from django_redis.util import default_reverse_key`
+# hands out no client and must keep passing, which cache_keys.py's standalone branch relies on.
+REDIS_WRAPPER_FACTORIES = {"get_redis_connection"}
+
 
 def redis_offenders(tree: ast.AST) -> list[str]:
     """Anything that can yield a redis-py client, whatever the spelling.
@@ -164,13 +211,32 @@ def redis_offenders(tree: ast.AST) -> list[str]:
                     hits.append(f"import {a.name}")
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
+            # The ORIGINAL name, never the asname: `import get_redis_connection as rc` used to
+            # defeat this rule outright, since the Name branch below then sees only `rc`.
+            bound = {a.name for a in node.names}
+            if mod == "django_redis" or mod.startswith("django_redis."):
+                if factories := bound & REDIS_WRAPPER_FACTORIES:
+                    hits.append(f"from {mod} import {', '.join(sorted(factories))}")
             if (mod == "redis" or mod.startswith("redis.")) \
                     and mod not in REDIS_HARMLESS_SUBMODULES:
-                bound = {a.name for a in node.names}
                 if bound & REDIS_CLIENT_NAMES or mod != "redis":
                     hits.append(f"from {mod} import {', '.join(sorted(bound))}")
-        elif isinstance(node, ast.Attribute) and node.attr in (
-                "get_client", "master_client", *REDIS_CLIENT_NAMES):
+        elif isinstance(node, ast.Attribute) and node.attr in ("get_client", "master_client"):
+            # ONLY the django_redis shape `<cache>.client.get_client(...)`. Matching the bare
+            # attribute name flagged ANY object owning such a method, whatever the receiver —
+            # a boto3 wrapper with `def get_client(self)` failed this rule and was told to use
+            # tenant_raw_client(), which is a different library entirely. Both sanctioned call
+            # sites reach it through `.client`: caches["default"].client.get_client
+            # (commons/platform/redis_client.py) and self.cache.client.get_client
+            # (tenants/resolver/cache.py).
+            #
+            # The narrowing costs one spelling: `c = cache.client` on its own line, then
+            # `c.get_client()`. Tracking that needs variable-binding inference, which is more
+            # machinery than this guard is worth — and a two-line dodge is a deliberate act,
+            # not the accident this rule exists to catch.
+            if isinstance(node.value, ast.Attribute) and node.value.attr == "client":
+                hits.append(f".client.{node.attr}")
+        elif isinstance(node, ast.Attribute) and node.attr in REDIS_CLIENT_NAMES:
             hits.append(f".{node.attr}")
         elif isinstance(node, ast.Name) and node.id == "get_redis_connection":
             hits.append("get_redis_connection")

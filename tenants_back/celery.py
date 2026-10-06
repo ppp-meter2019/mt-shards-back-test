@@ -14,14 +14,31 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "tenants_back.settings")
 
 from commons.platform.mode import use_multitenant  # noqa: E402
 
-# NOTHING in this module may read django.conf.settings at import time. Importing the settings
-# PACKAGE runs tenants_back/__init__.py first (the standard Celery-Django integration:
-# `from .celery import app as celery_app`), which lands here — so a settings read on this line
-# makes Django resolve the settings module RE-ENTRANTLY, from inside the partially initialised
-# package that contains it. It works today only because that import is the first statement in
-# __init__.py and settings_mode.py is a leaf, neither of which is enforced; point
-# DJANGO_SETTINGS_MODULE at a module that star-imports this project's settings and it breaks
-# (verified: django.setup() succeeds with DATABASES == {} and no USE_MULTITENANT).
+# NOTHING on this module's import graph may read django.conf.settings at import time — not
+# this file, and not anything it pulls in. Importing the settings PACKAGE runs
+# tenants_back/__init__.py first (the standard Celery-Django integration:
+# `from .celery import app as celery_app`), which lands here — so such a read makes Django
+# resolve the settings module RE-ENTRANTLY, from inside the partially initialised package
+# that contains it, and answer with a SECOND Settings object built from whatever has executed
+# so far.
+#
+# With DJANGO_SETTINGS_MODULE = tenants_back.settings that is only wasteful: the submodule
+# import completes on its own and both objects come out identical (192 settings each).
+# Point it at a wrapper OUTSIDE this package — `prod_settings.py` doing
+# `from tenants_back.settings import *` — and the inner object is built from a module still
+# on the stack: 146 global defaults, DATABASES == {}, no USE_MULTITENANT. It is TRANSIENT
+# (the outer load overwrites it, and django.setup() ends with correct settings), so the
+# damage is not the end state but every read made inside that window, which silently gets the
+# global default and may cache it forever.
+#
+# That is not hypothetical: `from tenants.celery import CeleryApp` below used to open exactly
+# such a window. Celery resolves registry_cls EAGERLY (celery/app/base.py:364,
+# symbol_by_name) -> tenants.celery.registry -> .task -> .compat -> django_tenants.utils,
+# whose module body evaluates get_tenant_database_alias() in two default args (utils.py:193,
+# 212) and so reads settings.TENANT_DB_ALIAS. tenants/context.py and tenants/celery/compat.py
+# now defer that import to call time. The rule is enforced by
+# tenants.tests.test_settings_invariants.SettingsLoadReentrancyTests, which asserts in a
+# subprocess that `import tenants_back` leaves settings UNCONFIGURED.
 #
 # The standard celery.py has no such read — `Celery(name)` and
 # `config_from_object("django.conf:settings")` are both lazy — so this is our deviation, not

@@ -84,15 +84,19 @@ Three ways to get it wrong, all silent:
   * a part containing ":" — this is a join, so `tenant_key("vtl", "a:b")` is indistinguishable
     from `tenant_key("vtl", "a", "b")`. Normalise or hash anything that might carry one.
   * `f"tenant:{connection.schema_name}:..."` by hand — bypasses the context check AND reads
-    the wrong connection (`default`, not the bound shard; see current_schema below).
+    the wrong connection (always `default`, whatever is bound; see current_schema below).
 
 To sweep a tenant, do not parse keys — match them: `SCAN MATCH 'tenant:<schema>:*'`, plus the
 `sess:*` namespace separately (see the table in deploy/redis_keys_design.md section D2).
 
 WORKS OUTSIDE WSGI. Nothing here touches `request`, middleware state or a thread-local set
-on the HTTP path: the only input is the schema on the BOUND shard connection —
-`connections[bound_alias()].schema_name`, never `default`, and never at all when no context
-is bound (see current_schema below). A rewritten WebSocket
+on the HTTP path: the only input is the schema on the BOUND connection —
+`connections[bound_alias()].schema_name`, never the AMBIENT `django.db.connection`, and
+never at all when no context is bound (see current_schema below). Note that bound alias is
+routinely "default" — that is the public / management path, which both
+ShardAwareTenantMiddleware and TenantTask pin with `use_alias("default")` — so
+`connections["default"]` in a traceback is normal here. What the rule forbids is reading a
+connection that nobody bound, not reading that particular one. A rewritten WebSocket
 service (Django Channels — a SEPARATE ASGI deployment, see the ASGI_APPLICATION note in
 settings_base.py) and the Celery workers must be able to build the same keys as the API.
 That constraint is why the token is read from the connection and passed nowhere.
@@ -132,11 +136,37 @@ if settings.USE_MULTITENANT:
         promises to refuse. The check has to stand on whether a context EXISTS, not on what
         the schema happens to say.
 
-        Falling back to public rather than raising keeps make_key TOTAL: it is the
-        KEY_FUNCTION of CACHES['default'], runs on every cache call, and an exception there
-        is not absorbed by IGNORE_EXCEPTIONS. Unbound callers therefore share the public
-        namespace — a containment failure, never a leak. tenant_key() turns that same public
-        result into a refusal, which is the contract that has to be strict.
+        Falling back to public rather than raising removes the PRACTICAL reason to raise: this
+        feeds the KEY_FUNCTION of CACHES['default'], it runs on every cache call, and an
+        exception here reaches the caller — django_redis's omit_exception intercepts
+        ConnectionInterrupted alone, so a non-redis exception is never absorbed whatever
+        IGNORE_EXCEPTIONS says (it is False on this alias anyway). tenant_key() turns that
+        same public result into a refusal, which is the contract that has to be strict.
+
+        It does NOT make make_key TOTAL, as an earlier version of this docstring claimed:
+        `connections[alias]` raises ConnectionDoesNotExist for an alias outside DATABASES,
+        straight out of the KEY_FUNCTION and into code with no tenancy in it. Only use_alias()
+        can bind such an alias — it sets current_db without touching `connections`, having no
+        schema to apply and so nothing to resolve — whereas _switch() (tenant_context /
+        schema_context) resolves the connection on its first line and fails at the `with`,
+        before any key is minted. Both use_alias call sites pass the literal "default", so
+        this is a property of the contract rather than a reachable failure.
+
+        THAT FALLBACK CAN LEAK ACROSS TENANTS, and an earlier version of this docstring said
+        the opposite ("a containment failure, never a leak"). Unbound callers do not each get
+        a broken namespace of their own — they all get the SAME one, `tenant:public:`. Two
+        unbound callers serving different tenants therefore read and write each other's
+        entries. Verified: under `use_alias("t1")` (schema alpha) and `use_alias("t2")`
+        (schema beta), a child thread in either produces the identical key
+        `tenant:public:app:1:orders:open`.
+
+        A thread is the realistic way to end up unbound: `current_db` is a ContextVar and
+        `threading.Thread` starts with a fresh context, so `bound_alias()` is None there. A
+        second mechanism points the same way even if the context were carried over —
+        `django.db.connections` is thread-local, so the connection a child thread sees has no
+        schema set on it either. tenant_key() raises in that situation; make_key cannot, which
+        is why the hazard lives entirely on the cache-API side. Pinned by
+        test_cache_keys.CacheKeyThreadTests. Do not cache tenant data from a thread pool.
 
         `or get_public_schema_name()` is belt-and-braces for a hand-rolled set_schema or a
         FakeTenant — NOT for a fresh connection: the backend's __init__ ends with
@@ -184,8 +214,16 @@ if settings.USE_MULTITENANT:
         return f"{TENANT_NAMESPACE}:{current_schema()}:{key_prefix}:{version}:{key}"
 
     def reverse_key(key: str) -> str:
-        """CACHES['default']['REVERSE_KEY_FUNCTION'] — required by django-redis for
-        keys()/delete_pattern()/iter_keys(). Inverse of make_key: five segments."""
+        """CACHES['default']['REVERSE_KEY_FUNCTION'] — required by django-redis for keys()
+        and iter_keys(), the two methods that hand PHYSICAL keys back to the caller
+        (client/default.py:706 and :689 — the only two call sites of self.reverse_key).
+
+        delete_pattern() does NOT use it, though an earlier version of this line said it did:
+        it builds a pattern, SCANs, deletes and returns a COUNT, so no key is ever turned
+        back into a logical one. That matters for reading tenants/resolver/cache.py, whose
+        snapshot sweep runs on delete_pattern and therefore does not depend on anything here.
+
+        Inverse of make_key: five segments."""
         return key.split(":", 4)[4]
 
     def tenant_key(*parts: str) -> str:

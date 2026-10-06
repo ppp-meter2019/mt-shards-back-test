@@ -11,6 +11,7 @@ Example:
 
 from typing import Any
 
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.management.base import CommandError, CommandParser
 from django_tenants.utils import get_public_schema_name
@@ -20,7 +21,6 @@ from commons.platform.commands import TenantCommand
 from tenants.context import schema_context
 from tenants.models import Domain, Shard, Tenant
 from tenants.validators import validate_hostname
-from users.models import User
 
 
 class Command(TenantCommand):
@@ -73,6 +73,10 @@ class Command(TenantCommand):
         # routed deterministically — and so it survives `users` being in TENANT_STRICT_ROUTE_APPS
         # (an unset context would otherwise raise in the strict router).
         with schema_context(get_public_schema_name()):
+            # Resolved HERE, not at module level: AUTH_USER_MODEL is swappable, and importing
+            # users.models at the top closed the cycle tenants -> users -> commons.platform ->
+            # tenants. Hoisting this line out of handle() trades that for AppRegistryNotReady.
+            User = get_user_model()
             user, created = User.objects.get_or_create(
                 username=opts["username"],
                 defaults={

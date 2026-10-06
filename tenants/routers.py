@@ -8,11 +8,16 @@ Inherits django-tenants TenantSyncRouter:
                       the closure apps' data migrations on public.
 """
 
+import functools
 import logging
 from typing import Any
 
+from django.apps import apps as django_apps
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.db import connections
+from django.dispatch import receiver
+from django.test.signals import setting_changed
 from django.db.models import Model
 from django.db.utils import ConnectionDoesNotExist
 from django_tenants.routers import TenantSyncRouter
@@ -25,6 +30,42 @@ from django_tenants.utils import (
 from .context import bound_alias
 
 logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def strict_route_labels() -> frozenset[str]:
+    """TENANT_STRICT_ROUTE_APPS (INSTALLED_APPS entries) resolved to app_labels.
+
+    The router compares model._meta.app_label; a bare `in` against the raw entries matches
+    nothing once a project writes "apps.accounts" or overrides AppConfig.label, and three
+    guards then switch off with NO error. Resolved via the registry — `label` is an
+    independent attribute, no string transform recovers it. Cached because a settings read
+    costs ~320 ns (LazyObject.__getattribute__) against 8 ns for frozenset membership.
+    """
+    by_entry: dict[str, str] = {}
+    for cfg in django_apps.get_app_configs():
+        by_entry[cfg.name] = cfg.label
+        by_entry[cfg.label] = cfg.label
+        by_entry[f"{cfg.__module__}.{cfg.__class__.__name__}"] = cfg.label
+
+    labels = set()
+    for entry in getattr(settings, "TENANT_STRICT_ROUTE_APPS", frozenset()):
+        if entry not in by_entry:
+            raise ImproperlyConfigured(
+                f"TENANT_STRICT_ROUTE_APPS entry {entry!r} names no installed app. Match it "
+                f"by INSTALLED_APPS name, AppConfig label, or dotted AppConfig class path."
+            )
+        labels.add(by_entry[entry])
+    return frozenset(labels)
+
+
+@receiver(setting_changed)
+def _clear_strict_route_labels(*, setting: str, **kwargs: Any) -> None:
+    """Both settings matter: one is the entries to resolve, the other is what they resolve TO
+    (override_settings(INSTALLED_APPS=...) repopulates the app registry). This only CLEARS, so
+    receiver order against Django's own INSTALLED_APPS handler is irrelevant."""
+    if setting in ("TENANT_STRICT_ROUTE_APPS", "INSTALLED_APPS"):
+        strict_route_labels.cache_clear()
 
 
 class PublicSchemaModelDenied(RuntimeError):
@@ -58,7 +99,7 @@ class TenantDatabaseRouter(TenantSyncRouter):
         # `default`, so this correctly stays quiet there.
         self._guard_public(model, alias or "default")
         if alias is None:                         # NO routing context established
-            if label in getattr(settings, "TENANT_STRICT_ROUTE_APPS", frozenset()):
+            if label in strict_route_labels():
                 raise RuntimeError(
                     f"{model._meta.label}: tenant-model query with NO routing context "
                     f"(current_db unset) — it would silently hit the DEFAULT database (wrong "
@@ -108,7 +149,7 @@ class TenantDatabaseRouter(TenantSyncRouter):
         if schema != get_public_schema_name():
             return
         label = model._meta.app_label
-        if label not in getattr(settings, "TENANT_STRICT_ROUTE_APPS", frozenset()):
+        if label not in strict_route_labels():
             return
         if model._meta.label_lower in getattr(settings, "PUBLIC_MODEL_ALLOWLIST", frozenset()):
             return
@@ -165,7 +206,7 @@ class TenantDatabaseRouter(TenantSyncRouter):
         # shared app's migration. The host project has no such operation today.
         if (model_name is None
                 and connection.schema_name == public_schema_name
-                and app_label in getattr(settings, "TENANT_STRICT_ROUTE_APPS", frozenset())):
+                and app_label in strict_route_labels()):
             return False
 
         if has_multi_type_tenants():

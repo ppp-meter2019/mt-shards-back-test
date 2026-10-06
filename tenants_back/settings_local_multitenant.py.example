@@ -1,0 +1,159 @@
+"""
+Local production settings for MULTI-TENANT mode. Copy this file as
+`settings_local_multitenant.py` (gitignored) and edit. settings.py imports it LAST,
+and only when USE_MULTITENANT is on:
+
+    if use_multitenant():
+        from .settings_multitenant import *
+        ...
+        from .settings_local_multitenant import *
+
+The standalone counterpart is settings_local.py.example. The two are
+separate files on purpose: this one pins ENGINE to the django-tenants backend and
+declares tenant_* shards, which is exactly what must NOT reach a standalone run.
+
+Anything here overrides the defaults from settings_base.py + settings_multitenant.py.
+
+Replace `example.com` with your real apex domain.
+Run `openssl rand -hex 50` to generate a SECRET_KEY.
+"""
+
+# Re-import the names we mutate in-place (DATABASES, CACHES are dicts). The underscore
+# helpers are defined in settings_multitenant.py and re-exported by settings.py - import
+# them from `.settings`, which is the only module guaranteed to have them bound by now.
+from .settings import DATABASES, CACHES, _MT_DB_DEFAULTS, _aurora_db_options
+
+
+# --------------------------------------------------------------------------
+# Core
+# --------------------------------------------------------------------------
+
+DEBUG = False
+
+SECRET_KEY = "replace-me-with-a-long-random-string"
+
+ALLOWED_HOSTS = [".example.com", "example.com"]
+
+
+# --------------------------------------------------------------------------
+# TLS / proxy - ALB terminates HTTPS, nginx forwards X-Forwarded-Proto.
+# --------------------------------------------------------------------------
+
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+USE_X_FORWARDED_HOST = True
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
+SESSION_COOKIE_DOMAIN = ".example.com"
+CSRF_COOKIE_DOMAIN    = ".example.com"
+
+# Required for Django admin POST behind TLS proxy.
+CSRF_TRUSTED_ORIGINS = [
+    "https://example.com",
+    "https://*.example.com",
+]
+
+
+# --------------------------------------------------------------------------
+# CORS - production runs frontend and backend behind a single ALB on the
+# same origin, so CORS is effectively unused in prod.
+# --------------------------------------------------------------------------
+
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://([a-z0-9-]+\.)?example\.com(:\d+)?$",
+]
+
+
+# --------------------------------------------------------------------------
+# Multi-DB Aurora endpoints. Three clusters: default + tenant_1 + tenant_2.
+#
+# settings_multitenant.py ships only a localhost dev `default`; every real cluster
+# is declared HERE. The key set below is also the universe of possible shards -
+# Shard.clean() refuses an alias that is not in DATABASES, so a new cluster is added
+# here FIRST and only then registered with `sync_shards`.
+#
+# For a cluster reached through RDS Proxy rather than directly, swap
+# _aurora_db_options() for _proxy_db_options() (import it above too): the proxy
+# presents an ACM certificate that chains to the public Amazon roots, not to the
+# RDS CA bundle.
+# --------------------------------------------------------------------------
+
+# Shared defaults — schema name on each cluster, port, pool settings, connection options.
+# Per-shard entries below add HOST/USER/PASSWORD.
+#
+# SPREAD _MT_DB_DEFAULTS, do not restate what it holds. The assignments below REPLACE each
+# DATABASES entry wholesale, so anything the multi-tenant layer declares on its own entry
+# (the django-tenants ENGINE today, more later) reaches this host only through that spread.
+# Restating a value here instead makes a private copy that stops tracking the layer.
+_AURORA_DEFAULTS = {
+    **_MT_DB_DEFAULTS,          # ENGINE + whatever the MT layer adds to it later
+    "NAME":               "tenants_back",
+    "PORT":               "5432",
+    "CONN_MAX_AGE":       60,   # host property: raise it where the topology is known
+    "OPTIONS":            _aurora_db_options(),   # replaces the dev default: verify-full TLS
+}
+
+# Each Aurora cluster has its own credentials. In real deployments load these
+# from AWS Secrets Manager (one secret per cluster) or SSM Parameter Store
+# (one parameter per field per cluster).
+DATABASES["default"] = {
+    **_AURORA_DEFAULTS,
+    "HOST":     "default.cluster-xxx.eu-west-1.rds.amazonaws.com",
+    "USER":     "default_app",
+    "PASSWORD": "replace-me-default",
+}
+DATABASES["tenant_1"] = {
+    **_AURORA_DEFAULTS,
+    "HOST":     "tenant1.cluster-yyy.eu-west-1.rds.amazonaws.com",
+    "USER":     "tenant1_app",
+    "PASSWORD": "replace-me-tenant1",
+}
+DATABASES["tenant_2"] = {
+    **_AURORA_DEFAULTS,
+    "HOST":     "tenant2.cluster-zzz.eu-west-1.rds.amazonaws.com",
+    "USER":     "tenant2_app",
+    "PASSWORD": "replace-me-tenant2",
+}
+
+
+# --------------------------------------------------------------------------
+# Redis (ElastiCache) - one cluster for the app cache + sessions.
+# maxmemory-policy=allkeys-lru is fine (disposable cache).
+# --------------------------------------------------------------------------
+
+# `default` and `sessions` are two ALIASES on ONE instance (settings_multitenant.py): same
+# LOCATION, different KEY_PREFIX, and only `default` is tenant-scoped. They are separate keys
+# here, so overriding just `default` would leave sessions on localhost. django_redis caches
+# pools by LOCATION, so one URL for both means one pool.
+for _alias in ("default", "sessions"):
+    CACHES[_alias]["LOCATION"] = "redis://tenants-app.xxx.cache.amazonaws.com:6379/0"
+
+# Multi-tenant adds two more caches (settings_multitenant.py), both defaulting to a
+# local Redis, and both needing a DIFFERENT eviction policy - hence separate instances:
+#   tenant_resolve - host -> tenant lookups; volatile-ttl (the registry keys carry no TTL
+#                    and must survive memory pressure).
+#   beat_lock      - the fanout overlap lock; MUST be NOEVICTION (the broker Redis), never
+#                    the allkeys-lru app cache.
+CACHES["tenant_resolve"]["LOCATION"] = "redis://tenants-resolve.xxx.cache.amazonaws.com:6379/0"
+CACHES["beat_lock"]["LOCATION"] = "rediss://tenants-broker.xxx.cache.amazonaws.com:6379/0"
+
+
+# --------------------------------------------------------------------------
+# Celery broker - read this before rebinding CELERY_BROKER_URL here.
+# --------------------------------------------------------------------------
+
+# The dicts above are MUTATED in place, so everything holding a reference to DATABASES or
+# CACHES sees the override. A module-level scalar is REBOUND instead: the name starts
+# pointing at a new string, while every value already derived from the old one keeps its
+# own copy. This file is imported LAST, so those derivations have already run:
+#
+#   CELERY_REDBEAT_REDIS_URL         (= CELERY_BROKER_URL, settings_multitenant.py)
+#   CACHES["beat_lock"]["LOCATION"]  (= CELERY_BROKER_URL, settings_multitenant.py)
+#
+# Assigning CELERY_BROKER_URL here therefore moves the task queues alone and leaves the
+# RedBeat schedule and the fanout overlap lock on the previous Redis - a beat split across
+# two instances is worse than a beat on the wrong one. If you set the broker here, set
+# CELERY_REDBEAT_REDIS_URL explicitly too (beat_lock is already set above).
+#
+# TIME_ZONE behaves the same way: CELERY_TIMEZONE is derived from it in settings_base.py,
+# so rebinding one here without the other splits the two apart.
