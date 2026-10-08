@@ -302,8 +302,25 @@ class Domain(DomainMixin):
             return
         self.domain = validate_tenant_domain(self.domain)
 
+    @classmethod
+    def from_db(cls, db: str | None, field_names: Sequence[str],
+                values: Sequence[Any]) -> "Domain":
+        """Snapshot the hostname as loaded, so save() can tell a RE-POINT from any other edit.
+
+        post_save only ever receives the NEW value, so nothing on that path can evict the OLD
+        host — it keeps resolving to this tenant until its positive entry expires
+        (POSITIVE_CACHE_SECONDS, an hour by default, with the gate off). Same shape and same
+        field_names guard as Tenant._loaded_status: a deferred load (.only()/.defer()) would
+        otherwise trigger a refetch right here.
+        """
+        obj = super().from_db(db, field_names, values)
+        if "domain" in field_names:
+            obj._loaded_domain = obj.domain
+        return obj
+
     def save(self, *args: Any, **kwargs: Any) -> None:
-        """Canonicalize the hostname on EVERY save path, then defer to DomainMixin.
+        """Canonicalize the hostname on EVERY save path, forget the old one on a re-point,
+        then defer to DomainMixin.
 
         clean() is not enough: it only runs under full_clean() (admin form, explicit
         calls), while .create()/.save() from operator-trusted commands, data migrations
@@ -319,10 +336,29 @@ class Domain(DomainMixin):
         kwarg - so a non-canonical value would miss the existing row, then collide with
         it on the unique index. Callers on that path must normalize the lookup value
         themselves (see bootstrap_public).
+
+        The re-point half is here rather than in each caller for the reason Tenant.save()
+        gives for status_changed_at: it keeps every .save() path correct without anyone
+        remembering. TenantSerializer.update() used to do this itself, which left the admin,
+        the shell and any future command re-pointing a domain with a stale host alive.
+        Two limits, both shared with the normalization above: QuerySet.update() /
+        bulk_update() never reach here, and refresh_from_db() does not refresh the snapshot
+        (Django copies field VALUES onto self, not private attributes).
         """
         from .validators import normalize_host
         self.domain = normalize_host(self.domain)
-        return super().save(*args, **kwargs)
+        old = getattr(self, "_loaded_domain", None)
+        super().save(*args, **kwargs)
+        if old is not None and old != self.domain:
+            # on_commit: a rolled-back rename must not evict a still-valid entry. The NEW
+            # host is handled by post_save (tenants/signals.py); this is the OLD one, which
+            # no signal can see.
+            from django.db import transaction
+            from .resolver import resolve_cache
+            transaction.on_commit(lambda host=old: resolve_cache.forget_host(host))
+        # Mirror the column, so a SECOND re-point of the same in-memory instance forgets the
+        # intermediate host too, and a plain re-save does not forget anything twice.
+        self._loaded_domain = self.domain
 
 
 class ReservedHostRule(models.Model):

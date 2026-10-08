@@ -269,7 +269,7 @@ VTL). Тому дисципліна тримається не налаштува
 | Точка входу | Alias | Контракт |
 |---|---|---|
 | `tenants.resolver.cache.ResolveCache.get_redis_raw_client()` | `tenant_resolve` | тенант-**агностична** |
-| `commons.platform.redis_client.tenant_raw_client()` | `default` | ключі **тільки** через `cache_keys.tenant_key()` |
+| `commons.platform.redis_client.django_redis_raw_client(alias)` | за аліасом | для `default` — ключі **тільки** через `cache_keys.tenant_key()` |
 
 **Клієнт не скоуплений — скоуплений КЛЮЧ.** Рев'ю такого сайту означає перевірку ключів, не
 клієнта.

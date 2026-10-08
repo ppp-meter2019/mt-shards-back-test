@@ -13,8 +13,9 @@ from django.db.utils import ConnectionDoesNotExist
 from django.test import SimpleTestCase
 
 import tenants.middleware as middleware
+import tenants.context as tctx
 from tenants.context import (
-    active_alias, bound_alias, schema_context, tenant_context, use_alias,
+    active_alias, bound_alias, current_schema_name, schema_context, tenant_context, use_alias,
 )
 
 
@@ -130,6 +131,82 @@ class ActiveAliasTests(SimpleTestCase):
         self.assertEqual(active_alias(), "default")             # unset → default (for readers)
         with use_alias("shard_q"):
             self.assertEqual(active_alias(), "shard_q")
+
+
+class CurrentSchemaNameTests(SimpleTestCase):
+    """current_schema_name(): the BOUND shard's schema, an EXPLICIT public when nothing is
+    bound. The single source for commons.platform.cache_keys (via the mode facade) and for
+    tenants.celery.compat — each of which then decides what a public answer means.
+    """
+
+    @staticmethod
+    def _conns(**by_alias: str) -> dict[str, Any]:
+        return {a: types.SimpleNamespace(schema_name=n) for a, n in by_alias.items()}
+
+    def test_reads_the_bound_shard_not_default(self) -> None:
+        """_switch() sets the schema on connections[<shard>], so in a Celery task `default` is
+        still public — and business tenants are always on a shard (Tenant.clean forbids the
+        default one). Reading `default` would collapse every tenant into public."""
+        with mock.patch.object(tctx, "connections",
+                               self._conns(tenant_1="acme", default="public")), \
+             use_alias("tenant_1"):
+            self.assertEqual(current_schema_name(), "acme")
+
+    def test_unbound_answers_public_and_ignores_a_stale_default(self) -> None:
+        """THE leak this reader exists to avoid. django_tenants resets the schema at the START
+        of process_request and never on close, so BETWEEN requests connections['default'] still
+        holds the tenant just served. With nothing bound that must read as public — not as that
+        tenant. An active_alias()-based reader (which coalesces to 'default') answered 'acme'
+        here, and tenant_key() then did NOT raise from outside any tenant context."""
+        self.assertIsNone(bound_alias())
+        with mock.patch.object(tctx, "connections", self._conns(default="acme")):
+            self.assertEqual(current_schema_name(), "public")
+
+    def test_a_falsy_schema_name_normalises_to_public(self) -> None:
+        """Belt-and-braces for a hand-rolled set_schema or a FakeTenant; a FRESH connection
+        cannot get here (the backend's __init__ ends with set_schema_to_public())."""
+        with mock.patch.object(tctx, "connections", self._conns(tenant_1="")), \
+             use_alias("tenant_1"):
+            self.assertEqual(current_schema_name(), "public")
+
+    def test_an_alias_outside_databases_raises(self) -> None:
+        """NOT total, and the docstring says so: only use_alias() can bind such an alias (it
+        never touches `connections`), and both real call sites pass the literal "default", so
+        this is a property of the contract rather than a reachable failure. Pinned because a
+        KEY_FUNCTION that raises surfaces in code with no tenancy in it.
+
+        Uses the REAL django.db.connections: a patched dict would raise KeyError and pin the
+        fake rather than Django's ConnectionDoesNotExist."""
+        with use_alias("nosuchshard"):
+            with self.assertRaises(ConnectionDoesNotExist):
+                current_schema_name()
+
+    def test_an_unexpected_error_propagates_instead_of_becoming_public(self) -> None:
+        """Only reachable with an alias BOUND — an unbound axis never touches a connection.
+        Silently answering public here would mis-stamp an outgoing Celery task and send a
+        tenant job to default.public, and would mint cache keys in the wrong namespace."""
+
+        class _Boom:
+            @property
+            def schema_name(self) -> None:
+                raise RuntimeError("bad connection state")
+
+        with mock.patch.object(tctx, "connections", {"tenant_1": _Boom()}), \
+             use_alias("tenant_1"):
+            with self.assertRaises(RuntimeError):        # fail-loud, NOT silent public
+                current_schema_name()
+
+    def test_compat_re_exports_the_same_object(self) -> None:
+        """tenants.celery.compat must not grow its own copy again: it had one, byte-identical
+        to commons.platform.cache_keys', and the two docstrings drifted apart instead."""
+        from tenants.celery import compat
+        self.assertIs(compat.current_schema_name, current_schema_name)
+
+    def test_the_mode_facade_re_exports_the_same_object(self) -> None:
+        """commons.platform.tenancy is the standalone-safe door to this read, not a second
+        implementation of it — which is what lets commons/ stay out of SCHEMA_ALLOW."""
+        from commons.platform import tenancy
+        self.assertIs(tenancy.current_schema_name, current_schema_name)
 
 
 class RoutingMiddlewareTests(SimpleTestCase):

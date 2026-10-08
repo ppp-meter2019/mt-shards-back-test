@@ -16,8 +16,13 @@ from typing import Any
 from django.conf import settings
 
 if settings.USE_MULTITENANT:
-    from django_tenants.utils import get_public_schema_name
-    from tenants.context import (active_alias, bound_alias, schema_context, tenant_context,
+    # get_public_schema_name through tenants.context, not django_tenants.utils directly: one
+    # chain to the upstream helper instead of two routes to it. tenants.context defers the
+    # upstream import to call time and caches it, which costs ~46 ns/call (measured) -- and
+    # make_key, the only hot caller, does not pay it at all: `schema_name or
+    # get_public_schema_name()` short-circuits whenever a context is bound.
+    from tenants.context import (active_alias, bound_alias, current_schema_name,
+                                 get_public_schema_name, schema_context, tenant_context,
                                  use_alias)
 
     def active_target_schemas(scope: str = "tenants") -> list[str]:
@@ -61,6 +66,13 @@ else:
     def get_public_schema_name() -> str:
         return "public"
 
+    def current_schema_name() -> str:
+        # `public`, not "": the same string get_public_schema_name() returns here, so shared
+        # business code comparing the two behaves identically in both modes. Returning ""
+        # made `current_schema_name() == get_public_schema_name()` True under MT-without-
+        # context and False here -- one name, two meanings, and neither wrong on its own.
+        return get_public_schema_name()
+
     def active_alias() -> str:
         # No shards in standalone: there is one connection and it is `default`.
         return "default"
@@ -80,5 +92,6 @@ else:
 
 __all__ = [
     "schema_context", "tenant_context", "use_alias", "active_alias", "bound_alias",
-    "get_public_schema_name", "active_target_schemas", "active_tenants_with_tz",
+    "get_public_schema_name", "current_schema_name",
+    "active_target_schemas", "active_tenants_with_tz",
 ]

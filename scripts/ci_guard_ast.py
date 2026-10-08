@@ -18,7 +18,8 @@ running them:
 `ast` has none of those failure modes: it sees attribute access and imports regardless of how
 the object was named, and it never sees a string literal as code.
 
-Run: `python scripts/ci_guard_ast.py <rule>` with rule in {schema, redis, all}.
+Run: `python scripts/ci_guard_ast.py <rule>` with rule in
+{schema, redis, commons, settings_load, all}.
 Nothing invokes this automatically — scripts/ci_mode.sh runs `check`, `makemigrations --check`
 and the test suite, and does not touch the guards.
 """
@@ -52,21 +53,22 @@ def iter_sources():
 # `connections[ALIASES[0]]` or `self.connection`.
 SCHEMA_ALLOW = {
     # Audited, standalone-safe readers (each MT-gated or getattr-guarded / not wired).
-    # Two standalone-safe ways to compare against the public schema, and both are in use:
-    #   a) the literal "public" — the users/* and products/* readers. Calling
-    #      get_public_schema_name() there would pull in django_tenants, NOT installed in
-    #      standalone. Deliberate — do not "fix" it.
-    #   b) commons.platform.tenancy.get_public_schema_name — the mode facade, which returns
-    #      the literal in standalone. Used by commons/platform/cache_keys.py, whose read is
-    #      itself inside an `if settings.USE_MULTITENANT` branch.
-    # Anything added here must carry, at its comparison site, a note saying which it uses.
-    "users/authentication.py",
-    "users/middleware.py",
+    # These compare against the public schema with the LITERAL "public": calling
+    # get_public_schema_name() there would pull in django_tenants, NOT installed in
+    # standalone. Deliberate — do not "fix" it.
+    #
+    # commons/platform/cache_keys.py used to be listed here too, for the single
+    # `connections[alias].schema_name` read behind its `if settings.USE_MULTITENANT` branch.
+    # That read now lives in tenants/context.py::current_schema_name — inside
+    # SCHEMA_SKIP_ROOTS — so NOTHING under commons/ reads the routing axis any more, which is
+    # what the facade's own docstring claims it is for. Keep it that way: a new read there
+    # belongs in tenants.context, reached through commons.platform.tenancy.
+    #
+    # Anything added here must carry, at its comparison site, a note saying so.
     "users/serializers.py",
     "users/signals.py",
     "users/permissions.py",
     "products/management/commands/seed_products.py",
-    "commons/platform/cache_keys.py",
 }
 SCHEMA_SKIP_ROOTS = {"tenants"}   # the app that owns the axis
 
@@ -225,7 +227,7 @@ def redis_offenders(tree: ast.AST) -> list[str]:
             # ONLY the django_redis shape `<cache>.client.get_client(...)`. Matching the bare
             # attribute name flagged ANY object owning such a method, whatever the receiver —
             # a boto3 wrapper with `def get_client(self)` failed this rule and was told to use
-            # tenant_raw_client(), which is a different library entirely. Both sanctioned call
+            # django_redis_raw_client(), which is a different library entirely. Both sanctioned call
             # sites reach it through `.client`: caches["default"].client.get_client
             # (commons/platform/redis_client.py) and self.cache.client.get_client
             # (tenants/resolver/cache.py).
@@ -243,6 +245,86 @@ def redis_offenders(tree: ast.AST) -> list[str]:
     return hits
 
 
+# ---------------------------------------------------------------------------
+# rule: commons (app boundary)
+# ---------------------------------------------------------------------------
+# `commons/` must import cleanly in STANDALONE, where django_tenants is not installed at all.
+# Section 4 of deploy/standalone_multitenant_design.md says so; until now only comments did.
+# The facade reaches tenancy through `tenants.*` instead, inside an `if settings.USE_MULTITENANT`
+# branch — that seam stays allowed, this rule is only about the upstream package.
+#
+# ANY depth, unlike the settings-load rule below: a deferred `import django_tenants` inside a
+# function is not a fix here. The package is absent in standalone, so a lazy import merely
+# moves the ImportError from boot to the first call — which is strictly worse.
+def commons_django_tenants(tree: ast.AST) -> list[str]:
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "django_tenants" or a.name.startswith("django_tenants."):
+                    hits.append(f"import {a.name}")
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if mod == "django_tenants" or mod.startswith("django_tenants."):
+                hits.append(f"from {mod} import ...")
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# rule: settings_load (D5 re-entrancy)
+# ---------------------------------------------------------------------------
+# These modules run MID-SETTINGS-LOAD: `tenants_back` is both the settings package and the
+# Celery app package, so Django imports it on the way to `tenants_back.settings`. A module-level
+# `django_tenants.utils` import there evaluates get_tenant_database_alias() in two default args
+# at import time, which reads django.conf.settings and makes Django build a SECOND, incomplete
+# Settings object. See tenants/context.py's get_public_schema_name docstring and
+# test_settings_invariants.SettingsLoadReentrancyTests.
+#
+# Scope measured, not guessed: `import tenants_back` with settings unconfigured pulls in
+# tenants_back{,.celery}, tenants{,.context}, tenants.celery.* and commons.platform.mode.
+# commons/ is covered by the stricter `commons` rule above; re-measure with that import if the
+# Celery bootstrap ever changes shape.
+SETTINGS_LOAD_PATH = (
+    "tenants/__init__.py",
+    "tenants/context.py",
+    "tenants/celery/",
+    "tenants_back/__init__.py",
+    "tenants_back/celery.py",
+)
+
+
+def _function_bodies(tree: ast.AST) -> set[int]:
+    """id() of every node that sits inside a def — i.e. does NOT run at import."""
+    inside = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in ast.walk(node):
+                inside.add(id(child))
+    return inside
+
+
+def settings_load_django_tenants(tree: ast.AST) -> list[str]:
+    """django_tenants imported at IMPORT TIME on the settings-load path.
+
+    Deliberately allows the deferred form — an import inside a function body is the sanctioned
+    fix (tenants/context.py does exactly that), so flagging it would forbid the remedy.
+    """
+    deferred = _function_bodies(tree)
+    hits = []
+    for node in ast.walk(tree):
+        if id(node) in deferred:
+            continue
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "django_tenants" or a.name.startswith("django_tenants."):
+                    hits.append(f"import {a.name}")
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if mod == "django_tenants" or mod.startswith("django_tenants."):
+                hits.append(f"from {mod} import ...")
+    return hits
+
+
 RULES = {
     "schema": dict(
         find=schema_offenders, allow=SCHEMA_ALLOW, skip_roots=SCHEMA_SKIP_ROOTS,
@@ -251,11 +333,30 @@ RULES = {
         hint=("Make it standalone-safe (MT-gate on settings.USE_MULTITENANT or getattr with a\n"
               "safe default), then add it to SCHEMA_ALLOW in this file."),
     ),
+    "commons": dict(
+        find=commons_django_tenants, allow=set(), skip_roots=set(),
+        only_prefixes=("commons/",),
+        ok="commons/ imports no django_tenants (standalone-safe)",
+        fail="django_tenants imported under commons/, which must load in standalone",
+        hint=("commons/ is the mode facade: reach tenancy through commons.platform.tenancy\n"
+              "(whose `tenants.*` imports sit inside `if settings.USE_MULTITENANT`), never\n"
+              "through django_tenants directly. A deferred import is NOT a fix — the package\n"
+              "is absent in standalone, so it only moves the ImportError to the first call."),
+    ),
+    "settings_load": dict(
+        find=settings_load_django_tenants, allow=set(), skip_roots=set(),
+        only_prefixes=SETTINGS_LOAD_PATH,
+        ok="no import-time django_tenants on the settings-load path",
+        fail="django_tenants imported at MODULE level on the settings-load path",
+        hint=("Defer it: move the import INSIDE the function that needs it (see\n"
+              "tenants/context.py::get_public_schema_name). A module-level import here runs\n"
+              "mid-settings-load and makes Django build a second, incomplete Settings object."),
+    ),
     "redis": dict(
         find=redis_offenders, allow=REDIS_ALLOW, skip_roots=set(),
         ok="raw redis-py access confined to the sanctioned choke points",
         fail="raw redis-py client acquired outside the two sanctioned choke points",
-        hint=("Use commons.platform.redis_client.tenant_raw_client() for tenant-scoped keys\n"
+        hint=("Use commons.platform.redis_client.django_redis_raw_client(alias) for raw access\n"
               "(build them with cache_keys.tenant_key()), or ResolveCache.get_redis_raw_client()\n"
               "for the tenant-agnostic resolve cache. A THIRD choke point needs its key contract\n"
               "documented and an entry in REDIS_ALLOW in this file."),
@@ -266,8 +367,11 @@ RULES = {
 def run(rule_name: str) -> int:
     rule = RULES[rule_name]
     checked = bad = 0
+    only = rule.get("only_prefixes")
     for rel, path in iter_sources():
         if rel.parts[0] in rule["skip_roots"]:
+            continue
+        if only and not rel.as_posix().startswith(only):
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(rel))

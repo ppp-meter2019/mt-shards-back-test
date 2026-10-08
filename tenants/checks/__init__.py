@@ -17,9 +17,10 @@ standalone has none of these surfaces.
 from .base import mt_check
 from .gate import gate_requires_warm
 from .beat import (
-    beat_grace_ge_fanout_period,
     beat_entries_wrapped,
+    beat_grace_ge_fanout_period,
     fanout_entries_are_unique,
+    fanout_options_do_not_collide,
     fanout_task_registered,
 )
 from .middleware import mt_middleware_order

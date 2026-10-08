@@ -4,9 +4,15 @@
 # environment variable and WITHOUT editing settings.py. settings_mode.py is gitignored.
 #
 # Precedence (see settings.py):
-#   1. env  USE_MULTITENANT=0/1   overrides this file (handy for CI / containers)
+#   1. env  USE_MULTITENANT       overrides this file (handy for CI / containers)
 #   2. this file (settings_mode.py)
 #   3. default False   (standalone — the host project's mode)
+#
+# Accepted spellings, in the env var AND here as a string: 1/true/yes/on and 0/false/no/off,
+# any case, surrounding whitespace ignored. Anything ELSE raises ImproperlyConfigured at
+# startup rather than resolving to a default — the two modes need different settings files,
+# so a typo must not pick one silently. An EMPTY env value counts as unset and falls through
+# to this file (`docker run -e USE_MULTITENANT` forwards "" when the host has it unset).
 #
 # Keep this file TRIVIAL — it is imported very early, before settings helpers exist,
 # so it must NOT reference anything from settings.py.

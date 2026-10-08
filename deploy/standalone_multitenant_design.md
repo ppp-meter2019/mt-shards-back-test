@@ -350,6 +350,10 @@ the host-project merge — the scripts above are the whole substance.
 
 ## Phase order & status
 
+> Test counts in this list are END-OF-PHASE snapshots, not the current state. The suite
+> only grows, so a number here dates its entry rather than describing the tree; for the
+> live figure run `scripts/ci_mode.sh mt`.
+
 1. **Phase 1 — DONE**: mode resolver (`settings_mode.py`) + `commons/platform` facade
    + `users/admin.py` rewire. (132 tests green, `check` clean, both facade
    branches verified.)

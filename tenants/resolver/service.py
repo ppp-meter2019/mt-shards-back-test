@@ -20,16 +20,8 @@ from .throttle import fill_cap, single_flight
 logger = logging.getLogger(__name__)
 
 # Rate-limit for the fail-open path: a sustained cache-path failure must not emit one
-# traceback per request. First hit (then at most once per _FAIL_LOG_EVERY) logs a full
-# traceback plus how many similar were suppressed since. Per-process; the unlocked shared
-# state is a benign race (at worst a double log / slight miscount) — fine for a log throttle.
-_FAIL_LOG_EVERY = 30.0
-_fail_last = 0.0
-_fail_suppressed = 0
-_bug_last = 0.0
-_bug_suppressed = 0
-_shed_last = 0.0
-_shed_suppressed = 0
+# traceback per request.
+_LOG_EVERY = 30.0
 
 
 class ResolveDeferred(Exception):
@@ -45,50 +37,61 @@ class ResolveDeferred(Exception):
     """
 
 
-def _log_cache_fail(hostname: str) -> None:
-    """EXPECTED infra failure (Redis down/slow): quiet-ish WARNING, rate-limited. Fail-open is
-    correct — the DB resolve returns the right tenant."""
-    global _fail_last, _fail_suppressed
-    now = time.monotonic()
-    if now - _fail_last >= _FAIL_LOG_EVERY:
-        extra = f" ({_fail_suppressed} similar suppressed)" if _fail_suppressed else ""
-        logger.warning("tenant resolve cache path failed (e.g. %r); DB fallback%s",
-                       hostname, extra, exc_info=True)
-        _fail_last, _fail_suppressed = now, 0
-    else:
-        _fail_suppressed += 1
+class _ThrottledLog:
+    """One rate-limited log line: the first hit goes out, the rest are counted and folded into
+    the next one past the interval ("N similar suppressed").
+
+    Per-process and deliberately UNLOCKED: a torn read costs at worst a double log or a
+    slightly low count, which is the right trade for something whose only job is to stop a
+    sustained failure emitting one traceback per request.
+
+    A class rather than three near-identical functions: the previous shape kept TWO module
+    globals per call site plus a `global` statement in each body, so a fourth site meant
+    copying the whole thing — and only ONE of the three copies was ever reached by a test.
+    """
+
+    def __init__(self, level: int, template: str, *, exc_info: bool = False) -> None:
+        self._level, self._template, self._exc_info = level, template, exc_info
+        self._last = 0.0
+        self._suppressed = 0
+
+    def __call__(self, hostname: str) -> None:
+        now = time.monotonic()
+        if now - self._last < _LOG_EVERY:
+            self._suppressed += 1
+            return
+        extra = f" ({self._suppressed} similar suppressed)" if self._suppressed else ""
+        logger.log(self._level, self._template, hostname, extra, exc_info=self._exc_info)
+        self._last, self._suppressed = now, 0
 
 
-def _log_cache_bug(hostname: str) -> None:
-    """UNEXPECTED error = a BUG in the cache/gate path (infra is already handled: the wrapped
-    cache masks Redis-down to a miss, and the gate catches RedisError). We STILL fail open —
-    the DB resolve is correct, so a cache-layer bug must not 500 the request — but we log LOUD
-    (ERROR, rate-limited) so the bug cannot masquerade as merely 'slower'."""
-    global _bug_last, _bug_suppressed
-    now = time.monotonic()
-    if now - _bug_last >= _FAIL_LOG_EVERY:
-        extra = f" ({_bug_suppressed} similar suppressed)" if _bug_suppressed else ""
-        logger.error("tenant resolve cache path BUG (unexpected error resolving %r); DB "
-                     "fallback%s", hostname, extra, exc_info=True)
-        _bug_last, _bug_suppressed = now, 0
-    else:
-        _bug_suppressed += 1
+# EXPECTED infra failure (Redis down/slow): quiet-ish WARNING, rate-limited. Fail-open is
+# correct — the DB resolve returns the right tenant.
+_log_cache_fail = _ThrottledLog(
+    logging.WARNING,
+    "tenant resolve cache path failed (e.g. %r); DB fallback%s",
+    exc_info=True,
+)
 
+# UNEXPECTED error = a BUG in the cache/gate path (infra is already handled: the wrapped cache
+# masks Redis-down to a miss, and the gate catches RedisError). We STILL fail open — the DB
+# resolve is correct, so a cache-layer bug must not 500 the request — but we log LOUD (ERROR,
+# rate-limited) so the bug cannot masquerade as merely "slower".
+_log_cache_bug = _ThrottledLog(
+    logging.ERROR,
+    "tenant resolve cache path BUG (unexpected error resolving %r); DB fallback%s",
+    exc_info=True,
+)
 
-def _log_shed(hostname: str) -> None:
-    """Load-shed on the flag-absent branch. Sustained shedding means the registry SET is
-    missing (or its Redis is down) under real traffic - an operational signal, not a
-    per-request event, so it is rate-limited like the two helpers above. No exc_info: there
-    is no exception here, this is a decision."""
-    global _shed_last, _shed_suppressed
-    now = time.monotonic()
-    if now - _shed_last >= _FAIL_LOG_EVERY:
-        extra = f" ({_shed_suppressed} similar suppressed)" if _shed_suppressed else ""
-        logger.warning("tenant resolve DEFERRED (registry flag absent, fill_cap exhausted; "
-                       "e.g. %r) -> retryable 503%s", hostname, extra)
-        _shed_last, _shed_suppressed = now, 0
-    else:
-        _shed_suppressed += 1
+# Load-shed on the flag-absent branch. Sustained shedding means the registry SET is missing (or
+# its Redis is down) under real traffic — an operational signal, not a per-request event, so it
+# is rate-limited like the two above. No exc_info: there is no exception here, this is a
+# decision.
+_log_shed = _ThrottledLog(
+    logging.WARNING,
+    "tenant resolve DEFERRED (registry flag absent, fill_cap exhausted; e.g. %r) "
+    "-> retryable 503%s",
+)
 
 
 def resolve(hostname: str, db_resolver: Callable[[], TenantSnapshot],

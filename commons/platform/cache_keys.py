@@ -58,20 +58,20 @@ through make_key, so ordinary caching needs nothing from here:
 
 tenant_key() is for what the cache API cannot express: hashes, sets, SET NX/EX, INCR, EXPIRE,
 pipelines, SCAN — i.e. the four aggregate structures of RGKB section 28 and the VTL keys.
-Pair it with commons.platform.redis_client.tenant_raw_client():
+Pair it with commons.platform.redis_client.django_redis_raw_client("default"):
 
     COORDS = "coordinates_package"          # a module constant; only the SUFFIX is constant
 
     def record_vehicle_position(vehicle_id: int, payload: dict) -> None:
         key = tenant_key(COORDS)            # tenant:acme:coordinates_package
         try:
-            tenant_raw_client().hset(key, str(vehicle_id), json.dumps(payload))
+            django_redis_raw_client("default").hset(key, str(vehicle_id), json.dumps(payload))
         except RedisError:                  # the raw client PROPAGATES; decide here
             logger.warning("coordinates: dropped a sample", exc_info=True)
 
     def drain_coordinates() -> dict:
         key = tenant_key(COORDS)
-        with tenant_raw_client().pipeline() as pipe:
+        with django_redis_raw_client("default").pipeline() as pipe:
             pipe.hgetall(key)
             pipe.delete(key)
             raw, _ = pipe.execute()
@@ -84,7 +84,8 @@ Three ways to get it wrong, all silent:
   * a part containing ":" — this is a join, so `tenant_key("vtl", "a:b")` is indistinguishable
     from `tenant_key("vtl", "a", "b")`. Normalise or hash anything that might carry one.
   * `f"tenant:{connection.schema_name}:..."` by hand — bypasses the context check AND reads
-    the wrong connection (always `default`, whatever is bound; see current_schema below).
+    the wrong connection (always `default`, whatever is bound; see
+    tenants.context.current_schema_name).
 
 To sweep a tenant, do not parse keys — match them: `SCAN MATCH 'tenant:<schema>:*'`, plus the
 `sess:*` namespace separately (see the table in deploy/redis_keys_design.md section D2).
@@ -92,7 +93,8 @@ To sweep a tenant, do not parse keys — match them: `SCAN MATCH 'tenant:<schema
 WORKS OUTSIDE WSGI. Nothing here touches `request`, middleware state or a thread-local set
 on the HTTP path: the only input is the schema on the BOUND connection —
 `connections[bound_alias()].schema_name`, never the AMBIENT `django.db.connection`, and
-never at all when no context is bound (see current_schema below). Note that bound alias is
+never at all when no context is bound (see tenants.context.current_schema_name, which owns
+that read). Note that bound alias is
 routinely "default" — that is the public / management path, which both
 ShardAwareTenantMiddleware and TenantTask pin with `use_alias("default")` — so
 `connections["default"]` in a traceback is normal here. What the rule forbids is reading a
@@ -106,7 +108,6 @@ broadcast of the four aggregate structures.
 """
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
-from django.db import connections
 
 # The shared leading literal. Changing it invalidates every tenant-scoped key in Redis
 # (a cold cache) AND breaks the glob contract with any other service writing these keys.
@@ -115,70 +116,17 @@ TENANT_NAMESPACE = "tenant"
 # Both come from the mode facade, NOT from django_tenants / tenants: in standalone the first
 # is not installed, and importing the second from outside `tenants` would break the app
 # boundary of deploy/standalone_multitenant_design.md section 4. The facade returns the
-# literal "public" and the alias "default" there.
-from commons.platform.tenancy import bound_alias, get_public_schema_name  # noqa: E402
+# literal "public" in standalone, where current_schema_name() is simply that literal.
+#
+# This module does NOT read connection.schema_name itself -- tenants.context owns that read
+# (see its current_schema_name docstring for bound_alias vs active_alias, and for why the
+# unbound answer is public). That is why nothing under commons/ needs an entry in
+# ci_guard_ast.py's SCHEMA_ALLOW any more; keep it that way.
+from commons.platform.tenancy import (  # noqa: E402
+    current_schema_name, get_public_schema_name,
+)
 
 if settings.USE_MULTITENANT:
-
-    def current_schema() -> str:
-        """The schema of the BOUND routing context, or public when nothing is bound.
-
-        Read from the bound SHARD connection, never from `default`: tenants.context._switch()
-        applies the schema to connections[<shard alias>], so in a Celery task `default` is
-        never touched. Business tenants are always on a shard (Tenant.clean forbids the
-        default one), so that is the normal path, not an edge case.
-
-        bound_alias(), NOT active_alias(). The latter coalesces "no context" into "default",
-        and that collapse is a cross-tenant hazard HERE specifically: django_tenants resets
-        the schema at the START of process_request and never on close, so BETWEEN requests
-        connections["default"] still holds the tenant just served. An off-request caller
-        would mint keys in that tenant's namespace, silently — exactly what tenant_key()
-        promises to refuse. The check has to stand on whether a context EXISTS, not on what
-        the schema happens to say.
-
-        Falling back to public rather than raising removes the PRACTICAL reason to raise: this
-        feeds the KEY_FUNCTION of CACHES['default'], it runs on every cache call, and an
-        exception here reaches the caller — django_redis's omit_exception intercepts
-        ConnectionInterrupted alone, so a non-redis exception is never absorbed whatever
-        IGNORE_EXCEPTIONS says (it is False on this alias anyway). tenant_key() turns that
-        same public result into a refusal, which is the contract that has to be strict.
-
-        It does NOT make make_key TOTAL, as an earlier version of this docstring claimed:
-        `connections[alias]` raises ConnectionDoesNotExist for an alias outside DATABASES,
-        straight out of the KEY_FUNCTION and into code with no tenancy in it. Only use_alias()
-        can bind such an alias — it sets current_db without touching `connections`, having no
-        schema to apply and so nothing to resolve — whereas _switch() (tenant_context /
-        schema_context) resolves the connection on its first line and fails at the `with`,
-        before any key is minted. Both use_alias call sites pass the literal "default", so
-        this is a property of the contract rather than a reachable failure.
-
-        THAT FALLBACK CAN LEAK ACROSS TENANTS, and an earlier version of this docstring said
-        the opposite ("a containment failure, never a leak"). Unbound callers do not each get
-        a broken namespace of their own — they all get the SAME one, `tenant:public:`. Two
-        unbound callers serving different tenants therefore read and write each other's
-        entries. Verified: under `use_alias("t1")` (schema alpha) and `use_alias("t2")`
-        (schema beta), a child thread in either produces the identical key
-        `tenant:public:app:1:orders:open`.
-
-        A thread is the realistic way to end up unbound: `current_db` is a ContextVar and
-        `threading.Thread` starts with a fresh context, so `bound_alias()` is None there. A
-        second mechanism points the same way even if the context were carried over —
-        `django.db.connections` is thread-local, so the connection a child thread sees has no
-        schema set on it either. tenant_key() raises in that situation; make_key cannot, which
-        is why the hazard lives entirely on the cache-API side. Pinned by
-        test_cache_keys.CacheKeyThreadTests. Do not cache tenant data from a thread pool.
-
-        `or get_public_schema_name()` is belt-and-braces for a hand-rolled set_schema or a
-        FakeTenant — NOT for a fresh connection: the backend's __init__ ends with
-        set_schema_to_public(), so schema_name is never falsy there.
-
-        The read is MT-only — hence the branch, and hence this file's entry in the ALLOW
-        list of scripts/ci_guard_schema_name.sh.
-        """
-        alias = bound_alias()
-        if alias is None:
-            return get_public_schema_name()
-        return connections[alias].schema_name or get_public_schema_name()
 
     def tenant_token() -> str:
         """The token for MANUAL keys. Raises outside a tenant context.
@@ -186,10 +134,10 @@ if settings.USE_MULTITENANT:
         A manual key is not covered by any cache-framework machinery: if it were built on
         the public schema it would just quietly point at the wrong namespace. Fail instead.
         """
-        schema = current_schema()
+        schema = current_schema_name()
         # This one comparison covers BOTH the real public schema and the unset state:
-        # current_schema() normalises a falsy schema_name to public (see its docstring), so
-        # there is no separate falsy branch to keep in sync.
+        # current_schema_name() normalises a falsy schema_name to public (see its docstring in
+        # tenants.context), so there is no separate falsy branch to keep in sync.
         #
         # The comparison goes through the MODE FACADE (pattern (b) in the ALLOW note of
         # scripts/ci_guard_schema_name.sh): commons.platform.tenancy returns the literal
@@ -210,8 +158,27 @@ if settings.USE_MULTITENANT:
 
         Does NOT raise on public: sessions of the public-host admin belong under
         `tenant:public:`, and a cache is not the place to enforce tenancy.
+
+        It also CANNOT raise, which is the stronger statement: this runs on every cache call
+        and an exception here reaches the caller -- django_redis's omit_exception intercepts
+        ConnectionInterrupted alone, so a non-redis exception is never absorbed whatever
+        IGNORE_EXCEPTIONS says (it is False on this alias anyway).
+
+        THAT PUBLIC FALLBACK CAN LEAK ACROSS TENANTS. Unbound callers do not each get a broken
+        namespace of their own -- they all get the SAME one, `tenant:public:`, so two unbound
+        callers serving different tenants read and write each other's entries. Verified: under
+        `use_alias("t1")` (schema alpha) and `use_alias("t2")` (schema beta), a child thread in
+        either produces the identical key `tenant:public:app:1:orders:open`.
+
+        A thread is the realistic way to end up unbound: `current_db` is a ContextVar and
+        `threading.Thread` starts with a fresh context, so bound_alias() is None there. A
+        second mechanism points the same way even if the context were carried over --
+        `django.db.connections` is thread-local, so the connection a child thread sees has no
+        schema set on it either. tenant_key() raises in that situation; make_key cannot, which
+        is why the hazard lives entirely on the cache-API side. Pinned by
+        test_cache_keys.CacheKeyThreadTests. Do not cache tenant data from a thread pool.
         """
-        return f"{TENANT_NAMESPACE}:{current_schema()}:{key_prefix}:{version}:{key}"
+        return f"{TENANT_NAMESPACE}:{current_schema_name()}:{key_prefix}:{version}:{key}"
 
     def reverse_key(key: str) -> str:
         """CACHES['default']['REVERSE_KEY_FUNCTION'] — required by django-redis for keys()
@@ -252,13 +219,6 @@ else:
     from django.core.cache.backends.base import default_key_func as make_key
     from django_redis.util import default_reverse_key as reverse_key
 
-    def current_schema() -> str:
-        # `public`, not "": the same string get_public_schema_name() returns here, so shared
-        # business code comparing the two behaves identically in both modes. Returning ""
-        # made `current_schema() == get_public_schema_name()` True under MT-without-context
-        # and False here — one name, two meanings, and neither of them wrong on its own.
-        return get_public_schema_name()
-
     def tenant_token() -> str:
         # Deliberately NOT public: in MT this function never returns the public schema, it
         # RAISES there. An empty string is the honest standalone answer — there is no tenant
@@ -272,6 +232,6 @@ else:
 
 
 __all__ = [
-    "TENANT_NAMESPACE", "current_schema", "tenant_token",
+    "TENANT_NAMESPACE", "tenant_token",
     "make_key", "reverse_key", "tenant_key",
 ]

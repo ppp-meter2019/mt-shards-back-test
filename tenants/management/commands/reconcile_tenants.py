@@ -20,6 +20,7 @@ from django.db.migrations.loader import MigrationLoader
 from django.db.utils import ConnectionDoesNotExist
 from django.utils import timezone
 from django_tenants.utils import get_public_schema_name, schema_exists
+from psycopg import sql
 
 from tenants.models import Tenant
 from tenants.resolver import resolve_cache
@@ -209,7 +210,30 @@ class Command(TenantCommand):
         if not labels:
             return 0
         with conn.cursor() as cur:
-            cur.execute(f'SET search_path TO "{schema_name}", public')
+            # psycopg.sql.Identifier, not an f-string. This is a PARAM-LESS execute(), i.e.
+            # the simple query protocol, where `;` starts a second statement — so a name
+            # carrying `"` would close the quotes and run whatever followed it. Identifier
+            # DOUBLES an internal quote, keeping the whole thing one identifier and one
+            # statement. Django builds SQL this way itself — see CursorMixin.callproc in the
+            # postgresql backend.
+            #
+            # What then happens to such a name is NOT an error: Postgres allows search_path to
+            # name schemas that do not exist and silently ignores them, so the SET succeeds and
+            # the SELECT below resolves django_migrations through the `public` fallback —
+            # reporting the PUBLIC schema's count for that tenant. A misleading number in a
+            # report, which is a long way better than the alternative.
+            #
+            # quote_schema() is the project's usual choice and every other schema-into-SQL site
+            # uses it, but it RAISES, and this command must survive one bad row to report the
+            # other tenants. Reaching here at all takes three independent bypasses: a row that
+            # skipped the model validators, a schema physically created outside
+            # create_tenant_schema / migrate_schemas (both of which quote_schema would have
+            # refused), and schema_exists() — itself parameterised — confirming that schema is
+            # really there. Length is not a concern either way: TenantMixin.schema_name is
+            # varchar(63), so an over-long name never reaches the database.
+            cur.execute(
+                sql.SQL("SET search_path TO {}, public").format(sql.Identifier(schema_name))
+            )
             cur.execute(
                 "SELECT COUNT(*) FROM django_migrations WHERE app = ANY(%s)",
                 [list(labels)],

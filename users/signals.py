@@ -22,7 +22,7 @@ def stamp_tenant_schema(sender, request, user, **kwargs):
     This stamp is what SchemaBoundSessionMiddleware enforces (fail-closed). It
     relies on auth.login() firing user_logged_in; any session-auth path that
     bypasses auth.login() must set session["schema"] itself, or the guard will
-    reject those sessions. See users/middleware.py.
+    reject those sessions. See tenants/auth/session.py.
     """
     # connection.schema_name is injected by the django_tenants backend (MT only);
     # on the plain PostGIS backend (standalone) it does not exist. Read defensively

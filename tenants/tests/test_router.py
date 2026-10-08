@@ -9,7 +9,7 @@ refused, because the closure apps' tables are there but EMPTY and would answer w
 plausible-looking zero rows.
 
 Data-migration filter — a closure app's RunPython/RunSQL must not run on the public schema
-(see the comment in allow_migrate and settings_base._PUBLIC_MODEL_ALLOWLIST).
+(see the comment in allow_migrate and settings_multitenant._PUBLIC_MODEL_ALLOWLIST).
 
 DB-free throughout: db_for_read inspects app membership + the ContextVar, and allow_migrate
 reads connection.schema_name, which django-tenants sets without opening a connection.

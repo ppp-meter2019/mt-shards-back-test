@@ -103,13 +103,51 @@ def fanout_task_registered(app_configs: list[AppConfig] | None,
     return []
 
 
+# Keys sub_dispatch passes to send_task explicitly. An entry's `options` is forwarded verbatim
+# and unpacked into that same call, so any of these in `options` is a TypeError at dispatch
+# time. `headers` is NOT here: sub_dispatch merges it (caller's keys first, our _schema_name
+# last) precisely because a beat entry may legitimately want to set one.
+_SEND_TASK_RESERVED = frozenset({"args", "kwargs", "name"})
+
+
+@register()
+@mt_check
+def fanout_options_do_not_collide(app_configs: list[AppConfig] | None,
+                                  **kwargs: Any) -> list[CheckMessage]:
+    """tenants.E009 — a fanout entry's `options` must not reuse a send_task parameter name.
+
+    sub_dispatch calls send_task(name, args=..., kwargs=..., headers=..., **options), so an
+    `options` key that names one of those raises TypeError. That failure is DETERMINISTIC: it
+    would hit every tenant on every tick. sub_dispatch now re-raises instead of logging it as
+    transient, so the task fails loudly — but the entry is wrong at deploy time, and that is
+    when it should be said.
+    """
+    errors = []
+    for name, entry in (getattr(settings, "CELERY_BEAT_SCHEDULE", None) or {}).items():
+        if not isinstance(entry, dict) or scope_of(entry) != "tenants":
+            continue
+        opts = (entry.get("kwargs") or {}).get("task_options") or {}
+        if not isinstance(opts, dict):
+            continue
+        if clash := _SEND_TASK_RESERVED & set(opts):
+            errors.append(Error(
+                f"CELERY_BEAT_SCHEDULE[{name!r}] has options {sorted(clash)}, which collide "
+                f"with send_task's own parameters.",
+                hint="Put task arguments in the entry's `args` / `kwargs`, not in `options`. "
+                     "`options` is for delivery settings (queue, priority, countdown, "
+                     "expires, headers).",
+                id="tenants.E009",
+            ))
+    return errors
+
+
 @register()
 @mt_check
 def fanout_entries_are_unique(app_configs: list[AppConfig] | None,
                               **kwargs: Any) -> list[CheckMessage]:
     """tenants.E006 — no two fanout entries may share (task_name, args).
 
-    That pair IS the overlap-lock key (dispatch._acquire_lock builds
+    That pair IS the overlap-lock key (dispatch._wave_lock builds
     `beat:fanout:<task>:<argsig>` — no cron, no scope), so entries sharing it SUPPRESS each
     other: the first wave of a tick takes the lock, the rest return "skipped (overlapping)".
 
@@ -117,7 +155,8 @@ def fanout_entries_are_unique(app_configs: list[AppConfig] | None,
     indistinguishable from a genuinely slow previous wave. For entries that share the pair
     but differ in cron / interval / grace it is worse than invisible: whichever wave wins
     the lock applies ITS grace, so the task's max lateness is nondeterministic between the
-    declared values, and a shorter fanout_period is silently capped by LOCK_SECONDS.
+    declared values. (The lock is released per wave now, so a shorter fanout_period is no
+    longer capped by LOCK_SECONDS — that was a separate bug, fixed in _wave_lock.)
 
     Matches on the SIGNATURE rather than the raw args deliberately — it is the exact value
     the lock keys on, so this check cannot disagree with runtime about what "the same

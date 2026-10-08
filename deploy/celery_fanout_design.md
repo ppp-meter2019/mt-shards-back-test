@@ -124,8 +124,15 @@ stays O(#schedules).
 @shared_task(base=Task, queue=task_queue("fanout"), acks_late=True, max_retries=0)
 def fanout_dispatch(task_name, scope="tenants", cron=None, grace=None,
                     task_args=None, task_kwargs=None, task_options=None, batch_size=None):
-    if not _acquire_lock(task_name, task_args):        # overlap-lock, key = (task, args)
+    lock = _wave_lock(task_name, _argsig(task_args))   # overlap-lock, key = (task, argsig)
+    if not lock.acquire(blocking=False):
         return {"skipped": "overlapping"}
+    try:                                               # ... body ...
+    finally:
+        try:
+            lock.release()                             # fenced: Lua compare-and-delete
+        except LockError:
+            pass                                       # outlived its TTL; a later wave owns it
     now = timezone.now()
     batch_size = batch_size or _beat_conf("BATCH_SIZE")
     if cron:                                           # calendar → per-tenant tz filter
@@ -195,6 +202,17 @@ class TaskRun(models.Model):                                      # default.publ
 
 `args_sig` is part of the identity, not decoration. Two calendar entries may share a task
 NAME and differ only by args — `fetch(1)` at 08:00 and `fetch(7)` at 09:00 are independent
+**Виправлено 2026-10-08.** Лок реалізовано через `redis-py Lock`, а не `cache.add`:
+`add` — це SETNX+TTL без способу звільнити «лише якщо все ще наш», тож попередня реалізація
+не звільняла лок **ніколи**. Він жив повний TTL незалежно від тривалості хвилі — тобто був не
+overlap-локом, а обмежувачем частоти на `LOCK_SECONDS`, і будь-який interval-запис із періодом
+менше 60 с тихо фанаутився раз на хвилину (обидва приклади в цьому документі, 5 с і 30 с,
+потрапляли під це). Звільнення тепер фенсоване — Lua compare-and-delete проти токена з
+`acquire()` — тож хвиля, що пережила свій TTL, не може видалити лок **наступної** хвилі й
+запустити каскад. TTL лишається з однією роллю: аварійний запобіжник, якщо воркера вбили
+посеред хвилі й `finally` не відпрацював. Той самий конструкт, що в
+`tenants/resolver/registry.py::run_locked`.
+
 schedules, which is why the overlap-lock keys on `(task, _argsig(args))`. The watermark must
 agree: keyed by task name alone, the wave that lands second reads the first one's watermark,
 sees the occurrence as already run, and is skipped indefinitely — silently, because the two
@@ -372,7 +390,7 @@ cutover. Remove:
   tasks must be **idempotent** (optional dedup key `f"{task}:{schema}:{fire_date}"`).
   Exactly-once is not offered (would need an outbox).
 - **Broker down** → tick skipped, recovered next tick (level-triggered); never fire-all.
-- **Overlap-lock** per `(task, args)` → no piled-up waves; a stale/late calendar
+- **Overlap-lock** per `(task, args)`, released per wave → no piled-up waves; a stale/late calendar
   occurrence is dropped by the grace window. The lock lives in the MT-only `beat_lock`
   cache = the BROKER Redis (NOEVICTION — a lock is never evicted mid-wave, unlike the
   allkeys-lru app `default` cache), static `beatlock:` prefix (tenant-agnostic). It runs
@@ -420,14 +438,18 @@ New dependency: `croniter` (universal requirements; used only by the MT tz path)
 
 ## 12. Phases
 
+> Test counts in this list are END-OF-PHASE snapshots, not the current state. The suite
+> only grows, so a number here dates its entry rather than describing the tree; for the
+> live figure run `scripts/ci_mode.sh mt`.
+
 - **A. Core — DONE** (units built + tested; live beat scheduler NOT switched yet —
   cutover is D/E). Added: `commons/platform/beat.py` (`task_queue` + `scoped_schedule`)
   (`scoped_schedule`, `_classify_schedule`, `_crontab_to_cronspec`, `beat_conf`, `BEAT_DEFAULTS`),
   `commons/platform/tenancy.py::active_target_schemas`, `tenants/tasks.py`
-  (`fanout_dispatch` interval+public / `sub_dispatch` / `_acquire_lock` / `_argsig`;
+  (`fanout_dispatch` interval+public / `sub_dispatch` / `_wave_lock` / `_argsig`;
   `provision_tenant`/`drop_tenant_schema_task` now `queue=task_queue("service")`), settings
   MT-only queues (`fast/slow/service/fanout`, dropped `CELERY_TASK_ROUTES`) + `TENANT_BEAT`.
-  Tests: `tenants/tests/test_fanout.py` (20). The calendar/tz branch of `fanout_dispatch`
+  Tests: `tenants/tests/test_fanout.py` (20 at the end of A). The calendar/tz branch of `fanout_dispatch`
   raises `NotImplementedError` until Phase B. `CELERY_BEAT_SCHEDULE` and the scheduler
   swap are NOT added yet (still the DB scheduler) — no cutover in A.
 - **B. tz — DONE.** `Tenant.timezone` (NULL-sentinel + `_validate_timezone`), `TaskRun`
@@ -438,8 +460,8 @@ New dependency: `croniter` (universal requirements; used only by the MT tz path)
   `tenants.E002` (grace ≥ fanout_period); `tenants.E006` (no two fanout entries share
   `(task_name, args)` — that pair IS the overlap-lock key, so such entries suppress each
   other, and if they differ in cron/interval/grace the applied grace depends on which wave
-  wins the lock). Tests: `test_fanout.py` (31 total) + `TaskRunTests`
-  in `db_integration.py` (DB harness). MT suite 178. Live cutover still deferred to D/E.
+  wins the lock). Tests: `test_fanout.py` (31 total at the end of B) + `TaskRunTests`
+  in `db_integration.py` (DB harness). MT suite 178 at that point. Live cutover still deferred to D/E.
 - **C. Gate — DONE.** `tenants_back/celery.py` is mode-aware: MT → `tenants.celery.CeleryApp`
   (shard-aware); standalone → plain `celery.Celery`. Verified by probe: in standalone the
   app is `celery.app.base.Celery` and `tenants` is not imported at all — so django-tenants
@@ -452,7 +474,7 @@ New dependency: `croniter` (universal requirements; used only by the MT tz path)
   `reconcile_tenants`); dropped `django-celery-beat` from requirements. **Cutover:** MT
   now runs stock `celery.beat:PersistentScheduler` off `CELERY_BEAT_SCHEDULE`
   (seeded with `resolve-gate-reconcile`); the DB scheduler is gone. Also removed the
-  now-dead `Tenant.from_db`/`_loaded_status`. Verified: MT 177 tests, `check` clean,
+  now-dead `Tenant.from_db`/`_loaded_status`. Verified: MT 177 tests at that point, `check` clean,
   `makemigrations --check` clean, beat config loads without `django_celery_beat`;
   `db_integration.py::FanoutTargetsDBTests` covers the enumeration. Mode resolver
   extracted to `commons/platform/mode.py::use_multitenant()` (settings-load-safe; used by

@@ -105,15 +105,59 @@ def bound_alias() -> str | None:
     tell a genuinely context-free query (a bug — the strict guard raises) from one deliberately
     routed to "default".
 
-    TWO intended callers, for the same reason: the router, and commons.platform.cache_keys.
-    A Redis key NAMES a tenant, so "no context" and "deliberately default" must not read the
-    same — django_tenants resets the schema at the start of process_request and never on
-    close, so between requests connections["default"] holds the tenant just served, and a
-    reader that coalesced would mint keys in that tenant's namespace. Every OTHER reader
+    TWO intended callers, for the same reason: TenantDatabaseRouter, and current_schema_name()
+    just below — which is what commons.platform.cache_keys and tenants.celery.compat reach
+    through, so neither of them touches this directly. A Redis key NAMES a tenant and a task
+    header NAMES a tenant, so "no context" and "deliberately default" must not read the same —
+    django_tenants resets the schema at the start of process_request and never on close, so
+    between requests connections["default"] holds the tenant just served, and a reader that
+    coalesced would mint keys (or stamp tasks) in that tenant's namespace. Every OTHER reader
     wants active_alias(). Both exist so that nothing outside this module has to touch the
     ContextVar itself — enforced by scripts/ci_guard_routing_axis.sh.
     """
     return current_db.get()
+
+
+def current_schema_name() -> str:
+    """The schema on the connection of the BOUND shard; public when nothing is bound.
+
+    THE answer to "which tenant are we on right now", for readers that need the name rather
+    than the alias. Lives here because this module owns the routing axis: `connections` and
+    bound_alias() are both already its own, and nothing outside `tenants/` then has to read
+    `connection.schema_name` at all (enforced by scripts/ci_guard_ast.py).
+
+    bound_alias(), NOT active_alias(). The latter coalesces "no context" into "default", and
+    that collapse is a hazard here specifically: django_tenants resets the schema at the START
+    of process_request and never on close, so BETWEEN requests connections["default"] still
+    holds the tenant just served. A reader that coalesced would answer with that tenant,
+    silently. The question has to stand on whether a context EXISTS, not on what the schema
+    happens to say.
+
+    The "no context" case is legitimate and is answered EXPLICITLY. It is reached on the
+    request path: HostRegistry.trigger_warm() (tenants/resolver/registry.py) enqueues a
+    reconcile from inside ShardAwareTenantMiddleware, before TenantShardRoutingMiddleware
+    binds the axis.
+
+    `or get_public_schema_name()` is belt-and-braces for a hand-rolled set_schema or a
+    FakeTenant -- NOT for a fresh connection: the backend's __init__ ends with
+    set_schema_to_public(), so schema_name is never falsy there.
+
+    NOT total: `connections[alias]` raises ConnectionDoesNotExist for an alias outside
+    DATABASES. Only use_alias() can bind such an alias -- it sets current_db without touching
+    `connections`, having no schema to apply and so nothing to resolve -- whereas _switch()
+    (tenant_context / schema_context) resolves the connection on its first line and fails at
+    the `with`, before any caller gets here. Both use_alias call sites pass the literal
+    "default", so this is a property of the contract rather than a reachable failure.
+
+    Callers decide what a PUBLIC answer means, and they do not agree -- deliberately:
+    commons.platform.cache_keys.make_key accepts it (`tenant:public:` is where the public-host
+    admin's sessions belong, and it cannot raise anyway), tenant_key() refuses it, and
+    tenants.celery.compat stamps it onto an outgoing task. See each for why.
+    """
+    alias = bound_alias()
+    if alias is None:
+        return get_public_schema_name()
+    return connections[alias].schema_name or get_public_schema_name()
 
 
 @contextmanager

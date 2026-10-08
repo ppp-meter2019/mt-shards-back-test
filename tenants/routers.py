@@ -158,7 +158,7 @@ class TenantDatabaseRouter(TenantSyncRouter):
             f"Its table is either absent there or deliberately EMPTY, so the query cannot "
             f"return a meaningful answer. If this model legitimately holds rows in public "
             f"(the operator's identity and what its save path touches), add "
-            f"{model._meta.label_lower!r} to settings_base._PUBLIC_MODEL_ALLOWLIST; otherwise "
+            f"{model._meta.label_lower!r} to settings_multitenant._PUBLIC_MODEL_ALLOWLIST; otherwise "
             f"this is a business query that escaped onto the management host."
         )
         if mode == "warn":

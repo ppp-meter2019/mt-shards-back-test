@@ -9,6 +9,10 @@ The login serializers stamp a `schema` claim on every token. Here we enforce it:
 the token is valid only on the schema it was issued for. Fail-closed — a missing
 or mismatched claim is rejected, so a token used in the wrong tenant is useless
 (it cannot grant cross-tenant access; worst case it's a dead token → 401).
+
+Wired only by settings_multitenant.py; standalone keeps stock JWTAuthentication. The
+`schema` claim is stamped at ISSUANCE by the project's login serializers — see
+tenants/auth/__init__.py for the contract that places on a host project.
 """
 
 from django.db import connection

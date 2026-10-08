@@ -7,7 +7,6 @@ from rest_framework import serializers
 
 # Runtime layer — console -> tenants is the allowed direction (tenants/console/__init__.py).
 from tenants.models import Domain, ReservedHostRule, Shard, Tenant
-from tenants.resolver import resolve_cache
 from tenants.validators import (
     validate_schema_name,
     validate_tenant_domain,
@@ -262,14 +261,14 @@ class TenantSerializer(serializers.ModelSerializer):
                 old_host = primary.domain if primary else None
                 if old_host != domain:
                     if primary is not None:
+                        # Domain.save() handles BOTH sides: post_save invalidates the new
+                        # host, and the model's own re-point hook forgets the old one. This
+                        # used to do the second half here, which left every other re-point
+                        # path (admin, shell, commands) with a stale host alive.
                         primary.domain = domain
-                        primary.save()          # post_save signal invalidates the NEW host
+                        primary.save()
                     else:
                         Domain.objects.create(domain=domain, tenant=tenant, is_primary=True)
-                    if old_host:
-                        # The signal only knows the NEW value; drop the OLD host too,
-                        # else it keeps resolving to this tenant until its TTL expires.
-                        resolve_cache.forget_host(old_host)
         return tenant
 
 

@@ -7,9 +7,13 @@ apply to.
 import os
 import subprocess
 import sys
+import types
 from collections.abc import Sequence
+from unittest import mock
 
+from django.apps import apps as django_apps
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.test import SimpleTestCase
 
 from ._settings_ast import assert_literal_assignment
@@ -48,7 +52,7 @@ class MiddlewareInvariantTests(SimpleTestCase):
     )
     AUTH_CHAIN = (
         "django.contrib.auth.middleware.AuthenticationMiddleware",
-        "users.middleware.SchemaBoundSessionMiddleware",
+        "tenants.auth.session.SchemaBoundSessionMiddleware",
     )
 
     def _assert_ordered(self, mw: list[str], chain: Sequence[str]) -> None:
@@ -100,7 +104,7 @@ class MiddlewareInvariantTests(SimpleTestCase):
         # swap Auth and SchemaBound so the session middleware precedes Auth
         swapped = list(good)
         a = swapped.index("django.contrib.auth.middleware.AuthenticationMiddleware")
-        b = swapped.index("users.middleware.SchemaBoundSessionMiddleware")
+        b = swapped.index("tenants.auth.session.SchemaBoundSessionMiddleware")
         swapped[a], swapped[b] = swapped[b], swapped[a]
         with self.settings(MIDDLEWARE=swapped):
             self.assertTrue(any(e.id == "tenants.E004" for e in mt_middleware_order(None)))
@@ -130,6 +134,99 @@ class BootstrapFloatTests(SimpleTestCase):
         with mock.patch.dict(os.environ, {self.KNOB: "abc"}):
             with self.assertRaises(ValueError):
                 bootstrap_float(self.KNOB, 60.0)
+
+
+class BooleanFlagParsingTests(SimpleTestCase):
+    """commons.platform.mode._parse_bool via use_multitenant() — the run-mode flag used to
+    accept ONLY the literal "1", so `USE_MULTITENANT=true` booted standalone while the deploy
+    had written a multi-tenant settings file."""
+
+    def _use_multitenant(self, raw: str) -> bool:
+        from commons.platform.mode import use_multitenant
+        with mock.patch.dict(os.environ, {"USE_MULTITENANT": raw}):
+            return use_multitenant()
+
+    def test_truthy_spellings(self) -> None:
+        for raw in ("1", "true", "True", "TRUE", "yes", "YES", "on", " true ", "1\n"):
+            with self.subTest(raw=raw):
+                self.assertIs(self._use_multitenant(raw), True)
+
+    def test_falsy_spellings(self) -> None:
+        for raw in ("0", "false", "False", "FALSE", "no", "off", " 0 "):
+            with self.subTest(raw=raw):
+                self.assertIs(self._use_multitenant(raw), False)
+
+    def test_unrecognised_fails_loud(self) -> None:
+        """The half that matters: a typo must NOT resolve to the default silently."""
+        for raw in ("ture", "maybe", "2", "y", "n", "-1", "enabled"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ImproperlyConfigured):
+                    self._use_multitenant(raw)
+
+    def test_message_names_the_origin_and_the_value(self) -> None:
+        with self.assertRaises(ImproperlyConfigured) as ctx:
+            self._use_multitenant("ture")
+        self.assertIn("env USE_MULTITENANT", str(ctx.exception))
+        self.assertIn("'ture'", str(ctx.exception))
+
+    def test_empty_env_falls_through_to_the_file(self) -> None:
+        """`docker run -e USE_MULTITENANT` / compose `${VAR}` forward "" when unset on the host,
+        so an empty value must mean "unset", not "not a boolean"."""
+        import commons.platform.mode as mode_mod
+        fake = types.ModuleType("tenants_back.settings_mode")
+        for raw in ("", "   "):
+            for value in (True, False):
+                with self.subTest(raw=raw, value=value):
+                    fake.USE_MULTITENANT = value
+                    with mock.patch.dict(os.environ, {"USE_MULTITENANT": raw}), \
+                         mock.patch.dict(sys.modules, {"tenants_back.settings_mode": fake}):
+                        self.assertIs(mode_mod.use_multitenant(), value)
+
+    def test_a_string_in_settings_mode_goes_through_the_parser(self) -> None:
+        """bool("false") is True — the same silent inversion, one layer down."""
+        import commons.platform.mode as mode_mod
+        fake = types.ModuleType("tenants_back.settings_mode")
+        cases = {"false": False, "off": False, "no": False, "true": True, "on": True}
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                fake.USE_MULTITENANT = raw
+                with mock.patch.dict(os.environ, {}, clear=False), \
+                     mock.patch.dict(sys.modules, {"tenants_back.settings_mode": fake}):
+                    os.environ.pop("USE_MULTITENANT", None)
+                    self.assertIs(mode_mod.use_multitenant(), expected)
+        fake.USE_MULTITENANT = "ture"
+        with mock.patch.dict(sys.modules, {"tenants_back.settings_mode": fake}):
+            os.environ.pop("USE_MULTITENANT", None)
+            with self.assertRaises(ImproperlyConfigured) as ctx:
+                mode_mod.use_multitenant()
+        self.assertIn("settings_mode.USE_MULTITENANT", str(ctx.exception))
+
+    def test_bool_and_int_in_settings_mode_still_work(self) -> None:
+        import commons.platform.mode as mode_mod
+        fake = types.ModuleType("tenants_back.settings_mode")
+        for value, expected in ((True, True), (False, False), (1, True), (0, False)):
+            with self.subTest(value=value):
+                fake.USE_MULTITENANT = value
+                with mock.patch.dict(sys.modules, {"tenants_back.settings_mode": fake}):
+                    os.environ.pop("USE_MULTITENANT", None)
+                    self.assertIs(mode_mod.use_multitenant(), expected)
+
+    def test_mode_module_does_not_pull_in_django_conf(self) -> None:
+        """_parse_bool raises ImproperlyConfigured, which must not cost settings access."""
+        src = (
+            "import sys, importlib;"
+            "importlib.import_module('commons.platform.mode');"
+            "from django.conf import settings;"
+            "print(settings.configured)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", src],
+            cwd=str(settings.BASE_DIR),
+            env={k: v for k, v in os.environ.items() if k != "DJANGO_SETTINGS_MODULE"},
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip().splitlines()[-1], "False", out.stdout)
 
 
 class SettingsLocalContractTests(SimpleTestCase):
@@ -278,12 +375,24 @@ class MergeSeamContractTests(SimpleTestCase):
                 f"{label!r} is allowed on public, but its app has no tables there.",
             )
 
-    def test_runtime_promotion_matches_its_source(self) -> None:
-        """The router reads the public setting; the merge edits the private list. Nothing
-        stops the two from drifting except this."""
-        from tenants_back import settings_base
-        self.assertEqual(frozenset(settings_base._PUBLIC_MODEL_ALLOWLIST),
-                         settings.PUBLIC_MODEL_ALLOWLIST)
+    def test_derived_entries_match_the_real_identity_model(self) -> None:
+        """The three derived entries are built from AUTH_USER_MODEL by string, which assumes
+        the default through-table names. Ask the model instead: a host whose identity model
+        declares a M2M with an explicit `through=`, or carries extra M2M fields, gets names
+        this derivation cannot produce — and the guard then REFUSES a legitimate query.
+
+        (It refuses loudly, naming the string to add, so this is a warning and not a
+        correctness hole. The test exists so the warning arrives at merge time rather than on
+        the first admin login.)"""
+        user = django_apps.get_model(settings.AUTH_USER_MODEL)
+        expected = {user._meta.label_lower} | {
+            f.remote_field.through._meta.label_lower for f in user._meta.many_to_many
+        }
+        self.assertLessEqual(
+            expected, settings.PUBLIC_MODEL_ALLOWLIST,
+            "the identity model's own tables are not all allowed on public — the string "
+            "derivation in settings_multitenant.py missed one; add it explicitly",
+        )
 
     def test_model_labels_are_lower_cased_and_well_formed(self) -> None:
         """Model._meta.label_lower is the form the guard compares against, so an entry in any
@@ -293,6 +402,73 @@ class MergeSeamContractTests(SimpleTestCase):
             self.assertEqual(label, label.lower(), f"{label!r} must be lower-cased")
             self.assertEqual(label.count("."), 1,
                              f"{label!r} must be exactly 'app_label.modelname'")
+
+
+class SettingsLoadScopeTests(SimpleTestCase):
+    """scripts/ci_guard_ast.py::SETTINGS_LOAD_PATH must still describe the REAL import closure.
+
+    That guard forbids a module-level django_tenants import on the settings-load path, and it
+    names that path as a hard-coded list of prefixes. A list is only as good as its last
+    measurement: move the Celery bootstrap, or import one more module from
+    tenants_back/__init__.py, and the guard goes quietly blind over the new file. So measure
+    the closure here and assert the list still covers it.
+
+    `commons/` is exempt because the stricter `commons` rule already forbids django_tenants
+    there at ANY depth.
+    """
+
+    FIRST_PARTY = ("tenants", "tenants_back", "commons", "users", "customers", "drivers",
+                   "cars", "products", "orders", "routes")
+
+    def _closure(self) -> list[str]:
+        script = (
+            "import sys\n"
+            "before = set(sys.modules)\n"
+            "import tenants_back\n"
+            "print('\\n'.join(sorted(set(sys.modules) - before)))\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(settings.BASE_DIR),
+            env={**os.environ, "USE_MULTITENANT": "1",
+                 "DJANGO_SETTINGS_MODULE": "tenants_back.settings"},
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, f"import failed:\n{proc.stderr}")
+        return [m for m in proc.stdout.split()
+                if m.split(".")[0] in self.FIRST_PARTY]
+
+    @staticmethod
+    def _declared_prefixes() -> tuple[str, ...]:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_ci_guard_ast_probe", settings.BASE_DIR / "scripts" / "ci_guard_ast.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.SETTINGS_LOAD_PATH
+
+    def test_the_guard_scope_covers_every_module_loaded_with_the_settings(self) -> None:
+        declared = self._declared_prefixes()
+        uncovered = []
+        for module in self._closure():
+            if module.split(".")[0] == "commons":
+                continue                       # covered by the stricter `commons` rule
+            rel = module.replace(".", "/")
+            paths = (f"{rel}.py", f"{rel}/__init__.py")
+            if not any(pth.startswith(declared) for pth in paths):
+                uncovered.append(module)
+        self.assertEqual(
+            uncovered, [],
+            "these modules now run mid-settings-load but ci_guard_ast.py's SETTINGS_LOAD_PATH "
+            "does not cover them, so a module-level django_tenants import there would pass CI. "
+            "Add their path prefix to SETTINGS_LOAD_PATH.",
+        )
+
+    def test_every_declared_prefix_still_exists(self) -> None:
+        """A prefix for a file that was moved or deleted silently narrows the rule to nothing."""
+        for prefix in self._declared_prefixes():
+            with self.subTest(prefix=prefix):
+                self.assertTrue((settings.BASE_DIR / prefix).exists(), prefix)
 
 
 class SettingsLoadReentrancyTests(SimpleTestCase):

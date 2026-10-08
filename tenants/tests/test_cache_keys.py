@@ -21,6 +21,7 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.test import SimpleTestCase
 
+import tenants.context as tctx
 from commons.platform import cache_keys
 
 from ._settings_ast import (BASE_SETTINGS, assert_literal_assignment,
@@ -42,8 +43,11 @@ def _as_schema(name, *, alias: str = "tenant_1", default_schema: str = "public")
         alias: types.SimpleNamespace(schema_name=name),
         "default": types.SimpleNamespace(schema_name=default_schema),
     }
-    with mock.patch.object(cache_keys, "connections", conns), \
-         mock.patch.object(cache_keys, "bound_alias", lambda: alias):
+    # Patches tenants.context, which now OWNS the read; cache_keys only consumes the answer
+    # (through commons.platform.tenancy). Patching it there keeps these tests about the key
+    # SHAPE while tenants/tests/test_context.py covers the read itself.
+    with mock.patch.object(tctx, "connections", conns), \
+         mock.patch.object(tctx, "bound_alias", lambda: alias):
         yield
 
 
@@ -129,9 +133,9 @@ class CacheKeyContextTests(SimpleTestCase):
         so in a Celery task `default` is still public — and business tenants are always on a
         shard (Tenant.clean forbids the default one). Reading `default` would collapse every
         tenant into `tenant:public:` and make tenant_key() refuse from inside a live tenant
-        context. Same source as tenants.celery.compat.current_schema_name."""
+        context. One source for both: tenants.context.current_schema_name, which
+        tenants.celery.compat re-exports (see tenants/tests/test_context.py)."""
         with _as_schema("acme", alias="tenant_1", default_schema="public"):
-            self.assertEqual(cache_keys.current_schema(), "acme")
             self.assertEqual(cache_keys.make_key("k", "app", 1), "tenant:acme:app:1:k")
             self.assertEqual(cache_keys.tenant_key("coordinates_package"),
                              "tenant:acme:coordinates_package")
@@ -144,9 +148,8 @@ class CacheKeyContextTests(SimpleTestCase):
         implementation (which read active_alias(), coalescing to 'default'): tenant_key()
         returned `tenant:acme:coordinates_package` and did NOT raise."""
         stale = {"default": types.SimpleNamespace(schema_name="acme")}
-        with mock.patch.object(cache_keys, "connections", stale), \
-             mock.patch.object(cache_keys, "bound_alias", lambda: None):
-            self.assertEqual(cache_keys.current_schema(), "public")
+        with mock.patch.object(tctx, "connections", stale), \
+             mock.patch.object(tctx, "bound_alias", lambda: None):
             self.assertEqual(cache_keys.make_key("k", "app", 1), "tenant:public:app:1:k")
             with self.assertRaises(ImproperlyConfigured):
                 cache_keys.tenant_key("coordinates_package")
@@ -187,7 +190,7 @@ class CacheKeyThreadTests(SimpleTestCase):
             "t2": types.SimpleNamespace(schema_name="beta"),
             "default": types.SimpleNamespace(schema_name="public"),
         }
-        with mock.patch.object(cache_keys, "connections", conns):
+        with mock.patch.object(tctx, "connections", conns):
             yield
 
     def test_two_tenants_collide_on_one_namespace_in_a_thread(self) -> None:

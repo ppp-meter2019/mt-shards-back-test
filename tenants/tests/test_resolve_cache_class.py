@@ -169,11 +169,29 @@ class TenantResolveCacheTests(SimpleTestCase):
         self.assertIn(rc._schema_snap_key("s1"), rc.cache.store)
         self.assertIn(rc._schema_snap_key("s2"), rc.cache.store)
 
-    def test_forget_all_clears_by_pattern_and_counts(self) -> None:
-        fake = FakeNxCache(); fake.store.update({"a": 1, "b": 2})
-        n = self.rc(fake).forget_all()
-        self.assertEqual(n, 2)
-        self.assertEqual(fake.store, {})
+    def test_forget_all_clears_both_snapshot_namespaces_and_counts(self) -> None:
+        """Both sub-namespaces, and nothing else.
+
+        host-snap feeds the web resolve path (Host -> tenant), schema-snap feeds the worker one
+        (get_schema_snapshot). Dropping either sweep leaves that path serving stale snapshots
+        until their TTL, which is exactly what `invalidate_resolve_cache --all` exists to avoid.
+        The patterns are asserted too (as a set): the previous version of this test passed
+        with any pattern and any number of calls, because the double ignored both.
+        """
+        fake = FakeNxCache()
+        rc = self.rc(fake)
+        fake.store.update({
+            rc._snap_key("a.example.com"): 1,
+            rc._snap_key("b.example.com"): 2,
+            rc._schema_snap_key("alpha"): 3,
+            "svc:future-key": "survives",     # another logical prefix - forget_all promises this
+        })
+        n = rc.forget_all()
+        self.assertEqual(n, 3)
+        self.assertEqual(list(fake.store), ["svc:future-key"])
+        # sorted(): exactly these two patterns, exactly twice - the ORDER of the two sweeps
+        # is incidental, so pinning it would only break a harmless refactor.
+        self.assertEqual(sorted(fake.pattern_calls), ["host-snap:*", "schema-snap:*"])
 
     # --- put: return contract ---
     def test_put_reports_whether_the_host_snap_was_written(self) -> None:

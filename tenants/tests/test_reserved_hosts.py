@@ -52,6 +52,31 @@ class MatchesTests(SimpleTestCase):
         self.assertTrue(r.matches("admin.routegenie.com"))
         self.assertFalse(r.matches("admin.client.com"))             # outside the base
 
+    def test_a_rule_binds_its_value_to_a_POSITION_in_the_host(self) -> None:
+        """Each match type anchors its value somewhere specific: EXACT to the whole host,
+        SUFFIX to a dotted tail, LABEL to the LEADING label. The same value elsewhere in the
+        host must NOT match — otherwise the rule over-reserves and a legitimate tenant domain
+        is refused at creation.
+
+        The LABEL half was uncovered: matches() could be widened to accept the label at any
+        position, or to accept it as a dotted suffix, and the whole suite stayed green.
+        """
+        label = rule(R.MatchType.LABEL, "www")
+        self.assertTrue(label.matches("www.acme.com"))                 # leading — reserved
+        self.assertFalse(label.matches("x.www.acme.com"))              # middle label
+        self.assertFalse(label.matches("acme.www"))                    # trailing label
+        self.assertFalse(label.matches("wwwx.acme.com"))               # not a whole label
+
+        scoped = rule(R.MatchType.LABEL, "admin", base="routegenie.com")
+        self.assertFalse(scoped.matches("x.admin.routegenie.com"))     # leading label is 'x'
+        self.assertFalse(scoped.matches("routegenie.com.admin"))       # label, wrong end
+
+        suffix = rule(R.MatchType.SUFFIX, "internal.x.com")
+        self.assertFalse(suffix.matches("internal.x.com.evil.net"))    # value leads, not tails
+
+        exact = rule(R.MatchType.EXACT, "manage.localhost")
+        self.assertFalse(exact.matches("manage.localhost.evil.net"))
+
 
 class HostnameValidatorTests(SimpleTestCase):
     def test_accepts(self) -> None:
@@ -154,47 +179,6 @@ class ValidateTenantDomainGlueTests(SimpleTestCase):
                 V.validate_tenant_domain("bad_underscore.com")
 
 
-class CandidateSupersetContractTests(SimpleTestCase):
-    """Guards the SUPERSET contract of candidate_q() semantically (DB-free): every host
-    matches() accepts MUST be reachable by candidate_q()'s shape, otherwise the hybrid
-    conflicts scan would silently drop a real conflict. Uses a faithful Python mirror of
-    candidate_q()'s case-insensitive lookups; the real Q runs against the DB harness.
-    """
-
-    HOSTS = [
-        "www.acme.com", "WWW.Mixed.com", "api.acme.com", "acme.routegenie.com",
-        "admin.routegenie.com", "admin.client.com", "internal.x.com",
-        "x.internal.x.com", "manage.localhost", "routegenie.com", "alpha.company1.com",
-    ]
-
-    def _prefilter(self, r: Any, host: str) -> bool:
-        """Mirror of candidate_q()'s SQL semantics (case-insensitive)."""
-        h = host.strip().lower().rstrip(".")
-        val = V.normalize_host(r.value)
-        if r.match_type == R.MatchType.EXACT:
-            return h == val
-        if r.match_type == R.MatchType.SUFFIX:
-            return h == val or h.endswith("." + val)
-        if r.match_type == R.MatchType.LABEL:
-            return h == val or h.startswith(val + ".")
-        return False
-
-    def test_matches_is_subset_of_prefilter(self) -> None:
-        rules = [
-            rule(R.MatchType.LABEL, "www"),
-            rule(R.MatchType.LABEL, "admin", base="routegenie.com"),
-            rule(R.MatchType.EXACT, "manage.localhost"),
-            rule(R.MatchType.SUFFIX, "internal.x.com"),
-        ]
-        for r in rules:
-            for h in self.HOSTS:
-                if r.matches(h):
-                    self.assertTrue(
-                        self._prefilter(r, h),
-                        f"{r}: matches({h!r}) but candidate_q shape excludes it — SUPERSET broken",
-                    )
-
-
 class ValidateSchemaNameGlueTests(SimpleTestCase):
     @mock.patch.object(V, "reserved_schema_labels", return_value={"admin", "api", "www"})
     def test_reserved_rejected(self, _rl: Any) -> None:
@@ -282,6 +266,11 @@ class CandidateQSupersetTests(SimpleTestCase):
     means comparing the column DIRECTLY. This simulates what Postgres would return for one
     column value, so the contract is pinned without a database; db_integration.py runs it
     against real rows AND checks that the constraint actually refuses the rest.
+
+    A second class used to sit next to this one, asserting the same SUPERSET property against a
+    hand-written Python mirror of candidate_q()'s lookups instead of the Q itself. It never
+    called candidate_q(), so it could not notice the method changing — only its own copy going
+    stale. Removed; the simulation below walks the real Q tree.
     """
 
     # Every value the constraint permits — i.e. exactly the fixed points of normalize_host.

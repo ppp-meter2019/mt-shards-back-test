@@ -26,7 +26,7 @@ def mt_middleware_order(app_configs: list[AppConfig] | None,
          "tenants.middleware.ShardAwareTenantMiddleware",
          "tenants.middleware.TenantShardRoutingMiddleware"),
         ("django.contrib.auth.middleware.AuthenticationMiddleware",
-         "users.middleware.SchemaBoundSessionMiddleware"),
+         "tenants.auth.session.SchemaBoundSessionMiddleware"),
     ]
     pos, errors = {}, []
     for chain in chains:                                     # presence

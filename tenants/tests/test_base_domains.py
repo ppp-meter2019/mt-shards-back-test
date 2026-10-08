@@ -1,5 +1,9 @@
-"""BaseDomainsView payload (DB-free). Permission gating (IsTenantAdminOnPublic) is
-covered by the DB-backed harness (db_integration.BaseDomainsEndpointDBTests)."""
+"""BaseDomainsView payload (DB-free).
+
+Permission gating (IsTenantAdminOnPublic) is covered by test_permissions.py, which calls
+has_permission() directly. db_integration.BaseDomainsEndpointDBTests additionally exercises
+it through DRF with real User rows, but that module is undiscoverable by design and runs
+only when pointed at a live database."""
 from django.test import SimpleTestCase, override_settings
 
 from tenants.console.views import BaseDomainsView

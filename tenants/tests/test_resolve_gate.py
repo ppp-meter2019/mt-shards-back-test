@@ -1,6 +1,7 @@
 """Tenant-resolve gate (WARM/GATE stages). DB-free: fake domain model + fake nx cache,
 host_registry.check / fill_cap.allow patched or fed a fake Redis. See
 deploy/resolve_gate_design.md."""
+import logging
 from typing import Any
 from unittest import mock
 
@@ -8,6 +9,7 @@ from django.test import SimpleTestCase, override_settings
 from redis.exceptions import RedisError
 
 import tenants.middleware as mw
+import tenants.resolver.service as service
 from tenants.resolver import (
     ResolveDeferred, TenantResolveCache, resolve_cache, fill_cap,
 )
@@ -15,7 +17,8 @@ from tenants.resolver import (
     DIRTY_KEY, WARM_LOCK_KEY, WARM_PENDING_KEY, HostRegistry, host_registry,
 )
 
-from ._support import FakeNxCache, make_domain_model, make_tenant, use_resolve_cache
+from ._support import (FakeLock, FakeLockRedis, FakeNxCache, make_domain_model,
+                        make_tenant, use_resolve_cache)
 
 
 class _FakeRedis:
@@ -227,39 +230,6 @@ class CacheEnabledFlagTests(SimpleTestCase):
         self.assertTrue(self._rc().enabled)             # #4: WARM keeps the cache in use
 
 
-class _FakeLock:
-    """Stand-in for redis-py's Lock: records acquire/release; release() can raise LockError
-    to simulate a lock that expired mid-reconcile (no longer ours)."""
-
-    def __init__(self, acquired: bool = True, release_raises: bool = False) -> None:
-        self._acquired = acquired
-        self._release_raises = release_raises
-        self.acquire_calls = 0
-        self.release_calls = 0
-
-    def acquire(self, blocking: bool = True, **kw: Any) -> bool:
-        self.acquire_calls += 1
-        return self._acquired
-
-    def release(self) -> None:
-        self.release_calls += 1
-        if self._release_raises:
-            from redis.exceptions import LockError
-            raise LockError("not owned")
-
-
-class _FakeLockRedis:
-    """Returns a preset _FakeLock from .lock(); records the lock() call args."""
-
-    def __init__(self, lock: Any) -> None:
-        self._lock = lock
-        self.lock_calls = []
-
-    def lock(self, name: str, timeout: float | None = None, **kw: Any) -> Any:
-        self.lock_calls.append((name, timeout))
-        return self._lock
-
-
 @override_settings(TENANT_REGISTRY={"WARM_ENABLED": True})
 class RunLockedFencingTests(SimpleTestCase):
     def _patches(self, fake: Any) -> tuple[Any, ...]:
@@ -269,8 +239,8 @@ class RunLockedFencingTests(SimpleTestCase):
         )
 
     def test_acquires_reconciles_and_releases(self) -> None:
-        lock = _FakeLock(acquired=True)
-        fake = _FakeLockRedis(lock)
+        lock = FakeLock(acquired=True)
+        fake = FakeLockRedis(lock)
         p1, p2 = self._patches(fake)
         with p1, p2, mock.patch.object(host_registry, "reconcile", return_value=7):
             n = host_registry.run_locked()
@@ -280,8 +250,8 @@ class RunLockedFencingTests(SimpleTestCase):
         self.assertEqual(lock.release_calls, 1)                  # fenced release fires
 
     def test_skips_when_lock_held(self) -> None:
-        lock = _FakeLock(acquired=False)            # someone else holds it
-        fake = _FakeLockRedis(lock)
+        lock = FakeLock(acquired=False)            # someone else holds it
+        fake = FakeLockRedis(lock)
         p1, p2 = self._patches(fake)
         with p1, p2, mock.patch.object(host_registry, "reconcile") as rec:
             n = host_registry.run_locked()
@@ -290,8 +260,8 @@ class RunLockedFencingTests(SimpleTestCase):
         self.assertEqual(lock.release_calls, 0)     # never release a lock we didn't take
 
     def test_release_error_is_swallowed(self) -> None:
-        lock = _FakeLock(acquired=True, release_raises=True)     # expired mid-reconcile
-        fake = _FakeLockRedis(lock)
+        lock = FakeLock(acquired=True, release_raises=True)     # expired mid-reconcile
+        fake = FakeLockRedis(lock)
         p1, p2 = self._patches(fake)
         with p1, p2, mock.patch.object(host_registry, "reconcile", return_value=3):
             n = host_registry.run_locked()          # LockError must NOT propagate
@@ -479,37 +449,98 @@ class SingleFlightTests(SimpleTestCase):
         self.assertEqual(got, "leader-value")           # took the shared result, no own resolve
 
 
-class FailOpenLogThrottleTests(SimpleTestCase):
-    """The fail-open branch logs at most one traceback per _FAIL_LOG_EVERY window and
-    counts the rest — no one-traceback-per-request storm under a sustained cache failure."""
+class ThrottledLogTests(SimpleTestCase):
+    """service._ThrottledLog — at most one line per _LOG_EVERY window, the rest counted.
 
-    def setUp(self) -> None:
-        from tenants.resolver import service
-        self.svc = service
-        self.svc._fail_last = 0.0
-        self.svc._fail_suppressed = 0
-        self.addCleanup(setattr, self.svc, "_fail_last", 0.0)
-        self.addCleanup(setattr, self.svc, "_fail_suppressed", 0)
+    Built on a FRESH instance rather than by poking module globals (which is what this had to
+    do while the three call sites each owned a pair of them), so nothing here leaks between
+    tests and the behaviour is asserted once for all three sites.
+    """
 
-    def test_first_logs_then_suppresses_within_window(self) -> None:
-        with mock.patch.object(self.svc.time, "monotonic", return_value=1000.0), \
-                mock.patch.object(self.svc.logger, "warning") as warn:
+    def _throttle(self, **kw: Any) -> Any:
+        return service._ThrottledLog(logging.WARNING, "x %r%s", **kw)
+
+    def test_first_emits_then_suppresses_within_the_window(self) -> None:
+        t = self._throttle()
+        with mock.patch.object(service.time, "monotonic", return_value=1000.0), \
+             mock.patch.object(service.logger, "log") as log:
             for _ in range(5):
-                self.svc._log_cache_fail("h")
-        self.assertEqual(warn.call_count, 1)            # only the first within the window
-        self.assertEqual(self.svc._fail_suppressed, 4)  # the other 4 counted
+                t("h")
+        self.assertEqual(log.call_count, 1)             # only the first within the window
+        self.assertEqual(t._suppressed, 4)              # the other 4 counted
 
-    def test_emits_again_after_window_with_suppressed_count(self) -> None:
-        self.svc._fail_last = 1000.0
-        self.svc._fail_suppressed = 7
-        after = 1000.0 + self.svc._FAIL_LOG_EVERY
-        with mock.patch.object(self.svc.time, "monotonic", return_value=after), \
-                mock.patch.object(self.svc.logger, "warning") as warn:
-            self.svc._log_cache_fail("h")
-        warn.assert_called_once()
-        msg = warn.call_args[0][0] % warn.call_args[0][1:]
-        self.assertIn("7 similar suppressed", msg)
-        self.assertEqual(self.svc._fail_suppressed, 0)  # reset after emit
+    def test_emits_again_after_the_window_with_the_suppressed_count(self) -> None:
+        t = self._throttle()
+        t._last, t._suppressed = 1000.0, 7
+        with mock.patch.object(service.time, "monotonic",
+                               return_value=1000.0 + service._LOG_EVERY), \
+             mock.patch.object(service.logger, "log") as log:
+            t("h")
+        log.assert_called_once()
+        args = log.call_args[0]
+        self.assertIn("7 similar suppressed", args[1] % args[2:])
+        self.assertEqual(t._suppressed, 0)              # reset after emit
+
+    def test_the_window_boundary_is_inclusive(self) -> None:
+        """>= _LOG_EVERY emits: a strict > would stall a wave landing exactly on the tick."""
+        t = self._throttle()
+        t._last = 1000.0
+        for delta, expected in ((service._LOG_EVERY - 0.001, 0), (service._LOG_EVERY, 1)):
+            with self.subTest(delta=delta):
+                t._last = 1000.0
+                with mock.patch.object(service.time, "monotonic",
+                                       return_value=1000.0 + delta), \
+                     mock.patch.object(service.logger, "log") as log:
+                    t("h")
+                self.assertEqual(log.call_count, expected)
+
+    def test_a_suppressed_call_leaves_the_window_start_alone(self) -> None:
+        """Counting must not extend the window — otherwise sustained traffic logs NOTHING."""
+        t = self._throttle()
+        with mock.patch.object(service.time, "monotonic", return_value=1000.0), \
+             mock.patch.object(service.logger, "log"):
+            t("h")                                      # emits, sets _last = 1000.0
+        with mock.patch.object(service.time, "monotonic", return_value=1020.0), \
+             mock.patch.object(service.logger, "log"):
+            t("h")                                      # suppressed
+        self.assertEqual(t._last, 1000.0)
+
+    def test_exc_info_is_forwarded(self) -> None:
+        for exc_info in (True, False):
+            with self.subTest(exc_info=exc_info):
+                t = self._throttle(exc_info=exc_info)
+                with mock.patch.object(service.time, "monotonic", return_value=1000.0), \
+                     mock.patch.object(service.logger, "log") as log:
+                    t("h")
+                self.assertIs(log.call_args[1]["exc_info"], exc_info)
+
+
+class ResolveLoggerWiringTests(SimpleTestCase):
+    """Each call site gets the level and exc_info its comment claims.
+
+    Previously unpinned for two of the three: the whole point of splitting them is that an
+    unexpected cache-path error is LOUD (so a bug cannot masquerade as "slower") while expected
+    infra failure and a deliberate load-shed are not, and a shed carries no exception at all.
+    """
+
+    def test_levels_and_exc_info(self) -> None:
+        for name, level, exc_info in (
+            ("_log_cache_fail", logging.WARNING, True),
+            ("_log_cache_bug", logging.ERROR, True),
+            ("_log_shed", logging.WARNING, False),
+        ):
+            with self.subTest(name=name):
+                fn = getattr(service, name)
+                self.assertEqual(fn._level, level)
+                self.assertIs(fn._exc_info, exc_info)
+
+    def test_every_template_takes_the_host_then_the_suppressed_suffix(self) -> None:
+        """_ThrottledLog always passes (hostname, extra) in that order."""
+        for name in ("_log_cache_fail", "_log_cache_bug", "_log_shed"):
+            with self.subTest(name=name):
+                rendered = getattr(service, name)._template % ("h.example.com", " (2 similar)")
+                self.assertIn("'h.example.com'", rendered)
+                self.assertTrue(rendered.endswith(" (2 similar)"))
 
 
 class ConfigNamespaceTests(SimpleTestCase):
@@ -584,21 +615,32 @@ class ResolveFailOpenRoutingTests(SimpleTestCase):
         fail.assert_not_called()
 
 
-class BugLogThrottleTests(SimpleTestCase):
-    """_log_cache_bug throttles like _log_cache_fail but at ERROR level, with its OWN counter
-    so a bug is never masked by infra-warning noise."""
-    def setUp(self) -> None:
-        from tenants.resolver import service
-        self.svc = service
-        self.svc._bug_last = 0.0
-        self.svc._bug_suppressed = 0
-        self.addCleanup(setattr, self.svc, "_bug_last", 0.0)
-        self.addCleanup(setattr, self.svc, "_bug_suppressed", 0)
+class ResolveLoggerIndependenceTests(SimpleTestCase):
+    """Each call site keeps its OWN window and counter, so a bug is never masked by
+    infra-warning noise — the reason the three are separate rather than one shared throttle.
 
-    def test_first_logs_error_then_suppresses(self) -> None:
-        with mock.patch.object(self.svc.time, "monotonic", return_value=2000.0), \
-                mock.patch.object(self.svc.logger, "error") as err:
+    Drives the REAL module-level instances (restored on teardown), because the thing under
+    test is how they were wired, not _ThrottledLog itself.
+    """
+
+    SITES = ("_log_cache_fail", "_log_cache_bug", "_log_shed")
+
+    def setUp(self) -> None:
+        for name in self.SITES:
+            t = getattr(service, name)
+            self.addCleanup(setattr, t, "_last", t._last)
+            self.addCleanup(setattr, t, "_suppressed", t._suppressed)
+            t._last, t._suppressed = 0.0, 0
+
+    def test_each_site_throttles_on_its_own_counter(self) -> None:
+        with mock.patch.object(service.time, "monotonic", return_value=2000.0), \
+             mock.patch.object(service.logger, "log") as log:
             for _ in range(3):
-                self.svc._log_cache_bug("h")
-        self.assertEqual(err.call_count, 1)
-        self.assertEqual(self.svc._bug_suppressed, 2)
+                service._log_cache_bug("h")
+            service._log_cache_fail("h")      # a DIFFERENT site: still gets its first hit
+        self.assertEqual(log.call_count, 2)   # one per site, not one in total
+        self.assertEqual(service._log_cache_bug._suppressed, 2)
+        self.assertEqual(service._log_cache_fail._suppressed, 0)
+        self.assertEqual(service._log_shed._suppressed, 0)
+        self.assertEqual(log.call_args_list[0][0][0], logging.ERROR)     # the bug, LOUD
+        self.assertEqual(log.call_args_list[1][0][0], logging.WARNING)   # the infra failure

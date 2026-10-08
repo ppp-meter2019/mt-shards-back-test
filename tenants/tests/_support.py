@@ -24,6 +24,7 @@ class FakeNxCache:
 
     def __init__(self) -> None:
         self.store = {}
+        self.pattern_calls = []        # every delete_pattern() argument, in order
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.store.get(key, default)
@@ -45,10 +46,24 @@ class FakeNxCache:
         for k in keys:
             self.store.pop(k, None)
 
-    def delete_pattern(self, pattern: str) -> int:   # test double: only "*" is exercised
-        n = len(self.store)
-        self.store.clear()
-        return n
+    def delete_pattern(self, pattern: str) -> int:
+        """The `<prefix>*` subset of glob that this project actually passes.
+
+        The real django_redis delete_pattern SCANs `KEY_PREFIX:version:<pattern>` and deletes
+        only the matches, so the pattern is the ONLY thing that decides the scope. A double
+        that clears the whole store makes every prefix-scoped sweep look alike — sweeping one
+        namespace instead of two, or a mistyped prefix, both come out identical. forget_all()
+        passes two distinct non-"*" patterns, so that difference is the thing under test.
+
+        Anything beyond `<prefix>*` fails loudly rather than being silently approximated.
+        """
+        if not pattern.endswith("*") or "*" in pattern[:-1]:
+            raise AssertionError(f"unsimulated pattern {pattern!r} — extend this double")
+        self.pattern_calls.append(pattern)
+        victims = [k for k in self.store if k.startswith(pattern[:-1])]
+        for k in victims:
+            del self.store[k]
+        return len(victims)
 
 
 class FakeSetRedis:
@@ -141,3 +156,43 @@ def make_domain_model(tenant: Any) -> type:
     FakeDomain.objects = _Objects
     FakeDomain.db_calls = calls
     return FakeDomain
+
+
+class FakeLock:
+    """Stand-in for redis-py's Lock: records acquire/release; release() can raise LockError
+    to simulate a lock that expired while the holder was still working (no longer ours).
+
+    Shared by the two fenced locks in this project — the resolver's warm lock and the beat
+    fanout wave lock — so both are exercised against the same stand-in."""
+
+    def __init__(self, acquired: bool = True, release_raises: bool = False,
+                 release_error: Exception | None = None) -> None:
+        self._acquired = acquired
+        self._release_raises = release_raises       # LockError: the key is no longer ours
+        self._release_error = release_error         # anything else release() can raise
+        self.acquire_calls = 0
+        self.release_calls = 0
+
+    def acquire(self, blocking: bool = True, **kw: Any) -> bool:
+        self.acquire_calls += 1
+        return self._acquired
+
+    def release(self) -> None:
+        self.release_calls += 1
+        if self._release_raises:
+            from redis.exceptions import LockError
+            raise LockError("not owned")
+        if self._release_error is not None:
+            raise self._release_error
+
+
+class FakeLockRedis:
+    """Returns a preset FakeLock from .lock(); records the lock() call args."""
+
+    def __init__(self, lock: Any) -> None:
+        self._lock = lock
+        self.lock_calls = []
+
+    def lock(self, name: str, timeout: float | None = None, **kw: Any) -> Any:
+        self.lock_calls.append((name, timeout))
+        return self._lock

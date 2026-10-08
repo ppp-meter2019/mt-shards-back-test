@@ -18,10 +18,12 @@ from typing import TYPE_CHECKING, Any
 
 from celery import Task, current_app, shared_task
 from celery.utils.log import get_task_logger
-from django.core.cache import caches
+from kombu.exceptions import OperationalError
 from django.utils import timezone
+from redis.exceptions import LockError, RedisError
 
 from commons.platform.beat import FANOUT_TASK_NAME, beat_conf, task_queue
+from commons.platform.redis_client import django_redis_raw_client
 from commons.platform.tenancy import active_target_schemas, active_tenants_with_tz
 from tenants.models import TaskRun
 
@@ -60,17 +62,32 @@ def argsig(task_args: Sequence[Any] | None) -> str:
     return hashlib.md5(blob.encode(), usedforsecurity=False).hexdigest()[:12]
 
 
-def _acquire_lock(task_name: str, args_sig: str) -> bool:
-    """Overlap-lock (atomic cache.add == SETNX). Returns True if this wave may run; False if a
-    previous wave of the SAME (task, args) still holds the lock (a deliberate skip). If the
-    beat_lock Redis is DOWN, cache.add RAISES (IGNORE_EXCEPTIONS is off) and fanout_dispatch
-    fails LOUDLY — surfacing the outage instead of silently skipping.
+def _wave_lock(task_name: str, args_sig: str) -> Any:
+    """The overlap lock for one wave of (task, args), unacquired.
 
-    Takes the signature rather than the raw args so the lock and the TaskRun watermark are
-    keyed by one value computed once per wave — they must never disagree about what counts
-    as "the same schedule entry"."""
+    redis-py's Lock, not cache.add: `add` is SETNX+TTL with no way to release only-if-ours, so
+    the previous implementation never released at all. The lock then lived its full TTL
+    regardless of how long the wave took, which turned an overlap lock into a rate limiter —
+    any interval entry shorter than LOCK_SECONDS silently fanned out once per LOCK_SECONDS,
+    and both documented examples (5s and 30s) were capped at 60.
+
+    Releasing is fenced: Lock.release() runs a Lua compare-and-delete against the token
+    acquire() minted, so a wave that outlived its TTL cannot delete the lock a LATER wave now
+    holds — which would let a third start on top of two and cascade. Same construct as
+    tenants/resolver/registry.py::run_locked; two fenced locks in one codebase should look
+    alike.
+
+    TTL keeps one job only: the crash backstop. A worker killed mid-wave never reaches the
+    finally, and LOCK_SECONDS bounds how long that blocks the schedule.
+
+    Keyed on the SIGNATURE rather than the raw args so the lock and the TaskRun watermark use
+    one value computed once per wave — they must never disagree about what counts as "the same
+    schedule entry". The beat_lock alias is the BROKER Redis (noeviction): an app cache on
+    allkeys-lru could simply evict a lock.
+    """
     key = "beat:fanout:%s:%s" % (task_name, args_sig)
-    return bool(caches["beat_lock"].add(key, "1", timeout=beat_conf("LOCK_SECONDS")))
+    client = django_redis_raw_client("beat_lock")
+    return client.lock(key, timeout=beat_conf("LOCK_SECONDS"))
 
 
 def _due_by_tenant_tz(task_name: str, args_sig: str, cron: str, now: "datetime",
@@ -120,10 +137,43 @@ def fanout_dispatch(task_name: str, scope: str = "tenants", cron: str | None = N
     # ONE signature per wave, shared by the lock, the due-check and the watermark. Computing
     # it in each place instead would make three copies of "which schedule entry is this".
     args_sig = argsig(task_args)
-    if not _acquire_lock(task_name, args_sig):
+    lock = _wave_lock(task_name, args_sig)
+    if not lock.acquire(blocking=False):
         logger.info("fanout_dispatch: %s skipped (overlapping wave)", task_name)
         return {"skipped": "overlapping"}
+    try:
+        return _fan_out(task_name, scope, cron, grace, task_args, task_kwargs,
+                        task_options, batch_size, args_sig)
+    finally:
+        # Both arms swallow deliberately. By the time this runs the wave has ALREADY dispatched
+        # every sub_dispatch, so an exception escaping here would discard a successful result
+        # and report fanout as broken — see the ORDER: `return _fan_out(...)` evaluates the
+        # body in full, stashes the value, and only then runs this block. Narrow on purpose:
+        # LockError is a subclass of RedisError, so its arm comes first, and anything that is
+        # neither is a bug in our own code and must still crash.
+        try:
+            lock.release()
+        except LockError:
+            # The wave outlived LOCK_SECONDS, so a LATER wave may already hold this key and it
+            # is not ours to delete. Releasing regardless would take that wave's lock and let a
+            # third start — a cascade of concurrent waves, the exact failure the lock prevents.
+            # Worth a warning: it means dispatch is slower than its own lock TTL.
+            logger.warning("fanout_dispatch: %s lock expired before release", task_name,
+                           exc_info=True)
+        except RedisError:
+            # Redis went away between acquire and release — release() runs a Lua script, so it
+            # is a network call. The key expires on its own via LOCK_SECONDS; the cost is one
+            # wave's worth of delay, not a lost dispatch. ERROR rather than WARNING: a broker
+            # that drops mid-wave is an outage, not a slow tick.
+            logger.error("fanout_dispatch: %s could not release its lock (redis unreachable)",
+                         task_name, exc_info=True)
 
+
+def _fan_out(task_name: str, scope: str, cron: str | None, grace: float | None,
+             task_args: Sequence[Any] | None, task_kwargs: dict[str, Any] | None,
+             task_options: dict[str, Any] | None, batch_size: int | None,
+             args_sig: str) -> dict[str, Any]:
+    """The wave itself, extracted so fanout_dispatch is just lock / body / fenced release."""
     batch_size = batch_size or beat_conf("BATCH_SIZE")
     if cron:                                    # calendar → per-tenant tz due-check
         now = timezone.now()
@@ -154,17 +204,35 @@ def sub_dispatch(task_name: str, schemas: Sequence[str], task_args: Sequence[Any
     # the broker's JSON round-trip by the time either side sees them.
     if args_sig is None:
         args_sig = argsig(task_args)
+    # `options` is a legitimate part of a beat entry and the fanout design promises to carry it
+    # through, so it may legally contain `headers` — which used to COLLIDE with ours:
+    # send_task(..., headers={...}, **options) raised "got multiple values for keyword argument
+    # 'headers'". That TypeError was deterministic, so it hit every schema on every tick while
+    # the loop below logged it as transient; fanout_dispatch still reported a clean wave, and
+    # for calendar entries the watermark never advanced, so the occurrence retried until grace
+    # expired and then vanished. Merge instead, with OUR key stamped LAST so a schedule entry
+    # cannot override the schema the task will run in.
+    options = dict(task_options or {})
+    caller_headers = options.pop("headers", None) or {}
     sent = []
     for schema in schemas:
         try:
             current_app.send_task(
                 task_name, args=task_args or [], kwargs=task_kwargs or {},
-                headers={"_schema_name": schema}, **(task_options or {}),
+                headers={**caller_headers, "_schema_name": schema}, **options,
             )
             sent.append(schema)
-        except Exception:
+        except OperationalError:
+            # Broker unreachable / connection lost: genuinely transient, and the next tick is
+            # the right retry. The only exception class this loop may swallow.
             logger.exception("sub_dispatch: send failed for schema %r "
                              "(will be retried next tick)", schema)
+        except Exception:
+            # Anything else is deterministic — a bad `options` key, a serialisation failure —
+            # and will fail identically on every schema and every tick. Re-raise so the task is
+            # marked FAILED instead of reporting a wave that silently delivered nothing.
+            logger.exception("sub_dispatch: %s cannot be sent (not retryable)", task_name)
+            raise
     # Calendar tasks only: advance the watermark for successfully-sent schemas
     # (at-least-once — mark AFTER send). Interval tasks pass run_ts=None.
     if run_ts and sent:

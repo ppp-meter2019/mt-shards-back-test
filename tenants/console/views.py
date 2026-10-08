@@ -235,7 +235,7 @@ class TenantViewSet(viewsets.ModelViewSet):
         # ACTIVE-tenant set fresh on every tick.
         instance.delete()
         if drop:
-            from .tasks import drop_tenant_schema_task
+            from tenants.tasks import drop_tenant_schema_task
             drop_tenant_schema_task.delay(alias, schema)
 
     # -------------------------------------------------------------------
@@ -305,7 +305,7 @@ class TenantViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_409_CONFLICT,
             )
-        from .tasks import provision_tenant
+        from tenants.tasks import provision_tenant
         provision_tenant.delay(tenant.id)
         return Response(
             {"detail": "Provisioning queued.", "schema": tenant.schema_name},

@@ -8,7 +8,9 @@ from unittest import mock
 from django.core.exceptions import ImproperlyConfigured
 from django.test import SimpleTestCase, override_settings
 from celery.schedules import crontab, schedule as interval_schedule
+from kombu.exceptions import OperationalError
 
+from ._support import FakeLock, FakeLockRedis
 from commons.platform.beat import _classify_schedule, _crontab_to_cronspec, scoped_schedule, scope_of
 from commons.platform.beat import task_queue
 from tenants import checks
@@ -107,14 +109,14 @@ class FanoutDispatchTests(SimpleTestCase):
         self.assertNotEqual(dispatch.argsig([7]), "")
 
     def test_overlap_lock_skips(self) -> None:
-        with mock.patch("tenants.celery.dispatch._acquire_lock", return_value=False), \
+        with mock.patch("tenants.celery.dispatch._wave_lock", return_value=FakeLock(acquired=False)), \
              mock.patch.object(dispatch.sub_dispatch, "delay") as delay:
             out = dispatch.fanout_dispatch.run("app.t", scope="tenants")
         self.assertEqual(out, {"skipped": "overlapping"})
         delay.assert_not_called()
 
     def test_interval_fans_out_all_in_one_batch(self) -> None:
-        with mock.patch("tenants.celery.dispatch._acquire_lock", return_value=True), \
+        with mock.patch("tenants.celery.dispatch._wave_lock", return_value=FakeLock()), \
              mock.patch("tenants.celery.dispatch.active_target_schemas",
                         return_value=["a", "b", "c"]), \
              mock.patch.object(dispatch.sub_dispatch, "delay") as delay:
@@ -124,7 +126,7 @@ class FanoutDispatchTests(SimpleTestCase):
         self.assertEqual(delay.call_args.args[1], ["a", "b", "c"])  # schemas batch
 
     def test_interval_batches(self) -> None:
-        with mock.patch("tenants.celery.dispatch._acquire_lock", return_value=True), \
+        with mock.patch("tenants.celery.dispatch._wave_lock", return_value=FakeLock()), \
              mock.patch("tenants.celery.dispatch.active_target_schemas",
                         return_value=["a", "b", "c", "d", "e"]), \
              mock.patch.object(dispatch.sub_dispatch, "delay") as delay:
@@ -132,7 +134,7 @@ class FanoutDispatchTests(SimpleTestCase):
         self.assertEqual(delay.call_count, 3)                  # 2 + 2 + 1
 
     def test_calendar_fans_out_due_subset_with_run_ts(self) -> None:
-        with mock.patch("tenants.celery.dispatch._acquire_lock", return_value=True), \
+        with mock.patch("tenants.celery.dispatch._wave_lock", return_value=FakeLock()), \
              mock.patch("tenants.celery.dispatch._due_by_tenant_tz",
                         return_value=["a", "b"]) as due, \
              mock.patch.object(dispatch.sub_dispatch, "delay") as delay:
@@ -159,8 +161,12 @@ class SameTaskDifferentArgsTests(SimpleTestCase):
     def test_lock_and_watermark_use_the_same_signature(self) -> None:
         """The two must never disagree about what 'the same schedule entry' is."""
         seen = {}
-        with mock.patch("tenants.celery.dispatch._acquire_lock",
-                        side_effect=lambda n, sig: seen.setdefault("lock", sig) or True), \
+
+        def _record_lock(task_name, sig):
+            seen["lock"] = sig
+            return FakeLock()
+
+        with mock.patch("tenants.celery.dispatch._wave_lock", side_effect=_record_lock), \
              mock.patch("tenants.celery.dispatch._due_by_tenant_tz",
                         side_effect=lambda n, sig, *a: seen.setdefault("due", sig) or ["a"]), \
              mock.patch.object(dispatch.sub_dispatch, "delay") as delay:
@@ -216,9 +222,12 @@ class SubDispatchTests(SimpleTestCase):
         self.assertEqual(first.kwargs["kwargs"], {"x": 2})
 
     def test_send_failure_is_counted_not_marked(self) -> None:
+        """OperationalError, not a bare Exception: only a TRANSIENT broker failure is counted
+        and retried next tick. A deterministic one now propagates — see
+        SubDispatchOptionsTests.test_a_deterministic_failure_is_raised_not_swallowed."""
         with mock.patch("tenants.celery.dispatch.current_app") as app, \
              mock.patch.object(dispatch.TaskRun, "mark_ran") as mark:
-            app.send_task.side_effect = [None, RuntimeError("broker hiccup")]
+            app.send_task.side_effect = [None, OperationalError("broker hiccup")]
             out = dispatch.sub_dispatch.run("app.t", ["alpha", "beta"])
         self.assertEqual(out, {"task": "app.t", "sent": 1, "requested": 2})
         mark.assert_not_called()                       # interval (run_ts None) never marks
@@ -226,7 +235,7 @@ class SubDispatchTests(SimpleTestCase):
     def test_calendar_marks_taskrun_for_sent_only(self) -> None:
         with mock.patch("tenants.celery.dispatch.current_app") as app, \
              mock.patch.object(dispatch.TaskRun, "mark_ran") as mark:
-            app.send_task.side_effect = [None, RuntimeError("hiccup")]
+            app.send_task.side_effect = [None, OperationalError("hiccup")]
             dispatch.sub_dispatch.run("app.daily", ["alpha", "beta"], run_ts="2026-06-15T08:00:30+00:00")
         # keyed by args_sig as well as task — see TaskRun / migration 0008
         mark.assert_called_once_with("app.daily", dispatch.argsig(None), ["alpha"],
@@ -431,3 +440,195 @@ class FanoutEntryUniquenessTests(SimpleTestCase):
                            "d": _cal([1]), "e": _cal([1]),
                            "f": _cal([9])})
         self.assertEqual(len(errs), 2)                      # two groups, one lone entry
+
+
+class WaveLockTests(SimpleTestCase):
+    """The lock BODY — never exercised before, which is why the missing release survived.
+
+    _acquire_lock used to be mocked at all five of its call sites, so `cache.add` with a TTL
+    and no release never ran in the suite. The consequence was invisible: an overlap lock that
+    is never released is a rate limiter at LOCK_SECONDS, and every interval entry shorter than
+    60s silently fanned out once per minute.
+    """
+
+    def _lock_for(self, fake):
+        with mock.patch("tenants.celery.dispatch.django_redis_raw_client", return_value=fake):
+            return dispatch._wave_lock("app.push", "abc123")
+
+    def test_locks_the_signature_keyed_name_on_the_beat_lock_alias(self) -> None:
+        """Key = beat:fanout:<task>:<argsig> — no cron, no scope. tenants.E006 relies on that
+        exact shape to reject two entries that would suppress each other."""
+        fake = FakeLockRedis(FakeLock())
+        with mock.patch("tenants.celery.dispatch.django_redis_raw_client", return_value=fake) as client:
+            dispatch._wave_lock("app.push", "abc123")
+        client.assert_called_once_with("beat_lock")
+        name, timeout = fake.lock_calls[0]
+        self.assertEqual(name, "beat:fanout:app.push:abc123")
+        self.assertEqual(timeout, 60)                      # LOCK_SECONDS default
+
+    @override_settings(TENANT_BEAT={"LOCK_SECONDS": 7})
+    def test_ttl_follows_the_setting(self) -> None:
+        fake = FakeLockRedis(FakeLock())
+        self._lock_for(fake)
+        self.assertEqual(fake.lock_calls[0][1], 7)
+
+    def test_a_finished_wave_releases_so_the_next_tick_is_not_skipped(self) -> None:
+        """The whole point of the fix: release on the way out, so a 50ms wave does not hold
+        the key for the full TTL and starve a 5s schedule down to one run a minute."""
+        lock = FakeLock(acquired=True)
+        with mock.patch("tenants.celery.dispatch._wave_lock", return_value=lock), \
+             mock.patch("tenants.celery.dispatch.active_target_schemas", return_value=["a"]), \
+             mock.patch.object(dispatch.sub_dispatch, "delay"):
+            out = dispatch.fanout_dispatch.run("app.push")
+        self.assertEqual(out["fanned_out"], 1)
+        self.assertEqual(lock.release_calls, 1)
+
+    def test_a_wave_that_raises_still_releases(self) -> None:
+        lock = FakeLock(acquired=True)
+        with mock.patch("tenants.celery.dispatch._wave_lock", return_value=lock), \
+             mock.patch("tenants.celery.dispatch.active_target_schemas",
+                        side_effect=RuntimeError("db down")):
+            with self.assertRaises(RuntimeError):
+                dispatch.fanout_dispatch.run("app.push")
+        self.assertEqual(lock.release_calls, 1)
+
+    def test_a_held_lock_skips_without_releasing_it(self) -> None:
+        """Never release a lock we did not take — that is someone else's wave."""
+        lock = FakeLock(acquired=False)
+        with mock.patch("tenants.celery.dispatch._wave_lock", return_value=lock), \
+             mock.patch.object(dispatch.sub_dispatch, "delay") as delay:
+            out = dispatch.fanout_dispatch.run("app.push")
+        self.assertEqual(out, {"skipped": "overlapping"})
+        delay.assert_not_called()
+        self.assertEqual(lock.release_calls, 0)
+
+    def test_an_expired_lock_logs_a_warning_and_does_not_propagate(self) -> None:
+        """A wave slower than LOCK_SECONDS has already lost the key to a later wave. Releasing
+        anyway would delete THAT wave's lock and let a third start, so redis-py refuses and we
+        log instead of failing the task.
+
+        The LEVEL and the message are asserted, not just the return value: LockError is a
+        subclass of RedisError, so swapping the two arms would make the RedisError one catch
+        both and report a merely-slow wave as a broker outage — pointing on-call at the wrong
+        subsystem while every test still passed on the return value alone."""
+        lock = FakeLock(acquired=True, release_raises=True)
+        with mock.patch("tenants.celery.dispatch._wave_lock", return_value=lock), \
+             mock.patch("tenants.celery.dispatch.active_target_schemas", return_value=["a"]), \
+             mock.patch.object(dispatch.sub_dispatch, "delay"):
+            with self.assertLogs("tenants.celery.dispatch", level="WARNING") as logs:
+                out = dispatch.fanout_dispatch.run("app.push")      # must NOT raise
+        self.assertEqual(out["fanned_out"], 1)
+        self.assertEqual(logs.records[0].levelname, "WARNING")
+        self.assertIn("expired before release", logs.output[0])
+
+    def test_a_redis_outage_during_release_does_not_lose_the_result(self) -> None:
+        """release() runs a Lua script, so it is a network call. By then the wave has already
+        dispatched — letting ConnectionError out would turn a successful fanout into a failed
+        task and point the on-call at the wrong subsystem."""
+        from redis.exceptions import ConnectionError as RedisConnectionError
+        lock = FakeLock(acquired=True, release_error=RedisConnectionError("gone"))
+        with mock.patch("tenants.celery.dispatch._wave_lock", return_value=lock), \
+             mock.patch("tenants.celery.dispatch.active_target_schemas", return_value=["a"]), \
+             mock.patch.object(dispatch.sub_dispatch, "delay"):
+            with self.assertLogs("tenants.celery.dispatch", level="ERROR") as logs:
+                out = dispatch.fanout_dispatch.run("app.push")  # must NOT raise
+        self.assertEqual(out["fanned_out"], 1)
+        self.assertEqual(logs.records[0].levelname, "ERROR")
+        self.assertIn("redis unreachable", logs.output[0])
+
+    def test_a_bug_in_our_own_code_still_crashes(self) -> None:
+        """The two arms are narrow on purpose: a non-Redis exception from release() is a defect
+        here, not an outage, and swallowing it would hide it forever."""
+        lock = FakeLock(acquired=True, release_error=TypeError("bad call"))
+        with mock.patch("tenants.celery.dispatch._wave_lock", return_value=lock), \
+             mock.patch("tenants.celery.dispatch.active_target_schemas", return_value=["a"]), \
+             mock.patch.object(dispatch.sub_dispatch, "delay"):
+            with self.assertRaises(TypeError):
+                dispatch.fanout_dispatch.run("app.push")
+
+
+class SubDispatchOptionsTests(SimpleTestCase):
+    """`options` is forwarded from the beat entry, so it may legally carry keys of its own.
+
+    `headers` used to collide with the schema stamp and raise TypeError — deterministically, on
+    every schema and every tick — while the loop logged it as transient and fanout_dispatch
+    reported a clean wave. For calendar entries the watermark never advanced, so the occurrence
+    retried until grace expired and then disappeared with no record.
+    """
+
+    def _send(self, options, schemas=("acme", "beta"), run_ts=None):
+        with mock.patch.object(dispatch.current_app, "send_task") as send, \
+             mock.patch.object(dispatch.TaskRun, "mark_ran") as mark:
+            out = dispatch.sub_dispatch.run("app.push", list(schemas), None, None,
+                                            options, run_ts, "sig")
+        return out, send, mark
+
+    def test_caller_headers_are_merged_not_collided(self) -> None:
+        out, send, _ = self._send({"queue": "slow", "headers": {"x-trace": "1"}})
+        self.assertEqual(out["sent"], 2)
+        for call, schema in zip(send.call_args_list, ("acme", "beta")):
+            self.assertEqual(call.kwargs["headers"], {"x-trace": "1", "_schema_name": schema})
+            self.assertEqual(call.kwargs["queue"], "slow")       # other options still forwarded
+
+    def test_our_stamp_wins_over_a_caller_supplied_one(self) -> None:
+        """A schedule entry must not be able to choose which tenant its task runs in."""
+        out, send, _ = self._send({"headers": {"_schema_name": "attacker"}}, schemas=("acme",))
+        self.assertEqual(out["sent"], 1)
+        self.assertEqual(send.call_args.kwargs["headers"]["_schema_name"], "acme")
+
+    def test_options_without_headers_still_work(self) -> None:
+        _, send, _ = self._send({"queue": "slow", "priority": 3}, schemas=("acme",))
+        self.assertEqual(send.call_args.kwargs["headers"], {"_schema_name": "acme"})
+        self.assertEqual(send.call_args.kwargs["priority"], 3)
+
+    def test_a_broker_outage_is_swallowed_and_retried_next_tick(self) -> None:
+        from kombu.exceptions import OperationalError
+        with mock.patch.object(dispatch.current_app, "send_task",
+                               side_effect=OperationalError("broker gone")), \
+             mock.patch.object(dispatch.TaskRun, "mark_ran") as mark:
+            out = dispatch.sub_dispatch.run("app.push", ["acme"], None, None, None,
+                                            "2026-01-01T00:00:00", "sig")
+        self.assertEqual(out, {"task": "app.push", "sent": 0, "requested": 1})
+        mark.assert_not_called()                      # watermark must not advance on a miss
+
+    def test_a_deterministic_failure_is_raised_not_swallowed(self) -> None:
+        """Re-raising is the point: a bad options key would otherwise report a clean wave that
+        delivered nothing, forever."""
+        with mock.patch.object(dispatch.current_app, "send_task",
+                               side_effect=TypeError("multiple values for 'args'")), \
+             mock.patch.object(dispatch.TaskRun, "mark_ran"):
+            with self.assertRaises(TypeError):
+                dispatch.sub_dispatch.run("app.push", ["acme"], None, None, None, None, "sig")
+
+
+class OptionsCollisionCheckTests(SimpleTestCase):
+    """tenants.E009 — say it at deploy time, not on the first tick."""
+
+    def _run(self, options):
+        entry = scoped_schedule({"task": "app.push", "schedule": 30.0, "options": options},
+                                scope="tenants")
+        with override_settings(CELERY_BEAT_SCHEDULE={"e": entry}):
+            from tenants.checks.beat import fanout_options_do_not_collide
+            return fanout_options_do_not_collide(None)
+
+    def test_delivery_options_pass(self) -> None:
+        self.assertEqual(self._run({"queue": "slow", "priority": 3, "expires": 60}), [])
+
+    def test_headers_pass_because_sub_dispatch_merges_them(self) -> None:
+        self.assertEqual(self._run({"headers": {"x-trace": "1"}}), [])
+
+    def test_args_collides(self) -> None:
+        errors = self._run({"args": [1]})
+        self.assertEqual([e.id for e in errors], ["tenants.E009"])
+        self.assertIn("'args'", errors[0].msg)
+
+    def test_kwargs_collides(self) -> None:
+        self.assertEqual([e.id for e in self._run({"kwargs": {"a": 1}})], ["tenants.E009"])
+
+    def test_public_scope_is_not_checked(self) -> None:
+        """A public entry goes to stock beat untouched — no sub_dispatch, no collision."""
+        entry = scoped_schedule({"task": "app.push", "schedule": 30.0, "options": {"args": [1]}},
+                                scope="public")
+        with override_settings(CELERY_BEAT_SCHEDULE={"e": entry}):
+            from tenants.checks.beat import fanout_options_do_not_collide
+            self.assertEqual(fanout_options_do_not_collide(None), [])

@@ -25,7 +25,6 @@ from .settings_base import *  # noqa: F401,F403
 from .settings_base import (
     _BUSINESS_APPS,
     _DJANGO_APPS,
-    _PUBLIC_MODEL_ALLOWLIST,
     _THIRD_PARTY_APPS,
 )
 
@@ -41,7 +40,7 @@ SHARED_APPS = [
     *_DJANGO_APPS,
     *_THIRD_PARTY_APPS,
     # EVERY per-tenant app, so that every FK target exists when the identity table is created
-    # here. Their tables stay empty: only settings_base._PUBLIC_MODEL_ALLOWLIST may be
+    # here. Their tables stay empty: only _PUBLIC_MODEL_ALLOWLIST below may be
     # touched on this schema, and tenants.routers refuses the rest.
     *_BUSINESS_APPS,
 ]
@@ -115,9 +114,63 @@ DATABASE_ROUTERS = [
 # because a setting nothing may mutate at runtime is the honest type for it.
 TENANT_STRICT_ROUTE_APPS = frozenset(_BUSINESS_APPS)
 
-# Runtime-readable promotion of the merge-seam list (settings_base). Underscored at the
-# source because it is a settings-build INGREDIENT; public here because the ROUTER reads it
-# per call, in tenants.routers._guard_public. Immutable: nothing may rewrite it at runtime.
+# ---------------------------------------------------------------------------
+# The MERGE seam — the one list the host merge edits.
+# ---------------------------------------------------------------------------
+
+# Models that may be USED on the public schema.
+#
+# EVERY per-tenant app has its tables in public (settings_multitenant.py splices all of
+# _BUSINESS_APPS into SHARED_APPS), because the platform operator is a row in the
+# AUTH_USER_MODEL table and Django cannot create that table without every app its model
+# reaches through a relation. Marking only the FK closure would work too, but the closure has
+# to be COMPUTED and can be computed WRONG — and a half closure does not misbehave, it fails
+# `migrate_schemas --shared` at CREATE TABLE on a real cluster. Sharing all of them makes the
+# question disappear: every FK target is present by construction.
+#
+# The price is empty tables in public (~311 models at merge instead of ~236) and the
+# contenttype / permission rows that come with them. They cost nothing to hold; the one real
+# cost is that the public admin's permission widgets list them, which is a display filter to
+# be written, not a correctness problem.
+#
+# So the ONLY thing that still has to be decided per model is this: which of those tables may
+# actually be touched on public. Everything absent from this list is structure, and a query
+# against it there is a bug the router refuses (tenants.routers._guard_public).
+#
+# Today: the operator's identity plus the two through tables its group / permission
+# assignments live in (the public admin registers Group, so those rows are real).
+#
+# An entry's app need not be per-tenant at all — a genuinely shared app (django.contrib.*,
+# third-party) has its tables in public anyway. At merge django_password_history is that case:
+# UserPasswordHistory needs rows, and the app rides in on _THIRD_PARTY_APPS.
+#
+# The merge set is a MEASUREMENT, not a decision: run createsuperuser / login / the admin
+# against public with PUBLIC_MODEL_GUARD="warn" and read off what it logs. Known starting
+# points: accounts.driverprofile (User.save() probes it), accounts.staffprofile
+# (create_superuser), commons.change (the post_save audit hook).
+#
+#
+# MULTITENANT-ONLY by nature, hence here and not in the base: "the public schema" is a
+# multi-tenant concept, nothing promotes this list in standalone, and its only reader —
+# tenants.routers._guard_public — lives in an app standalone does not install.
+#
+# Defined AFTER settings_base has run, so AUTH_USER_MODEL is already bound and the first three
+# entries derive from it. rsplit, not split: AUTH_USER_MODEL is "<app_label>.<ModelName>", and
+# taking the label from the END survives a host that writes a full package path there.
+# Deriving them is a CONVENIENCE, not a safety mechanism — getting them wrong surfaces as a
+# refused admin login naming the exact string to add, never as a silent wrong answer.
+#
+# Lower-cased "app_label.modelname" — the form Model._meta.label_lower returns.
+_AUTH_APP, _AUTH_NAME = AUTH_USER_MODEL.lower().rsplit(".", 1)
+_PUBLIC_MODEL_ALLOWLIST = [
+    f"{_AUTH_APP}.{_AUTH_NAME}",
+    f"{_AUTH_APP}.{_AUTH_NAME}_groups",
+    f"{_AUTH_APP}.{_AUTH_NAME}_user_permissions",
+]
+
+# Runtime-readable promotion of the list above. Underscored at the source because it is a
+# settings-build INGREDIENT; public here because the ROUTER reads it per call, in
+# tenants.routers._guard_public. Immutable: nothing may rewrite it at runtime.
 #
 # The other half of that guard — WHICH apps it polices — is TENANT_STRICT_ROUTE_APPS above.
 # One set, three router behaviours: refuse a contextless query, skip data migrations on
@@ -297,7 +350,7 @@ _MT_INSERTS = {
         "tenants.middleware.TenantShardRoutingMiddleware",
     ),
     "django.contrib.auth.middleware.AuthenticationMiddleware": (
-        "users.middleware.SchemaBoundSessionMiddleware",
+        "tenants.auth.session.SchemaBoundSessionMiddleware",
     ),
 }
 # Rebuild in ONE pass over the base list: keep each middleware, then append any inserts
@@ -312,7 +365,7 @@ MIDDLEWARE = [mw for base_mw in MIDDLEWARE
 # claim != the request's tenant, so a token cannot be reused across tenants (CRITICAL #2).
 # ---------------------------------------------------------------------------
 REST_FRAMEWORK = {**REST_FRAMEWORK, "DEFAULT_AUTHENTICATION_CLASSES": (
-    "users.authentication.SchemaBoundJWTAuthentication",
+    "tenants.auth.jwt.SchemaBoundJWTAuthentication",
 )}
 
 
@@ -345,7 +398,7 @@ REST_FRAMEWORK = {**REST_FRAMEWORK, "DEFAULT_AUTHENTICATION_CLASSES": (
 #                   cached_db.delete() clears only the CURRENT schema's key — so invalidation
 #                   would be narrower than the thing invalidated. The isolation it would buy
 #                   is zero: cross-tenant reuse is rejected by
-#                   users.middleware.SchemaBoundSessionMiddleware, and a per-schema key never
+#                   tenants.auth.session.SchemaBoundSessionMiddleware, and a per-schema key never
 #                   prevented the load anyway (a miss falls through to the same shared table).
 #   tenant_resolve  resolution runs BEFORE the schema is known (see its own block below).
 #   beat_lock       set and checked in the public-context dispatcher (see its block below).
@@ -439,7 +492,7 @@ CACHES = {
     },
 
     # Cross-tenant coordination cache for the fanout overlap-lock
-    # (tenants.celery.dispatch._acquire_lock). Points at the BROKER Redis, which is NOEVICTION
+    # (tenants.celery.dispatch._wave_lock). Points at the BROKER Redis, which is NOEVICTION
     # — a lock here is never dropped under memory pressure (the app `default` cache is
     # allkeys-lru, where an evicted lock mid-wave would let fan-outs overlap). Tenant-agnostic
     # by construction: a STATIC KEY_PREFIX, never a per-tenant KEY_FUNCTION (the lock is

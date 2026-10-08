@@ -7,10 +7,23 @@ from rest_framework.views import APIView
 
 
 class IsTenantAdminOnPublic(BasePermission):
-    """Only tenant-administrators authenticated on the public schema may use
-    this endpoint. We check both the role and that we are actually on the
-    public schema — a company-admin with role accidentally set to
-    'tenant_admin' on a tenant DB shouldn't be able to manage tenants."""
+    """Only tenant-administrators authenticated on the public schema may use this endpoint.
+
+    The ROLE check is the live barrier: the public schema has its own auth_user, anyone who
+    can log in there reaches this permission, and only `tenant_admin` may pass.
+
+    The SCHEMA check is a second line of defence, not the first one. Every endpoint using this
+    class is registered in tenants_back/urls_public.py, which django-tenants mounts as
+    PUBLIC_SCHEMA_URLCONF; ROOT_URLCONF (urls_tenant.py) does not route them, so from a tenant
+    host these URLs do not resolve at all and no permission runs. The check holds the invariant
+    for the paths routing does not cover — a view mounted in both URLconfs, a direct call, a
+    future management endpoint added to the tenant side — and it is what makes "manage tenants"
+    impossible for a company-admin whose role was somehow set to 'tenant_admin' on a tenant DB.
+
+    Order matters: authentication is checked FIRST because AnonymousUser has no `.role`, so
+    reaching the last line with one would raise AttributeError (a 500, not a denial).
+    See tenants/tests/test_permissions.py.
+    """
 
     message = "Only tenant administrators on the management host may access this."
 

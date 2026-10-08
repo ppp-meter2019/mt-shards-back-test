@@ -38,6 +38,16 @@ def headers_with_schema(headers: Optional[dict]) -> dict:
     if headers and "_schema_name" in headers:
         return headers
     headers = copy.deepcopy(headers) if headers else {}
+    # Fails LOUD on an unexpected error (a bad alias / connection state = a bug): silently
+    # returning public would mis-stamp the outgoing task, and the receiving worker
+    # (TenantTask.__call__) would enter that tenant in full -- no error, wrong tenant.
+    #
+    # A PUBLIC answer here is legitimate, not a fallback: trigger_warm() enqueues a reconcile
+    # from inside ShardAwareTenantMiddleware, before the routing axis is bound. It only HAPPENS
+    # to be public today because upstream resets the schema on the first line of
+    # process_request; after set_tenant() the very same read would stamp the tenant being
+    # served onto an unrelated task. That is why current_schema_name() answers the unbound case
+    # explicitly instead of reading connections["default"].
     headers["_schema_name"] = current_schema_name()
     return headers
 
