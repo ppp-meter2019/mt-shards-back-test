@@ -276,6 +276,63 @@ class DueByTenantTzTests(SimpleTestCase):
         self.assertEqual(self._due(tenants, _utc(2026, 6, 15, 5, 0, 30), 300), ["a"])
 
 
+class DroppedOccurrenceWarningTests(SimpleTestCase):
+    """The grace skip is DESIGNED (§3.1) but used to be invisible: the only trace was a
+    TaskRun row that stopped advancing. These pin the warning AND both guards that keep it
+    from becoming a per-tick, per-tenant flood — a log nobody can read is the same as none."""
+
+    LOG = "tenants.celery.dispatch"
+
+    def _due(self, tenants: Any, now: datetime, grace: float, last: Any = None) -> list[str]:
+        with mock.patch("tenants.celery.dispatch.active_tenants_with_tz", return_value=tenants), \
+             mock.patch.object(dispatch.TaskRun, "load_map", return_value=last or {}):
+            return dispatch._due_by_tenant_tz("t", dispatch.argsig(None),
+                                              "0 8 * * *", now, grace)
+
+    def test_warns_when_a_known_tenant_passes_grace_undispatched(self) -> None:
+        last = {"a": _utc(2026, 6, 14, 8, 0, 0)}                 # ran yesterday, not today
+        with self.assertLogs(self.LOG, level="WARNING") as logs:
+            due = self._due([("a", "UTC")], _utc(2026, 6, 15, 8, 6, 0), 300, last)
+        self.assertEqual(due, [])
+        self.assertEqual(logs.records[0].levelname, "WARNING")
+        self.assertIn("occurrence DROPPED", logs.output[0])
+        self.assertIn("1 tenant(s)", logs.output[0])
+
+    def test_silent_for_a_tenant_that_never_ran_this_entry(self) -> None:
+        """A newly added schedule entry would otherwise report a miss for EVERY tenant on
+        EVERY tick until its first occurrence — the same case test_no_retroactive_fire_on_deploy
+        pins for the dispatch decision."""
+        with mock.patch.object(dispatch.logger, "warning") as warn:
+            self.assertEqual(self._due([("a", "UTC")], _utc(2026, 6, 15, 9, 0, 0), 300), [])
+        warn.assert_not_called()
+
+    def test_silent_once_past_the_band(self) -> None:
+        """t_fire does not move until the next occurrence, so without an upper bound one
+        missed daily task logs on every tick for the rest of the day."""
+        last = {"a": _utc(2026, 6, 14, 8, 0, 0)}
+        with mock.patch.object(dispatch.logger, "warning") as warn:
+            # 20 min past the 08:00 occurrence: > 2 * grace (600s)
+            self.assertEqual(self._due([("a", "UTC")], _utc(2026, 6, 15, 8, 20, 0), 300, last), [])
+        warn.assert_not_called()
+
+    def test_silent_while_still_within_grace(self) -> None:
+        """Inside grace the occurrence is still DUE, not dropped — warning here would fire on
+        the very tick that dispatches it."""
+        last = {"a": _utc(2026, 6, 14, 8, 0, 0)}
+        with mock.patch.object(dispatch.logger, "warning") as warn:
+            self.assertEqual(self._due([("a", "UTC")], _utc(2026, 6, 15, 8, 4, 0), 300, last), ["a"])
+        warn.assert_not_called()
+
+    def test_one_line_for_the_whole_wave_not_one_per_tenant(self) -> None:
+        last = {c: _utc(2026, 6, 14, 8, 0, 0) for c in "abcdefg"}
+        with self.assertLogs(self.LOG, level="WARNING") as logs:
+            self._due([(c, "UTC") for c in "abcdefg"], _utc(2026, 6, 15, 8, 6, 0), 300, last)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("7 tenant(s)", logs.output[0])
+        self.assertIn("a, b, c, d, e", logs.output[0])           # sample capped at 5
+        self.assertNotIn(" f,", logs.output[0])
+
+
 @override_settings(USE_MULTITENANT=True)
 class BeatGraceCheckTests(SimpleTestCase):
     def _entry(self, grace: float | None = None, period: float = 60.0) -> dict[str, Any]:

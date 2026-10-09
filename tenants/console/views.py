@@ -2,11 +2,12 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
+import psycopg
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import connections
+from django.db import Error as DBError, connections
 from django.db.models import Count, F
 from django.db.models.deletion import ProtectedError
 from django.utils import timezone
@@ -124,17 +125,22 @@ class ShardViewSet(mixins.ListModelMixin,
         a single console-style `output` string for display in a <pre>.
         """
         shard = self.get_object()
-        with connections[shard.alias].cursor() as cur:
-            cur.execute(
-                "SELECT n.nspname, "
-                "       pg_catalog.pg_get_userbyid(n.nspowner), "
-                "       pg_catalog.array_to_string(n.nspacl, E'\\n'), "
-                "       pg_catalog.obj_description(n.oid, 'pg_namespace') "
-                "FROM pg_catalog.pg_namespace n "
-                "WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' "
-                "ORDER BY 1"
-            )
-            rows = [[r[0], r[1], r[2] or "", r[3] or ""] for r in cur.fetchall()]
+        try:
+            with connections[shard.alias].cursor() as cur:
+                cur.execute(
+                    "SELECT n.nspname, "
+                    "       pg_catalog.pg_get_userbyid(n.nspowner), "
+                    "       pg_catalog.array_to_string(n.nspacl, E'\\n'), "
+                    "       pg_catalog.obj_description(n.oid, 'pg_namespace') "
+                    "FROM pg_catalog.pg_namespace n "
+                    "WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema' "
+                    "ORDER BY 1"
+                )
+                rows = [[r[0], r[1], r[2] or "", r[3] or ""] for r in cur.fetchall()]
+        except (DBError, psycopg.OperationalError, psycopg.InterfaceError):
+            logger.warning("schemas peek failed for shard %r", shard.alias, exc_info=True)
+            return Response({"shard": shard.alias, "detail": "Shard is unreachable."},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
         dbname = settings.DATABASES[shard.alias]["NAME"]
         table = _psql_aligned(

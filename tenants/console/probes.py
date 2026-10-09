@@ -19,8 +19,8 @@ TWO PROPERTIES EVERY PROBE HERE SHARES, and the reason they live together:
     shard is down, and N resets of django-tenants' search_path cache.
   * DEGRADE PER SHARD. A down or unreachable shard is logged and skipped; its tenants render
     with the field missing. The console is a DIAGNOSTIC tool — it must stay readable exactly
-    when one cluster is broken. Only DB/connection failures are swallowed (`DBError`,
-    `ConnectionDoesNotExist`); a programming error propagates and 500s, on purpose.
+    when one cluster is broken. Only DB/connection failures are swallowed (`_SHARD_DOWN`);
+    a programming error propagates and 500s, on purpose.
 
 SQL SAFETY: schema names reach these queries as SQL IDENTIFIERS, so every one of them goes
 through `quote_schema()` (validate AND quote in one call) and is pre-filtered on the safety
@@ -33,6 +33,7 @@ import logging
 from collections.abc import Callable, Iterable
 from typing import Any
 
+import psycopg
 from django.contrib.auth import get_user_model
 from django.db import Error as DBError, connections
 from django.db.utils import ConnectionDoesNotExist
@@ -41,6 +42,11 @@ from tenants.models import Tenant
 from tenants.validators import is_safe_schema_identifier, quote_schema
 
 logger = logging.getLogger(__name__)
+
+# psycopg.* too: django-tenants sets search_path on a RAW cursor, so a mid-request
+# connection drop escapes unwrapped (same pair as middleware.py).
+_SHARD_DOWN = (DBError, ConnectionDoesNotExist,
+               psycopg.OperationalError, psycopg.InterfaceError)
 
 
 def _by_shard(tenants: Iterable[Tenant]) -> dict[str, set[str]]:
@@ -69,7 +75,7 @@ def _for_each_shard(tenants: Iterable[Tenant],
         try:
             with connections[alias].cursor() as cur:
                 probe(cur, alias, sorted(schemas))
-        except (DBError, ConnectionDoesNotExist):
+        except _SHARD_DOWN:
             logger.warning("%s probe failed for shard %r; its tenants are shown without it",
                            what, alias, exc_info=True)
 

@@ -304,6 +304,52 @@ class TaskRunTests(TestCase):
         TaskRun.mark_ran("task.y", self.SIG, ["b"], now)
         self.assertEqual(set(TaskRun.load_map("task.x", self.SIG)), {"a"})
 
+    def test_mark_ran_never_moves_the_watermark_backward(self) -> None:
+        """The whole reason mark_ran is two statements instead of one upsert.
+
+        sub_dispatch messages are drained by many parallel workers off one queue, so the
+        wave that finishes LAST is not the wave that started last. A plain
+        update_conflicts upsert writes `last_run_at = EXCLUDED.last_run_at` unconditionally,
+        and a straggler carrying an older run_ts would rewind the watermark — re-opening an
+        occurrence a later wave already covered."""
+        t_old = timezone.now().replace(microsecond=0)
+        t_new = t_old + timedelta(minutes=1)
+
+        TaskRun.mark_ran("app.daily", self.SIG, ["a"], t_new)     # later wave lands first
+        TaskRun.mark_ran("app.daily", self.SIG, ["a"], t_old)     # straggler lands second
+        self.assertEqual(TaskRun.load_map("app.daily", self.SIG)["a"], t_new)
+
+    def test_mark_ran_converges_regardless_of_arrival_order(self) -> None:
+        """Both halves are monotone, so the opposite order must reach the same value —
+        otherwise the fix would only work for the order the first test happens to use."""
+        t_old = timezone.now().replace(microsecond=0)
+        t_new = t_old + timedelta(minutes=1)
+
+        TaskRun.mark_ran("app.hourly", self.SIG, ["a"], t_old)    # earlier wave lands first
+        TaskRun.mark_ran("app.hourly", self.SIG, ["a"], t_new)    # later wave lands second
+        self.assertEqual(TaskRun.load_map("app.hourly", self.SIG)["a"], t_new)
+
+    def test_mark_ran_is_per_schema_not_per_call(self) -> None:
+        """A batch carries up to BATCH_SIZE schemas in ONE call; a straggler for one of them
+        must not drag the others back either."""
+        t_old = timezone.now().replace(microsecond=0)
+        t_new = t_old + timedelta(minutes=1)
+
+        TaskRun.mark_ran("app.batch", self.SIG, ["a", "b"], t_new)
+        TaskRun.mark_ran("app.batch", self.SIG, ["a", "b"], t_old)
+        m = TaskRun.load_map("app.batch", self.SIG)
+        self.assertEqual((m["a"], m["b"]), (t_new, t_new))
+
+    def test_mark_ran_accepts_a_generator(self) -> None:
+        """`schemas: Iterable[str]` — a generator is always truthy, so the `if not schemas`
+        guard never fired on one and the body then consumed it twice."""
+        t = timezone.now().replace(microsecond=0)
+        TaskRun.mark_ran("app.gen", self.SIG, (s for s in ["a", "b"]), t)
+        self.assertEqual(set(TaskRun.load_map("app.gen", self.SIG)), {"a", "b"})
+
+        TaskRun.mark_ran("app.gen", self.SIG, (s for s in []), t)   # empty: no-op, no error
+        self.assertEqual(set(TaskRun.load_map("app.gen", self.SIG)), {"a", "b"})
+
 
 class SchemaNameLifecycleTests(TestCase):
     """The end-to-end claim behind allowing a LEADING DIGIT in a schema name.

@@ -18,6 +18,64 @@
 
 ---
 
+## Вимоги до інфраструктури
+
+**Redis server ≥ 7.0** — не рекомендація, а умова роботи гейта. Умовні аргументи
+`NX`/`XX`/`GT`/`LT` для `EXPIRE` з'явилися рівно в Redis 7.0.0; на 6.x арність `EXPIRE`
+дорівнює 3, тож четвертий аргумент дає `ResponseError: wrong number of arguments for
+'expire' command`.
+
+Два місця шлють `EXPIRE … NX`, і ламаються вони по-різному:
+
+| Місце | Поведінка на Redis 6.x |
+|---|---|
+| `throttle.FillCap.allow()` — `INCR` + `EXPIRE … NX` окремими командами | `INCR` проходить, `EXPIRE` кидає → `except RedisError` → per-pod bucket. `treg:probe:<sec>` лишається **без TTL**, а під `volatile-ttl` такий ключ не витісняється ніколи |
+| `registry._apply_membership()` — `INCR` + `EXPIRE … NX` у `pipeline()` | `pipeline()` у redis-py **транзакційний за замовчуванням** (`transaction=True` → `MULTI/EXEC`), помилка арності ловиться при постановці в чергу → `EXECABORT` → відкочується і `INCR`. `treg:hosts:dirty` не з'являється ніколи → **dirty-recheck у `reconcile()` сліпий** (`before == after == None`), повтор на мутацію під час ребілду не спрацьовує |
+
+Пом'якшення, щоб не перебільшувати: `SADD`/`SREM` виконуються **до** пайплайну, тож членство
+в SET підтримується (хоча `add()`/`remove()` при цьому логують `host_registry.add failed` про
+успішну операцію), а `arm()` шле звичайний `EXPIRE` і працює — `treg:hosts` протухає за
+`HOSTS_ARM_SECONDS`, гейт переходить у UNKNOWN → fail-open. Це **деградація, не аутейдж**.
+
+**Супутня вимога: redis-py ≥ 4.2** (аргумент `nx=` у `Redis.expire()` доданий там). Підлогу
+сьогодні тримає **не** `django-redis==5.4.*` (він допускає `redis>=3`), а транзитивний пін
+`celery[redis]` → `kombu[redis]` → `redis>=4.5.2,<6.5`. На старішому redis-py виклик дає
+`TypeError`, який **не** є `RedisError` і тому оминає обидва `except RedisError`: у `throttle`
+він долітає до `resolve()` → `except Exception` (LOUD ERROR + fail-open), а в сигналі `Domain`
+(`transaction.on_commit`) валить запит у 500 **після** коміту рядка, тож `arm()` і
+`trigger_warm()` не виконуються.
+
+**Чому вимога живе в документі, а не в деплой-чеку.** `tenants.E001`–`E009` перевіряють
+узгодженість конфігурації, а `INFO server` — мережевий виклик у `check`-фазі. Свідоме
+рішення: вимога фіксується тут і перевіряється при виборі інстансу (`INFO server` →
+`redis_version`).
+
+**ElastiCache:** Redis OSS v6 у стандартній підтримці AWS до 2027-01-31, тобто 6.2-кластер
+досі можна створити помилково; Valkey (форк 7.2) вимогу задовольняє.
+
+> **Чому `arm()` шле `EXPIRE` БЕЗ `NX` — рішення, не недогляд.** Наявність `treg:hosts` несе
+> дві ролі: прапор консистентності для читання (гейт) і **дозвіл на інкрементальний запис** —
+> `_apply_membership` робить `SADD` лише `if c.exists(HOSTS_KEY)`. Нормальний стан ключа —
+> **без TTL** (його знімає `RENAME` у reconcile); TTL існує лише як тимчасовий запобіжник на
+> проміжку між мутацією та її reconcile. З `NX` дедлайн прибивається до **першої** мутації,
+> тож на довгій серії змін флаг падає посеред здорової роботи: гейт **блимає** у fail-open і
+> назад, а `SADD` на цей час вимкнений. Ковзний TTL натомість тримає запобіжник незведеним,
+> поки активний write-path доводить, що реєстр підтримується, і зводить його, коли зміни
+> припиняються. Вирішальне — саме цільовий сценарій запобіжника: `SADD`/`SREM`/`arm`/
+> `forget_host` ідуть прямо в Redis і переживають падіння брокера, а всі шляхи повернення
+> флага (`trigger_warm` → `.delay()`, добовий beat) — ні.
+>
+> **Залишковий ризик, названий явно:** `SADD`, загублений на транзиторному збої Redis
+> (`add()` ловить `RedisError` і лише логує), лишає валідний хост у NONMEMBER → **404 без
+> верхньої межі**, поки триває churn доменів. З `NX` межею був би `HOSTS_ARM_SECONDS`.
+> Компенсація — startup-warm (див. TODO), а не повернення `NX`.
+>
+> Це стосується **тільки** арму. `store`/`put`(`nx`), tombstone(`nx`), `SET treg:warming NX EX`
+> і `EXPIRE … NX` на `treg:hosts:dirty` / `treg:probe:<sec>` — інші механізми, `NX` там
+> обов'язковий.
+
+---
+
 ## Redis-ключі (`tenant_resolve`, db2)
 
 Два РОЗДІЛЬНІ неймспейси: снепшоти йдуть через django_redis під власним піднеймспейсом
@@ -31,7 +89,7 @@
 | `<host>` → snapshot | позитив (`dump` тенант+шард) | **`ttl_by_status`** |
 | `<host>` → `NEGATIVE` | кешований промах | 60с |
 | `<host>` → `TOMBSTONE` | hold на інвалідації | 5с |
-| `treg:hosts` (SET) | усі валідні хости; **існування = флаг консистентності** | немає; **арм 5хв (`EXPIRE NX`)** на add/del/rename |
+| `treg:hosts` (SET) | усі валідні хости; **існування = флаг консистентності** | немає; **арм 5хв (`EXPIRE`, ковзний)** на add/del/rename |
 | `treg:warming` | лок «один writer» | `EX` > тривалості warm |
 | `treg:probe:<sec>` | лічильник fill-cap | 2с |
 
@@ -148,18 +206,19 @@ Hold тримається на **resolve-path** (`store`/`put` з `nx=True` — 
 
 ### D. Domain ADD
 1. `forget_host` + `SADD treg:hosts host`.
-2. `EXPIRE treg:hosts 300 NX` (арм dead-man switch).
+2. `EXPIRE treg:hosts 300` (арм dead-man switch; **ковзний, без `NX`** — див. рішення в
+   «Вимоги до інфраструктури»).
 3. тригер warm → перепис + `RENAME` (disarm).
 - Хост валідний **миттєво** (SADD видно всім подам).
 
 ### E. Domain DELETE
 1. `SREM treg:hosts host` + **`delete` позитиву** (не лише tombstone — щоб не віддавати як HIT).
-2. `EXPIRE treg:hosts 300 NX`.
+2. `EXPIRE treg:hosts 300` (ковзний).
 3. тригер warm → orphan-sweep + `RENAME`.
 - Чутливе видалення = доступ відрізано одразу (крок 1).
 
 ### F. Domain RENAME/repoint
-- `SREM old + SADD new`; `delete(old)` + `forget(new)`; `EXPIRE treg:hosts 300 NX`; тригер warm.
+- `SREM old + SADD new`; `delete(old)` + `forget(new)`; `EXPIRE treg:hosts 300` (ковзний); тригер warm.
 
 ### G. Bulk / raw / міграції (обхід сигналів) — відповідальність код-шляху
 - create/update: **скинути флаг** (`DELETE treg:hosts`) → fail-open → warm додасть/оновить
@@ -243,6 +302,14 @@ django-tenants виконує `SET search_path` на сирому psycopg-кур
 ---
 
 ## TODO (окремий тікет)
+
+**Startup-warm.** «Розклад тасок» обіцяє «старт пода: флаг відсутній → взяти лок → warm», але
+гука немає — `tenants/apps.py:ready()` його не робить. Сьогодні **всі** шляхи повернення
+`treg:hosts` ідуть через брокер (`trigger_warm` → `.delay()`, добовий beat), тож при мертвому
+брокері флаг, який одного разу впав, не підніметься сам. Startup-warm дав би третій,
+брокеро-незалежний шлях — і заодно закрив би залишковий ризик ковзного арму (див. «Вимоги до
+інфраструктури»).
+
 
 **Інвалідація кеша на зміну шарда тенанта.** `dump()` кладе поля шарда в snapshot, а
 рісивера на `Shard` немає → зміна шарда самозцілюється лише добовим warm (стале поле шарда

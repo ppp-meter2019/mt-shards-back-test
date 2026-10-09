@@ -479,12 +479,30 @@ class ReservedHostRule(models.Model):
 
 
 class TaskRun(models.Model):
-    """Durable per-(task, args, tenant-schema) last-run watermark for CALENDAR (tz) fanout.
+    """Durable per-(task, args, tenant-schema) DISPATCH watermark for CALENDAR (tz) fanout.
 
     Lives in default.public (SHARED). Makes per-tenant due-ness level-triggered: a missed
-    tick self-heals within `grace`, and re-firing the same occurrence is deduped. Only
-    calendar tasks write here; interval / public tasks do not. See
-    deploy/celery_fanout_design.md §3.
+    tick self-heals within `grace`. Only calendar tasks write here; interval / public tasks
+    do not. See deploy/celery_fanout_design.md §3 and §9.
+
+    DISPATCH, not RUN. The column is spelled `last_run_at`, but what it records is when the
+    fanout SENT the task, not when a worker finished it: sub_dispatch calls mark_ran()
+    immediately after `send_task` (tenants/celery/dispatch.py), stamping the producer's tick
+    `run_ts`. A task that was enqueued and then FAILED inside its worker still advances this
+    watermark and is never re-sent by a later tick. So an operator reading a row to answer
+    "why did x.report not run for tenant Y" is reading when it was DELIVERED; whether it ran
+    is a question for that task's own result/logs.
+
+    What it does NOT dedup. Re-firing the same occurrence is suppressed only once this row
+    is WRITTEN, and the write happens one hop downstream of the read that decides due-ness:
+    fanout_dispatch loads the map, fans out, and releases its overlap-lock BEFORE any
+    sub_dispatch starts. While a wave is still draining the `fanout` queue, the next tick
+    reads an unchanged watermark and dispatches the SAME occurrence again — up to
+    TZ_GRACE_SECONDS / fanout_period times (5 at defaults) before `grace` drops it. Not a
+    corner case: that queue runs many parallel workers, so a free one picks up the next
+    fanout_dispatch while the others are still sending the previous wave. Hence the
+    contract in §9 — delivery is AT-LEAST-ONCE and calendar tasks must be IDEMPOTENT. This
+    watermark bounds the duplicates; it does not remove them.
 
     `args_sig` is part of the identity because two schedule entries may share a task NAME
     and differ only by args — `fetch(1)` at 08:00 and `fetch(7)` at 09:00 are two
@@ -531,8 +549,24 @@ class TaskRun(models.Model):
     @classmethod
     def mark_ran(cls, task: str, args_sig: str, schemas: Iterable[str],
                  run_ts: datetime | str) -> None:
-        """Bulk-upsert last_run_at=run_ts for the given schemas (after successful send)."""
-        if not schemas:
+        """Advance last_run_at to run_ts for the given schemas (after successful send).
+
+        MONOTONIC: the watermark never moves backward. Django's update_conflicts emits
+        `last_run_at = EXCLUDED.last_run_at` — an unconditional overwrite, with no way to wrap
+        it in GREATEST — so a sub_dispatch from an EARLIER wave finishing after a later one
+        would rewind the watermark. Mostly harmless (run_ts is always >= the occurrence that
+        wave dispatched, so the rewind still dominates it), but not always: after an outage
+        long enough to span a cron period, a drained message carrying a stale run_ts can land
+        last and re-open an occurrence another wave already covered.
+
+        Two statements, deliberately NOT wrapped in a transaction — both halves are monotone,
+        so any interleaving of two waves converges on the greater run_ts:
+          1. insert the rows that do not exist yet, leaving existing ones untouched;
+          2. advance only those strictly older than run_ts.
+        One extra statement per sub_dispatch (i.e. per BATCH of schemas, not per tenant).
+        """
+        schemas = list(schemas)         # consumed twice below; also makes the guard correct
+        if not schemas:                 # for a generator argument (always truthy, even empty)
             return
         if isinstance(run_ts, str):
             from django.utils.dateparse import parse_datetime
@@ -540,10 +574,10 @@ class TaskRun(models.Model):
         cls.objects.bulk_create(
             [cls(schema=s, task=task, args_sig=args_sig, last_run_at=run_ts)
              for s in schemas],
-            update_conflicts=True,
-            unique_fields=["schema", "task", "args_sig"],
-            update_fields=["last_run_at"],
+            ignore_conflicts=True,                          # ON CONFLICT DO NOTHING
         )
+        cls.objects.filter(task=task, args_sig=args_sig, schema__in=schemas,
+                           last_run_at__lt=run_ts).update(last_run_at=run_ts)
 
 
 def sync_tenant_timezone(schema_name: str, tz: str | None) -> int:

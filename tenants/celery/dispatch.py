@@ -98,6 +98,10 @@ def _due_by_tenant_tz(task_name: str, args_sig: str, cron: str, now: "datetime",
     now. A missed tick self-heals within grace; beyond grace it is skipped (never fired
     late, never N times). See deploy/celery_fanout_design.md §3 / §3.1.
 
+    That skip is WARNED about once per dropped occurrence (bounded to a grace-wide band), so
+    "the report stopped arriving for tenant Y" has a log line behind it instead of only a
+    TaskRun row that quietly stopped advancing.
+
     Keyed by (task_name, args_sig), the SAME identity the overlap-lock uses: two entries
     sharing a task name but differing by args are independent schedules, and reading one
     watermark for both would let the wave that lands second treat the occurrence as already
@@ -108,7 +112,7 @@ def _due_by_tenant_tz(task_name: str, args_sig: str, cron: str, now: "datetime",
     from croniter import croniter
 
     last = TaskRun.load_map(task_name, args_sig)
-    due = []
+    due, dropped = [], []
     for schema, tzname in active_tenants_with_tz():
         try:
             tz = ZoneInfo(tzname)
@@ -120,10 +124,32 @@ def _due_by_tenant_tz(task_name: str, args_sig: str, cron: str, now: "datetime",
         # the current occurrence is returned. (An exact-boundary now would be caught next tick.)
         t_fire = croniter(cron, now.astimezone(tz)).get_prev(datetime).astimezone(_utc.utc)
         last_run = last.get(schema)
-        already = last_run is not None and t_fire <= last_run
-        too_late = (now - t_fire).total_seconds() > grace
-        if not already and not too_late:
+        elapsed = (now - t_fire).total_seconds()
+        if last_run is not None and t_fire <= last_run:
+            continue                                # already dispatched for this occurrence
+        if elapsed <= grace:
             due.append(schema)
+        elif last_run is not None and elapsed <= 2 * grace:
+            # Past grace and never dispatched: this occurrence is being DROPPED. That is the
+            # documented behaviour (§3.1), but until now it was INVISIBLE — the only trace was
+            # a TaskRun row quietly not advancing, plus a smaller number in _fan_out's INFO
+            # line, which attributes nothing to anyone. Two guards keep this from becoming the
+            # flood a bare `too_late` would be:
+            #   last_run is not None  a tenant that has never run this entry would report a
+            #                         miss for every past occurrence the moment the entry is
+            #                         first added to the schedule (the case pinned by
+            #                         test_no_retroactive_fire_on_deploy);
+            #   elapsed <= 2 * grace  t_fire does not move until the NEXT occurrence, so with
+            #                         no upper bound one missed daily task would log on every
+            #                         tick for the rest of the day.
+            # The band is one grace wide => at most grace/fanout_period lines per dropped
+            # occurrence (5 at defaults) — the same ceiling as the duplicate-dispatch window.
+            dropped.append(schema)
+    if dropped:
+        logger.warning(
+            "tz-fanout %s: %d tenant(s) passed the %.0fs grace with no dispatch — "
+            "occurrence DROPPED (e.g. %s)",
+            task_name, len(dropped), grace, ", ".join(sorted(dropped)[:5]))
     return due
 
 
