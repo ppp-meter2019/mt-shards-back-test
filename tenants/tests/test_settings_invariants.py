@@ -285,6 +285,21 @@ class SettingsLocalContractTests(SimpleTestCase):
             with self.subTest(name=name):
                 self.assertTrue(callable(getattr(dispatcher, name, None)))
 
+    def test_production_db_options_carry_tcp_keepalives(self) -> None:
+        """A silently dead connection must surface as an error within ~a minute instead of
+        hanging a migration run (or a request) for ever — and libpq must accept the
+        keywords: parsing them as a conninfo string fails on any unknown one."""
+        import psycopg
+        import tenants_back.settings_multitenant as mt
+        for name in ("_aurora_db_options", "_proxy_db_options"):
+            with self.subTest(name=name):
+                opts = getattr(mt, name)()
+                self.assertEqual({k: opts[k] for k in mt._TCP_KEEPALIVES}, mt._TCP_KEEPALIVES)
+                self.assertEqual(opts["keepalives"], 1)
+                params = psycopg.conninfo.conninfo_to_dict(
+                    psycopg.conninfo.make_conninfo(**{k: str(v) for k, v in opts.items()}))
+                self.assertEqual(params["keepalives_idle"], "30")
+
     def test_standalone_example_does_not_import_the_aurora_helpers(self) -> None:
         """The standalone branch of the dispatcher deliberately does NOT re-export them:
         Aurora / RDS Proxy is multi-tenant deployment topology, and the helpers now live in

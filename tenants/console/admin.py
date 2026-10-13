@@ -17,14 +17,18 @@ from django.contrib import admin, messages
 from django.contrib.admin import AdminSite
 from django.contrib.auth.admin import GroupAdmin
 from django.contrib.auth.models import Group
+from django.db import transaction
 from django.db.models import QuerySet
 from django.db.models.deletion import ProtectedError
-from django.http import HttpRequest, HttpResponse
+from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
+from django.utils import timezone
 from django_tenants.admin import TenantAdminMixin
 from django_tenants.utils import get_public_schema_name
 
 # Runtime layer — console -> tenants is the allowed direction.
+from tenants import migrator
 from tenants.models import Domain, ReservedHostRule, Shard, Tenant
+from tenants.resolver import resolve_cache
 
 
 class PublicAdminSite(AdminSite):
@@ -125,8 +129,42 @@ class ShardAdmin(admin.ModelAdmin):
 # ---------------------------------------------------------------------------
 # Tenant
 # ---------------------------------------------------------------------------
+S = Tenant.Status
+
+# Allowed status transitions in the admin (deploy/migrations_plan_rev7.md §14.2). NEW and
+# PENDING are the migrator's; MAINTENANCE is entered and left only here (I7).
+STATUS_TRANSITIONS: dict[str, list[str]] = {
+    S.NEW:         [S.NEW],
+    S.PENDING:     [S.PENDING],
+    S.ACTIVE:      [S.ACTIVE, S.DEACTIVATED, S.MAINTENANCE],
+    S.DEACTIVATED: [S.DEACTIVATED, S.ACTIVE, S.MAINTENANCE],
+    S.FAILED:      [S.FAILED, S.NEW, S.MAINTENANCE],
+    S.MAINTENANCE: [S.MAINTENANCE, S.ACTIVE, S.DEACTIVATED, S.FAILED],
+}
+
+CONFIRM_SCHEMA_LABEL = ("I checked the schema: its data is restored, or I accept an empty "
+                        "schema, or the existing schema belongs to this tenant.")
+
+
+class StatusConflict(Exception):
+    """The tenant's status moved between the operator opening the page and the CAS."""
+
+
 class TenantAdminForm(forms.ModelForm):
-    """Filters shard choices based on public/non-public and restricts status transitions."""
+    """Filters shard choices based on public/non-public and restricts status transitions.
+
+    Status changes are validated here (clean) and written by TenantAdmin.save_model as a
+    CAS. → ACTIVE goes through the reactivation stopper; → MAINTENANCE is refused while a
+    migrator holds the tenant's lease; FAILED → NEW needs `confirm_schema` (the migrator
+    then accepts the existing schema: previous_status = failed, M4).
+
+    The base of a status change is `expected_status`: the status the operator SAW, carried
+    in a hidden field from the GET. The admin re-reads the row on POST, so `instance.status`
+    is already the fresh value — basing the change on it would let a stale page silently
+    overwrite a concurrent change (a console deactivation, the migrator's FAILED)."""
+
+    confirm_schema = forms.BooleanField(required=False, label=CONFIRM_SCHEMA_LABEL)
+    expected_status = forms.CharField(widget=forms.HiddenInput, required=False)
 
     class Meta:
         model = Tenant
@@ -136,6 +174,12 @@ class TenantAdminForm(forms.ModelForm):
         super().__init__(*args, **kwargs)
         instance = kwargs.get("instance") or self.instance
         public = get_public_schema_name()
+        self.old_status = None
+        if instance and instance.pk:
+            posted = self.data.get(self.add_prefix("expected_status")) if self.is_bound else None
+            self.old_status = posted if posted in Tenant.Status.values else instance.status
+            self.fields["expected_status"].initial = self.old_status
+            self.initial["status"] = self.old_status    # a disabled field keeps what was shown
 
         # Shard choices: public tenant -> default only; others -> non-default active only.
         if instance and instance.pk and instance.schema_name == public:
@@ -145,25 +189,62 @@ class TenantAdminForm(forms.ModelForm):
                 is_default=False, is_active=True
             )
 
-        # Allowed status transitions (admin can deactivate/reactivate; everything
-        # else is system-managed).
         if instance and instance.pk:
-            current = instance.status
-            allowed = {
-                Tenant.Status.NEW:         [Tenant.Status.NEW],
-                Tenant.Status.PENDING:     [Tenant.Status.PENDING],
-                Tenant.Status.ACTIVE:      [Tenant.Status.ACTIVE, Tenant.Status.DEACTIVATED],
-                Tenant.Status.DEACTIVATED: [Tenant.Status.ACTIVE, Tenant.Status.DEACTIVATED],
-                Tenant.Status.FAILED:      [Tenant.Status.FAILED, Tenant.Status.NEW],
-            }.get(current, [current])
+            current = self.old_status
+            allowed = STATUS_TRANSITIONS.get(current, [current])
             self.fields["status"].choices = [
                 (s, dict(Tenant.Status.choices)[s]) for s in allowed
             ]
             if current in (Tenant.Status.PENDING, Tenant.Status.NEW):
                 self.fields["status"].disabled = True
+            if current == Tenant.Status.FAILED:
+                self.fields["confirm_schema"].help_text = (
+                    f"Needed for FAILED → New. Schema now: {self._schema_state(instance)}.")
         else:
             self.fields["status"].initial = Tenant.Status.NEW
             self.fields["status"].choices = [(Tenant.Status.NEW, "New")]
+
+    @staticmethod
+    def _schema_state(t: Tenant) -> str:
+        try:
+            n = migrator.schema_table_count(t.shard.alias, t.schema_name)
+        except Exception as exc:
+            return f"unknown ({t.shard.alias} unreachable: {type(exc).__name__})"
+        if n is None:
+            return f"does not exist on {t.shard.alias}"
+        return f"empty, on {t.shard.alias}" if n == 0 else f"NOT empty ({n} tables) on {t.shard.alias}"
+
+    def clean(self) -> dict[str, Any]:
+        cleaned = super().clean()
+        old, new = self.old_status, cleaned.get("status")
+        if old is None or new is None or new == old:
+            return cleaned                  # no status change requested: status is not written
+        t = self.instance
+        if t.status != old:
+            raise forms.ValidationError(
+                f"The status changed while this page was open (it is now '{t.status}', "
+                f"you saw '{old}'). Nothing was saved; reload the page and try again.")
+        if new == Tenant.Status.ACTIVE:
+            try:
+                migrator.check_reactivation(t)
+            except migrator.ReactivationBlocked as exc:
+                flag = " --maintenance" if old == Tenant.Status.MAINTENANCE else ""
+                hint = ("retry after the deploy / when the shard is back" if exc.status == 503
+                        else f"run `migrate_schemas -s {t.schema_name}{flag}` first")
+                raise forms.ValidationError({"status": f"Cannot activate: {exc} ({exc.code}); {hint}."})
+        elif new == Tenant.Status.MAINTENANCE:
+            h = migrator.lease_holder(t.pk)
+            if h is not None:
+                busy = (not h.expired) or migrator.shard_session_active(t.shard.alias, t.pk)
+                if busy:
+                    raise forms.ValidationError({"status": (
+                        f"Being migrated right now by {h.owner} since "
+                        f"{h.since:%Y-%m-%d %H:%M:%S} UTC; wait for it to finish.")})
+        if old == Tenant.Status.FAILED and new == Tenant.Status.NEW and not cleaned.get("confirm_schema"):
+            raise forms.ValidationError({"confirm_schema": (
+                "Tick this to move a FAILED tenant back to New: the next provisioning run "
+                "will adopt whatever schema is there.")})
+        return cleaned
 
 
 class TenantAdmin(TenantAdminMixin, admin.ModelAdmin):
@@ -172,6 +253,16 @@ class TenantAdmin(TenantAdminMixin, admin.ModelAdmin):
     list_filter     = ("status", "shard")
     search_fields   = ("company_name", "schema_name")
     readonly_fields = ("previous_status", "status_changed_at", "last_error", "created_on")
+
+    def get_fields(self, request: HttpRequest, obj: Tenant | None = None) -> list[str]:
+        """confirm_schema only on a FAILED tenant (the only status where it means anything);
+        expected_status only on the change form."""
+        fields = list(super().get_fields(request, obj))
+        if obj is None or obj.status != Tenant.Status.FAILED:
+            fields = [f for f in fields if f != "confirm_schema"]
+        if obj is None:
+            fields = [f for f in fields if f != "expected_status"]
+        return fields
 
     def get_readonly_fields(self, request: HttpRequest,
                             obj: Tenant | None = None) -> list[str]:
@@ -182,11 +273,62 @@ class TenantAdmin(TenantAdminMixin, admin.ModelAdmin):
             ro.append("schema_name")
         return ro
 
-    # No save_model override needed: the Tenant post_save signal (tenants/signals.py)
-    # invalidates the resolve snapshots on EVERY .save(), admin included — it does not
-    # check whether the status moved, because invalidating is cheap and a stale routing
-    # snapshot is not. Beat needs no signal at all: the fanout dispatcher reads the
-    # ACTIVE-tenant set fresh each tick. (status_changed_at is stamped by Tenant.save().)
+    def save_model(self, request: HttpRequest, obj: Tenant, form: TenantAdminForm,
+                   change: bool) -> None:
+        """A status change is a CAS on the status the operator saw (§14.2; the form's
+        `expected_status`). Other fields are saved with update_fields — never `status` — so
+        an edit of company_name cannot resurrect a stale status either. The form already
+        refuses a status that moved before the POST; a move in the milliseconds between
+        clean() and this CAS raises StatusConflict, which leaves the admin's atomic() — so
+        save_related / log_change never run on a doomed transaction — and is turned into a
+        message by changeform_view."""
+        if not change:
+            super().save_model(request, obj, form, change)
+            return
+        old, new = form.old_status, obj.status
+        other = [f for f in form.changed_data
+                 if f not in ("status", "confirm_schema", "expected_status")]
+        if new != old:
+            if new == Tenant.Status.MAINTENANCE:
+                # The form's lease check and this write are separate steps: lock the lease
+                # row for the rest of this transaction so no migrator can start between them.
+                h = migrator.lease_lock_for_transition(obj.pk)
+                if h is not None:
+                    raise StatusConflict(
+                        f"'{obj.schema_name}' started migrating meanwhile ({h.owner} since "
+                        f"{h.since:%Y-%m-%d %H:%M:%S} UTC); nothing was saved. Wait for it to "
+                        f"finish and try again.")
+            fields: dict[str, Any] = {"status": new, "previous_status": old,
+                                      "status_changed_at": timezone.now()}
+            if new == Tenant.Status.NEW:
+                fields["last_error"] = ""
+            if not Tenant.objects.filter(pk=obj.pk, status=old).update(**fields):
+                raise StatusConflict(
+                    f"The status of '{obj.schema_name}' changed concurrently (it is no longer "
+                    f"'{old}'); nothing was saved. Reload the page and try again.")
+            # .update() skips post_save, so invalidate the resolve snapshot — after commit,
+            # or a rollback would leave a forgotten entry refilled from the OLD row.
+            transaction.on_commit(lambda: resolve_cache.forget_tenant(obj))
+            obj.previous_status = old
+            obj._loaded_status = new            # Tenant.save() must not re-stamp the change
+        else:
+            # No status change requested. obj.status holds the value the PAGE showed; if
+            # someone moved the status since, Tenant.save() would see a "change" and stamp
+            # status_changed_at over theirs. Keep the row's own status on the object.
+            obj.status = getattr(obj, "_loaded_status", obj.status)
+        if other:
+            obj.save(update_fields=other)       # post_save → forget_tenant, as before
+
+    def changeform_view(self, request: HttpRequest, object_id: str | None = None,
+                        form_url: str = "", extra_context: dict[str, Any] | None = None
+                        ) -> HttpResponse:
+        # Outside the admin's atomic(): by the time StatusConflict gets here the
+        # transaction has already been rolled back by the exception itself.
+        try:
+            return super().changeform_view(request, object_id, form_url, extra_context)
+        except StatusConflict as exc:
+            self.message_user(request, str(exc), level=messages.ERROR)
+            return HttpResponseRedirect(request.path)
 
     def delete_model(self, request: HttpRequest, obj: Tenant) -> None:
         try:

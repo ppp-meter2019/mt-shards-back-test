@@ -1,7 +1,7 @@
 """Tenant-resolution cache invalidation — signal receivers.
 
 These cover admin-driven .save()/.delete(). NOTE: the status machine mutates via
-QuerySet.update() (migrate_schemas / reconcile_tenants / the deactivate-activate
+QuerySet.update() (tenants.migrator / the deactivate-activate
 API), which does NOT fire these signals — those call sites invalidate explicitly
 via tenants.resolver.resolve_cache.forget_tenant(). See that module.
 """

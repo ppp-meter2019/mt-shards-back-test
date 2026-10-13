@@ -1,330 +1,249 @@
-"""Reconcile Tenant.status with the actual migration state on each shard.
+"""reconcile_tenants — read-only migration state of public and the tenants
+(deploy/migrations_plan_rev7.md §11). Never writes: statuses change only through the
+migrator (fenced CAS), the admin and the console.
 
-Strategy: conservative.
-  - Auto-fixes only obvious drifts (a stale PENDING that actually completed).
-  - Never overrides ACTIVE/FAILED/DEACTIVATED automatically.
-  - 'ACTIVE but behind on migrations' is REPORTED, not changed - it is the
-    normal state immediately after a new code deploy until the operator runs
-    `migrate_schemas --tenant`.
+  --check                    deploy gate. Exit 1 if public is behind, the code is older
+                             than the database, any ACTIVE tenant is behind or has no
+                             schema, or `default` / a shard holding ACTIVE tenants is
+                             unreachable. A stuck PENDING is a WARN only. NEW, DEACTIVATED,
+                             FAILED and MAINTENANCE are not checked.
+  --report [-s X] [--only-pending] [--plan]
+                             one row per tenant (public first): status, migrations behind
+                             or "no schema", lease (owner, since, EXPIRED), PENDING in
+                             progress or stuck, INVALID indexes, and the next command to
+                             run. --plan adds the names of the unapplied migrations.
+
+"Behind" is migrator.behind() — the same definition migrate_schemas' crash snapshot uses.
 """
+from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
-from django.conf import settings
-from django.core.management.base import CommandParser
+from django.core.management.base import CommandError, CommandParser
+from django_tenants.utils import get_public_schema_name
+
 from commons.platform.commands import TenantCommand
-from django.db import connection, connections
-from django.db.models import QuerySet
-from django.db.migrations.loader import MigrationLoader
-from django.db.utils import ConnectionDoesNotExist
-from django.utils import timezone
-from django_tenants.utils import get_public_schema_name, schema_exists
-from psycopg import sql
-
+from tenants import migrator
 from tenants.models import Tenant
-from tenants.resolver import resolve_cache
-
-
-@dataclass
-class Decision:
-    new_status: str
-    status_change: bool
-    reason: str = ""
-    warning: str = ""
-    error: str = ""
 
 
 class Command(TenantCommand):
-    help = "Reconcile Tenant.status with actual migration state on each shard."
+    help = ("Read-only migration state (deploy/migrations_plan_rev7.md §11): --check is the "
+            "deploy gate (exit 1 on any problem), --report is the per-tenant table.")
 
     def add_arguments(self, parser: CommandParser) -> None:
-        parser.add_argument("--dry-run", action="store_true",
-                            help="Only print what would be changed; do not write.")
-        parser.add_argument("--report", action="store_true",
-                            help="Print a status table (read-only).")
-        parser.add_argument("--only-pending", action="store_true",
-                            help="Only inspect tenants whose status=pending.")
-        parser.add_argument("--schema", help="Restrict to a single schema_name.")
+        g = parser.add_mutually_exclusive_group(required=True)
+        g.add_argument("--check", action="store_true",
+                       help="Deploy gate: exit 1 if public or any ACTIVE tenant is not up to date.")
+        g.add_argument("--report", action="store_true", help="Per-tenant state table.")
+        parser.add_argument("-s", "--schema", dest="schema", help="--report: only this tenant.")
+        parser.add_argument("--only-pending", action="store_true", dest="only_pending",
+                            help="--report: only PENDING tenants.")
+        parser.add_argument("--plan", action="store_true",
+                            help="--report: list the unapplied migrations by name.")
 
-    def handle(self, *args: Any, **opts: Any) -> None:
-        if opts["report"]:
-            self._print_report(opts.get("schema"))
-            return
-
-        qs = self._build_queryset(opts)
-        changed = warned = errored = 0
-
-        for tenant in qs:
-            decision = self._evaluate(tenant)
-
-            if decision.error:
-                errored += 1
-                self.stdout.write(self.style.ERROR(
-                    f"ERROR {tenant.schema_name}: {decision.error}"
-                ))
-
-            if decision.status_change:
-                changed += 1
-                marker = "DRY-RUN " if opts["dry_run"] else ""
-                self.stdout.write(self.style.SUCCESS(
-                    f"{marker}FIX  {tenant.schema_name}: "
-                    f"{tenant.status} -> {decision.new_status}  ({decision.reason})"
-                ))
-                if not opts["dry_run"]:
-                    self._apply_status(tenant, decision.new_status, decision.reason)
-            elif decision.warning:
-                warned += 1
-                self.stdout.write(self.style.WARNING(
-                    f"WARN {tenant.schema_name}: {decision.warning}"
-                ))
-
-        suffix = " (dry-run - no changes saved)" if opts["dry_run"] else ""
-        self.stdout.write("")
-        self.stdout.write(self.style.SUCCESS(
-            f"Reconcile complete{suffix}: "
-            f"{changed} change(s), {warned} warning(s), {errored} error(s)."
-        ))
-
-    def _build_queryset(self, opts: dict[str, Any]) -> QuerySet:
-        qs = Tenant.objects.select_related("shard").exclude(schema_name=get_public_schema_name())
-        if opts["only_pending"]:
-            qs = qs.filter(status=Tenant.Status.PENDING)
-        if opts["schema"]:
-            qs = qs.filter(schema_name=opts["schema"])
-        return qs
-
-    # ------------------------------------------------------------------
-    # Decision logic - conservative
-    # ------------------------------------------------------------------
-    def _evaluate(self, tenant: Tenant) -> Decision:
-        # Sanity: alias must be in settings.DATABASES.
+    def handle(self, *args: Any, **options: Any) -> None:
+        if options["check"] and (options["schema"] or options["only_pending"] or options["plan"]):
+            raise CommandError("-s, --only-pending and --plan go only with --report.")
         try:
-            conn = connections[tenant.shard.alias]
-        except ConnectionDoesNotExist:
-            return Decision(
-                new_status=tenant.status, status_change=False,
-                error=(f"shard alias {tenant.shard.alias!r} is not configured "
-                       f"in settings.DATABASES"),
-            )
-
-        # schema_exists() takes the database ALIAS (string), not a connection.
-        exists = schema_exists(tenant.schema_name, tenant.shard.alias)
-        if not exists:
-            return self._eval_no_schema(tenant)
-
-        applied = self._applied(conn, tenant.schema_name)
-        expected = self._expected()
-
-        if applied >= expected:
-            return self._eval_fully_migrated(tenant)
-        return self._eval_partial(tenant, applied, expected)
-
-    def _eval_no_schema(self, tenant: Tenant) -> Decision:
-        status = tenant.status
-        if status == Tenant.Status.PENDING:
-            # Claim succeeded but CREATE SCHEMA never ran. Roll the claim back.
-            return Decision(
-                new_status=Tenant.Status.NEW, status_change=True,
-                reason="Schema not created; rolling back stale pending.",
-            )
-        if status == Tenant.Status.ACTIVE:
-            # ACTIVE without a schema = serving requests with no DB - red alert.
-            return Decision(
-                new_status=status, status_change=False,
-                error="ACTIVE but schema is missing - likely data loss; manual recovery required.",
-            )
-        return Decision(new_status=status, status_change=False)
-
-    def _eval_fully_migrated(self, tenant: Tenant) -> Decision:
-        status = tenant.status
-        if status == Tenant.Status.PENDING:
-            # Migrations completed but the final status flip was lost.
-            target = (Tenant.Status.DEACTIVATED
-                      if tenant.previous_status == Tenant.Status.DEACTIVATED
-                      else Tenant.Status.ACTIVE)
-            return Decision(
-                new_status=target, status_change=True,
-                reason="All migrations applied; finalizing stale pending.",
-            )
-        if status == Tenant.Status.NEW:
-            # Migrations applied out-of-band (DBA used create_tenant_schema +
-            # ran migrate manually). Sync the status.
-            return Decision(
-                new_status=Tenant.Status.ACTIVE, status_change=True,
-                reason="Schema fully migrated externally; marking active.",
-            )
-        return Decision(new_status=status, status_change=False)
-
-    def _eval_partial(self, tenant: Tenant, applied: int, expected: int) -> Decision:
-        status = tenant.status
-        progress = f"{applied}/{expected}"
-
-        if status == Tenant.Status.ACTIVE:
-            # Common state after a deploy adds new TENANT_APPS migrations.
-            # Operator needs to run migrate_schemas - we do NOT mark as failed.
-            return Decision(
-                new_status=status, status_change=False,
-                warning=(f"ACTIVE but behind on migrations ({progress}); "
-                         f"run `manage.py migrate_schemas --tenant`."),
-            )
-        if status == Tenant.Status.PENDING:
-            return Decision(
-                new_status=status, status_change=False,
-                warning=(f"PENDING with partial migrations ({progress}); "
-                         f"manual review - likely interrupted run."),
-            )
-        if status == Tenant.Status.NEW:
-            return Decision(
-                new_status=status, status_change=False,
-                warning=(f"NEW but schema partial ({progress}); "
-                         f"likely failed initial provisioning."),
-            )
-        if status == Tenant.Status.DEACTIVATED:
-            return Decision(
-                new_status=status, status_change=False,
-                warning=(f"DEACTIVATED, behind on migrations ({progress}); informational."),
-            )
-        # FAILED + partial - that's the expected failed state.
-        return Decision(new_status=status, status_change=False)
-
-    # ------------------------------------------------------------------
-    def _apply_status(self, tenant: Tenant, new_status: str, reason: str) -> None:
-        update_fields = {
-            "status": new_status,
-            "status_changed_at": timezone.now(),
-        }
-        if new_status in (Tenant.Status.ACTIVE, Tenant.Status.DEACTIVATED):
-            update_fields["last_error"] = ""
+            self.holders = migrator.lease_holders()
+        except Exception as e:
+            if not migrator.is_conn_error(e):
+                raise
+            raise CommandError(f"default unreachable: {e}")
+        if options["check"]:
+            self._check()
         else:
-            update_fields["last_error"] = reason
-        Tenant.objects.filter(pk=tenant.pk).update(**update_fields)
-        resolve_cache.forget_tenant(tenant)   # .update() bypasses post_save
-        # No beat nudge: the fanout dispatcher reads the ACTIVE set fresh each tick.
+            self._report(options["schema"], options["only_pending"], options["plan"])
 
     # ------------------------------------------------------------------
-    # Migration introspection
+    # Shared pieces
     # ------------------------------------------------------------------
-    def _applied(self, conn: Any, schema_name: str) -> int:
-        labels = self._tenant_app_labels()
-        if not labels:
-            return 0
-        with conn.cursor() as cur:
-            # psycopg.sql.Identifier, not an f-string. This is a PARAM-LESS execute(), i.e.
-            # the simple query protocol, where `;` starts a second statement — so a name
-            # carrying `"` would close the quotes and run whatever followed it. Identifier
-            # DOUBLES an internal quote, keeping the whole thing one identifier and one
-            # statement. Django builds SQL this way itself — see CursorMixin.callproc in the
-            # postgresql backend.
-            #
-            # What then happens to such a name is NOT an error: Postgres allows search_path to
-            # name schemas that do not exist and silently ignores them, so the SET succeeds and
-            # the SELECT below resolves django_migrations through the `public` fallback —
-            # reporting the PUBLIC schema's count for that tenant. A misleading number in a
-            # report, which is a long way better than the alternative.
-            #
-            # quote_schema() is the project's usual choice and every other schema-into-SQL site
-            # uses it, but it RAISES, and this command must survive one bad row to report the
-            # other tenants. Reaching here at all takes three independent bypasses: a row that
-            # skipped the model validators, a schema physically created outside
-            # create_tenant_schema / migrate_schemas (both of which quote_schema would have
-            # refused), and schema_exists() — itself parameterised — confirming that schema is
-            # really there. Length is not a concern either way: TenantMixin.schema_name is
-            # varchar(63), so an over-long name never reaches the database.
-            cur.execute(
-                sql.SQL("SET search_path TO {}, public").format(sql.Identifier(schema_name))
-            )
-            cur.execute(
-                "SELECT COUNT(*) FROM django_migrations WHERE app = ANY(%s)",
-                [list(labels)],
-            )
-            row = cur.fetchone()
-        return int(row[0]) if row else 0
+    def _pending_state(self, t: Tenant) -> tuple[bool, str]:
+        """(stuck, why) for a PENDING tenant: in progress while its lease is live or a
+        tm:<pk> backend is still active (expired lease, or a lease released after a lost
+        connection — the migrator will not take it until that backend is gone); stuck
+        otherwise."""
+        h = self.holders.get(t.pk)
+        if h is not None and not h.expired:
+            return False, f"in progress (lease {h.owner})"
+        s = migrator.shard_session_active(t.shard.alias, t.pk)
+        lease = "lease expired" if h is not None else "no lease"
+        if s is not None:
+            return False, f"in progress ({lease}, backend pid {s.pid} still active)"
+        return True, f"stuck ({lease}, no active backend)"
 
-    def _expected(self) -> int:
-        if hasattr(self, "_expected_cache"):
-            return self._expected_cache
-        loader = MigrationLoader(connection)
-        labels = self._tenant_app_labels()
-        self._expected_cache = sum(
-            1 for (app, _) in loader.graph.nodes if app in labels
-        )
-        return self._expected_cache
-
-    def _tenant_app_labels(self) -> set:
-        if hasattr(self, "_labels_cache"):
-            return self._labels_cache
-        self._labels_cache = {
-            a.rsplit(".", 1)[-1] for a in settings.TENANT_APPS
-        }
-        return self._labels_cache
+    @staticmethod
+    def _tenants(**filters: Any):
+        return (Tenant.objects.select_related("shard").filter(**filters)
+                .exclude(schema_name=get_public_schema_name()).order_by("shard__alias", "schema_name"))
 
     # ------------------------------------------------------------------
-    # Report mode
+    # --check
     # ------------------------------------------------------------------
-    def _print_report(self, single_schema: Optional[str] = None) -> None:
-        qs = Tenant.objects.select_related("shard").exclude(schema_name=get_public_schema_name())
-        if single_schema:
-            qs = qs.filter(schema_name=single_schema)
+    def _check(self) -> None:
+        problems: list[str] = []
+        try:
+            if migrator.code_older_than_db():
+                problems.append("code_older_than_db: public holds migrations this code does not "
+                                "know, applied by a newer release — deploy the newer code")
+            plan = migrator.public_plan()
+            if plan:
+                problems.append(f"public: {len(plan)} migration(s) behind — run "
+                                f"`migrate_schemas --shared`")
+            active = list(self._tenants(status=Tenant.Status.ACTIVE))
+            pending = list(self._tenants(status=Tenant.Status.PENDING))
+        except Exception as e:
+            if not migrator.is_conn_error(e):
+                raise
+            raise CommandError(f"reconcile_tenants --check: default unreachable: {e}")
 
-        self.stdout.write(
-            f"{'SCHEMA':<20} {'SHARD':<14} {'STATUS':<13} "
-            f"{'APPLIED':<10} {'PREV':<13} NOTES"
-        )
-        self.stdout.write("-" * 100)
-
-        any_behind = any_pending = any_failed = False
-
-        for t in qs:
-            try:
-                conn = connections[t.shard.alias]
-            except ConnectionDoesNotExist:
-                self.stdout.write(self.style.ERROR(
-                    f"{t.schema_name:<20} {t.shard.alias:<14} {t.status:<13} "
-                    f"{'?':<10} {t.previous_status:<13} shard alias not configured!"
-                ))
+        n_behind = n_missing = n_stuck = 0
+        unreachable: set[str] = set()
+        for t in active:
+            alias = t.shard.alias
+            if alias in unreachable:
                 continue
+            try:
+                b = migrator.behind(t)
+            except Exception as e:
+                if not migrator.is_conn_error(e):
+                    raise
+                unreachable.add(alias)
+                problems.append(f"shard {alias} unreachable: {e}".rstrip())
+                continue
+            if b is None:
+                n_missing += 1
+                problems.append(f"{t.schema_name} ({alias}): ACTIVE but its schema is missing")
+            elif b:
+                n_behind += 1
+                hint = ("" if t.shard.is_active else
+                        f"; shard {alias} is inactive, so `--tenant` skips it")
+                problems.append(f"{t.schema_name} ({alias}): {b} migration(s) behind — run "
+                                f"`migrate_schemas -s {t.schema_name}`{hint}")
+        for t in pending:
+            try:
+                stuck, why = self._pending_state(t)
+            except Exception as e:
+                if not migrator.is_conn_error(e):
+                    raise
+                stuck, why = True, f"unknown (shard {t.shard.alias} unreachable)"
+            if stuck:
+                n_stuck += 1
+                self.stdout.write(f"WARN stuck PENDING {t.schema_name} ({t.shard.alias}): {why}")
 
-            if not schema_exists(t.schema_name, t.shard.alias):
-                applied_str = "-"
-                note = (self.style.ERROR("ACTIVE but no schema!")
-                        if t.status == Tenant.Status.ACTIVE else "no schema")
-            else:
-                applied = self._applied(conn, t.schema_name)
-                expected = self._expected()
-                applied_str = f"{applied}/{expected}"
-                if applied >= expected:
-                    note = (self.style.SUCCESS("up to date")
-                            if t.status == Tenant.Status.ACTIVE else f"({t.status})")
-                else:
-                    if t.status == Tenant.Status.ACTIVE:
-                        any_behind = True
-                    note = self.style.WARNING(f"behind ({expected - applied} pending)")
+        for p in problems:
+            self.stdout.write(f"FAIL {p}")
+        self.stdout.write(f"checked_active={len(active)} behind={n_behind} missing={n_missing} "
+                          f"pending_stuck={n_stuck} unreachable_shards={sorted(unreachable)}")
+        if problems:
+            raise CommandError(f"reconcile_tenants --check: {len(problems)} problem(s).", returncode=1)
+        self.stdout.write("OK")
 
-            if t.status == Tenant.Status.PENDING:
-                any_pending = True
-            if t.status == Tenant.Status.FAILED:
-                any_failed = True
+    # ------------------------------------------------------------------
+    # --report
+    # ------------------------------------------------------------------
+    def _report(self, schema: str | None, only_pending: bool, names: bool) -> None:
+        filters: dict[str, Any] = {}
+        if schema:
+            filters["schema_name"] = schema
+        if only_pending:
+            filters["status"] = Tenant.Status.PENDING
+        tenants = list(self._tenants(**filters))
+        if schema and not tenants:
+            raise CommandError(f"Tenant {schema!r} not found"
+                               f"{' (or not PENDING)' if only_pending else ''}.")
+        self.stdout.write(f"{'SCHEMA':<24} {'SHARD':<10} {'STATUS':<12} {'BEHIND':<10} {'LEASE':<44} NEXT")
+        if not schema and not only_pending:
+            self._public_row(names)
+        unreachable: set[str] = set()
+        for t in tenants:
+            self._tenant_row(t, names, unreachable)
 
-            self.stdout.write(
-                f"{t.schema_name:<20} {t.shard.alias:<14} {t.status:<13} "
-                f"{applied_str:<10} {t.previous_status:<13} {note}"
-            )
+    def _lease_text(self, key: int) -> str:
+        h = self.holders.get(key)
+        if h is None:
+            return "-"
+        return f"{h.owner} since {h.since:%Y-%m-%dT%H:%M:%SZ}{' EXPIRED' if h.expired else ''}"
 
-        self.stdout.write("")
-        if any_behind:
-            self.stdout.write(self.style.WARNING(
-                "-> ACTIVE tenants are behind on migrations. "
-                "Run `python manage.py migrate_schemas --tenant`."
-            ))
-        if any_pending:
-            self.stdout.write(self.style.WARNING(
-                "-> PENDING tenants detected. "
-                "Run `python manage.py reconcile_tenants --only-pending`."
-            ))
-        if any_failed:
-            self.stdout.write(self.style.ERROR(
-                "-> FAILED tenants detected. Manual admin attention required."
-            ))
-        if not (any_behind or any_pending or any_failed):
-            self.stdout.write(self.style.SUCCESS("-> All tenants in the expected state."))
+    def _row(self, schema: str, shard: str, status: str, behind: str, key: int,
+             next_: str, notes: list[str], plan: list[tuple[str, str]] | None) -> None:
+        self.stdout.write(f"{schema:<24} {shard:<10} {status:<12} {behind:<10} "
+                          f"{self._lease_text(key):<44} {next_}")
+        for n in notes:
+            self.stdout.write(f"{'':<24} {n}")
+        for app, name in plan or ():
+            self.stdout.write(f"{'':<24}   - {app}.{name}")
+
+    def _public_row(self, names: bool) -> None:
+        try:
+            plan = migrator.public_plan()
+        except Exception as e:
+            if not migrator.is_conn_error(e):
+                raise
+            self._row("public", "default", "-", "?", 0, "default unreachable", [str(e)], None)
+            return
+        if 0 in self.holders:
+            nxt = self._lease_next(0, "shared", ["default"])
+        else:
+            nxt = "migrate_schemas --shared" if plan else "-"
+        self._row("public", "default", "-", str(len(plan)), 0, nxt, [], plan if names else None)
+
+    def _lease_next(self, key: int, target: str, aliases: list[str]) -> str:
+        """Next step while lease `key` is held."""
+        h = self.holders[key]
+        if not h.expired:
+            return f"wait: migration in progress ({h.owner})"
+        for alias in aliases:
+            s = migrator.shard_session_active(alias, key)
+            if s is not None:
+                return f"wait: lease expired, backend pid {s.pid} on {alias} still active"
+        return f"migration_lease --release {target}, then rerun"
+
+    def _tenant_row(self, t: Tenant, names: bool, unreachable: set[str]) -> None:
+        alias, schema, status = t.shard.alias, t.schema_name, t.status
+        if alias in unreachable:
+            self._row(schema, alias, status, "?", t.pk, "shard unreachable", [], None)
+            return
+        notes: list[str] = []
+        plan: list[tuple[str, str]] | None = None
+        try:
+            p = migrator.pending_plan(t)
+            behind = "no schema" if p is migrator.MISSING else str(len(p))
+            if p is not migrator.MISSING and names:
+                plan = p
+            invalid = migrator.invalid_indexes(alias, schema) if p is not migrator.MISSING else ()
+            if status == Tenant.Status.PENDING:
+                notes.append(f"PENDING {self._pending_state(t)[1]}")
+            nxt = self._next(t, p, invalid)
+        except Exception as e:
+            if not migrator.is_conn_error(e):
+                raise
+            unreachable.add(alias)
+            self._row(schema, alias, status, "?", t.pk, "shard unreachable", [str(e).strip()], None)
+            return
+        if invalid:
+            notes.append(f"INVALID indexes: {', '.join(invalid)}")
+        if status == Tenant.Status.FAILED and t.last_error:
+            notes.append(f"last_error: {t.last_error.strip().splitlines()[-1][:160]}")
+        self._row(schema, alias, status, behind, t.pk, nxt, notes, plan)
+
+    def _next(self, t: Tenant, plan: Any, invalid: tuple[str, ...]) -> str:
+        s, schema = t.status, t.schema_name
+        if t.pk in self.holders:
+            return self._lease_next(t.pk, schema, [t.shard.alias])
+        if s == Tenant.Status.FAILED:
+            return "admin: FAILED → NEW (see last_error)"
+        if s == Tenant.Status.MAINTENANCE:
+            return (f"operator-owned: after the repair `migrate_schemas -s {schema} "
+                    f"--maintenance`, then admin → ACTIVE")
+        if invalid:
+            return f"DROP INDEX CONCURRENTLY each INVALID index, then `migrate_schemas -s {schema}`"
+        if plan is migrator.MISSING:
+            if s in migrator.PROVISIONABLE:
+                return f"migrate_schemas -s {schema}"
+            return (f"schema missing: restore it (runbook §19, via MAINTENANCE); "
+                    f"`migrate_schemas -s {schema}` would mark it FAILED schema_missing")
+        if plan or s in migrator.PROVISIONABLE:
+            return f"migrate_schemas -s {schema}"
+        return "-"

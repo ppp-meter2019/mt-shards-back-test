@@ -14,7 +14,7 @@ from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from django_tenants.utils import get_public_schema_name
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import APIException, PermissionDenied
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.serializers import BaseSerializer
@@ -22,6 +22,7 @@ from rest_framework.views import APIView
 
 # Runtime layer — absolute imports ACROSS the console boundary (allowed direction:
 # console -> tenants; never the reverse. See tenants/console/__init__.py).
+from tenants import migrator
 from tenants.context import tenant_context
 from tenants.models import Domain, ReservedHostRule, Shard, Tenant
 from tenants.permissions import IsTenantAdminOnPublic
@@ -35,6 +36,18 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TenantMaintenance(APIException):
+    """409 for any console write on a MAINTENANCE tenant: the status is operator-owned and
+    changes only in the platform admin (deploy/migrations_plan_rev7.md §2.3, §14.3)."""
+    status_code = status.HTTP_409_CONFLICT
+    default_code = "tenant_maintenance"
+
+    def __init__(self, what: str) -> None:
+        super().__init__({"detail": f"Tenant is in maintenance; {what} — managed by the "
+                                    f"platform admin.",
+                          "code": "tenant_maintenance"})
 
 
 class BaseDomainsView(APIView):
@@ -227,6 +240,10 @@ class TenantViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance: Tenant) -> None:
         self._guard_public(instance)
+        # A MAINTENANCE tenant may be mid-restore (pg_restore into its schema): deleting it
+        # here, worse with ?drop_schema=true, would pull the schema out from under the DBA.
+        if instance.status == Tenant.Status.MAINTENANCE:
+            raise TenantMaintenance("finish maintenance first")
         # Optional: also drop the tenant's schema (DELETE ?drop_schema=true).
         # Deleting the row leaves the schema (auto_drop_schema=False); when the
         # operator opts in we queue a service-queue task to drop it on the shard.
@@ -295,7 +312,7 @@ class TenantViewSet(viewsets.ModelViewSet):
         Re-provisioning guard: only a NEW tenant is provisionable. Any other
         status is rejected (409) — you cannot re-provision an already-provisioned
         tenant (ACTIVE/DEACTIVATED), one in progress (PENDING), or a FAILED one
-        (reset it via reconcile_tenants first).
+        (reset it in the admin: FAILED → NEW).
         """
         tenant = self.get_object()
         self._guard_public(tenant)
@@ -386,7 +403,7 @@ class TenantViewSet(viewsets.ModelViewSet):
 
         The serializer's status field is read-only, so this dedicated action
         is the only way to flip the bit from the API. We use UPDATE WHERE to
-        avoid races with a concurrent migrate_schemas / reconcile_tenants run.
+        avoid races with a concurrent status change.
         """
         return self._transition(
             pk,
@@ -396,23 +413,42 @@ class TenantViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def activate(self, request: Request, pk: str | None = None) -> Response:
-        """Transition DEACTIVATED -> ACTIVE via atomic UPDATE WHERE."""
+        """Transition DEACTIVATED -> ACTIVE via atomic UPDATE WHERE — only through the
+        reactivation stopper (migrator.check_reactivation, §14.3): a tenant deactivated
+        across a release has missed its migrations and must not be served by code that
+        expects them. 409 schema_behind / schema_missing (fix: `migrate_schemas -s X`),
+        503 deploy_in_progress / shard_unreachable (retry)."""
         return self._transition(
             pk,
             from_status=Tenant.Status.DEACTIVATED,
             to_status=Tenant.Status.ACTIVE,
+            stopper=True,
         )
 
-    def _transition(self, pk: str, *, from_status: str, to_status: str) -> Response:
+    def _transition(self, pk: str, *, from_status: str, to_status: str,
+                    stopper: bool = False) -> Response:
         tenant = self.get_object()
         self._guard_public(tenant)
+        if tenant.status == Tenant.Status.MAINTENANCE:
+            raise TenantMaintenance(f"cannot move it to '{to_status}' from the console")
+        if stopper and tenant.status == from_status:
+            try:
+                migrator.check_reactivation(tenant)
+            except migrator.ReactivationBlocked as exc:
+                body = {"detail": f"Cannot activate '{tenant.schema_name}': {exc}. "
+                                  + ("Retry later." if exc.status == 503 else
+                                     f"Run `migrate_schemas -s {tenant.schema_name}` first."),
+                        "code": exc.code}
+                if isinstance(exc, migrator.SchemaBehind):
+                    body["pending"] = exc.pending
+                return Response(body, status=exc.status)
         updated = Tenant.objects.filter(pk=tenant.pk, status=from_status).update(
             previous_status=F("status"),
             status=to_status,
             # .update() bypasses Tenant.save(), which is what stamps this on the .save()
-            # paths — so set it here, as every other status writer does (migrate_schemas,
-            # reconcile_tenants). Without it a deactivation would leave the field showing
-            # when the row was last EDITED, which the console renders as the status age.
+            # paths — so set it here, as every other status writer does (tenants.migrator).
+            # Without it a deactivation would leave the field showing when the row was last
+            # EDITED, which the console renders as the status age.
             status_changed_at=timezone.now(),
         )
         if not updated:

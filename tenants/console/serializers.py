@@ -104,7 +104,7 @@ class TenantSerializer(serializers.ModelSerializer):
             "domains",
             "admins",
         ]
-        # status is managed by migrate_schemas / reconcile_tenants commands and
+        # status is managed by the migrator (migrate_schemas, Celery) and
         # by dedicated actions (activate/deactivate); the API never lets
         # clients write it via the generic serializer.
         read_only_fields = [
@@ -255,7 +255,15 @@ class TenantSerializer(serializers.ModelSerializer):
         """
         domain = validated_data.pop("domain", None)
         with transaction.atomic():
-            tenant = super().update(instance, validated_data)
+            # Only the fields this request changes — never a full-row save(): the row was
+            # read at the start of the request, and a full save would write back its stale
+            # status / previous_status / last_error over a concurrent change (the migrator's
+            # claim, the admin's MAINTENANCE). post_save still fires → forget_tenant.
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            if validated_data:
+                instance.save(update_fields=list(validated_data))
+            tenant = instance
             if domain:
                 primary = instance.domains.filter(is_primary=True).first()
                 old_host = primary.domain if primary else None

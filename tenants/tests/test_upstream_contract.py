@@ -24,6 +24,9 @@ is not installed at all.
 """
 import argparse
 import inspect
+import io
+import sys
+from unittest import mock
 
 from django.test import SimpleTestCase
 
@@ -89,3 +92,90 @@ class OurPatchLandsTests(SimpleTestCase):
                 self.assertIsNotNone(patched, f"django_tenants.utils.{name} is gone")
                 self.assertEqual(patched.__module__, "tenants.context",
                                  "apps.ready() monkeypatch did not take effect")
+
+
+class MigratorUpstreamContractTests(SimpleTestCase):
+    """What tenants.migrator / migrate_schemas assume about django-tenants, psycopg, the
+    stdlib and the Django admin (deploy/migrations_plan_rev7.md §18.2; UPSTREAM_FORK.md §4).
+    run_migrations is driven for real here, with its DB edges mocked: the canaries check the
+    BEHAVIOUR the migrator compensates for, not just that the names exist."""
+
+    class _Tty(io.StringIO):
+        def isatty(self) -> bool:                        # upstream styles only a terminal
+            return True
+
+    def _run(self, *, fail: bool = False, idx: int | None = None, count: int | None = None):
+        from django_tenants.migration_executors import base
+
+        class FakeMigrate:
+            def __init__(self, stdout, stderr) -> None:
+                self.stdout = stdout
+
+            def execute(self, *args, **options) -> None:
+                self.stdout.write("  Applying app.0001_x... OK")
+                if fail:
+                    raise ValueError("boom")
+
+        conn = mock.MagicMock()
+        out = self._Tty()
+        with mock.patch("django.db.connections", {"tenant_1": conn}), \
+             mock.patch.object(base, "MigrationRecorder"), \
+             mock.patch.object(base, "transaction"), \
+             mock.patch.object(base, "get_tenant_base_migrate_command_class", return_value=FakeMigrate), \
+             mock.patch.object(sys, "stdout", out):
+            try:
+                base.run_migrations([], {"database": "tenant_1", "verbosity": 1}, "standard",
+                                    "acme", idx=idx, count=count)
+            except ValueError:
+                pass
+        return conn, out.getvalue().splitlines()
+
+    def test_run_migrations_line_prefix_is_what_the_log_tee_strips(self) -> None:
+        """§9.9: the per-tenant log file holds the output WITHOUT upstream's
+        "[standard:acme] " prefix (coloured on a terminal, "[1/9 (11%) …]" with progress)."""
+        from tenants.migrator import _clean
+        for kw in ({}, {"idx": 0, "count": 9}):
+            _, lines = self._run(**kw)
+            applied = [line for line in lines if "Applying" in line]
+            self.assertEqual(len(applied), 1, lines)
+            self.assertNotEqual(applied[0], "  Applying app.0001_x... OK")   # really prefixed
+            self.assertEqual(_clean(applied[0]), "  Applying app.0001_x... OK", applied[0])
+
+    def test_run_migrations_closes_the_connection_only_on_success(self) -> None:
+        """§7: hence _close_shard in the migrator's finally — on a failure upstream leaves the
+        shard connection open, with our lock_timeout on it."""
+        conn, _ = self._run()
+        conn.close.assert_called_once_with()
+        conn, _ = self._run(fail=True)
+        conn.close.assert_not_called()
+
+    def test_set_schema_takes_include_public(self) -> None:
+        """B1 (§5.4) and the trap at base.py:47-49: pending_plan() reads the tenant's own
+        django_migrations with set_schema(..., include_public=False)."""
+        from django_tenants.postgresql_backend.base import DatabaseWrapper
+        self.assertIn("include_public", inspect.signature(DatabaseWrapper.set_schema).parameters)
+
+    def test_psycopg_cancels_and_waits_on_keyboard_interrupt(self) -> None:
+        """§6.5: after Ctrl-C the lease is released only if the shard backend is idle — which
+        relies on psycopg cancelling the running query and waiting for it before re-raising,
+        and on transaction_status telling ACTIVE from idle."""
+        from psycopg import connection as pg_connection
+        interrupted = pg_connection._INTERRUPTED                 # a class or a tuple of them
+        self.assertTrue(issubclass(KeyboardInterrupt, interrupted), interrupted)
+        src = inspect.getsource(pg_connection.Connection.wait)
+        self.assertIn("_try_cancel", src)
+        self.assertIn("transaction_status == ACTIVE", src)
+
+    def test_multiprocessing_and_prctl(self) -> None:
+        """§9.7 m7: the hard stop kills multiprocessing.active_children(); §9.6: workers
+        arm PR_SET_PDEATHSIG through libc's prctl (Linux)."""
+        import ctypes
+        import multiprocessing
+        self.assertTrue(callable(multiprocessing.active_children))
+        self.assertTrue(hasattr(ctypes.CDLL(None), "prctl"))
+
+    def test_admin_changeform_view_runs_in_a_transaction(self) -> None:
+        """§14.2: TenantAdmin.save_model rolls a lost status CAS back with
+        transaction.set_rollback(True), which needs the admin's surrounding atomic()."""
+        from django.contrib.admin import ModelAdmin
+        self.assertIn("transaction.atomic", inspect.getsource(ModelAdmin.changeform_view))

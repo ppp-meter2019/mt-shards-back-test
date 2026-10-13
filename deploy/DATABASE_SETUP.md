@@ -288,17 +288,21 @@ Creating the `Tenant` row (admin UI or API) only inserts a registry record with
 step on a backend host.
 
 ```bash
-# Resolves the shard from Tenant.shard, CREATE SCHEMA for NEW tenants,
-# runs TENANT_APPS migrations, flips NEW -> ACTIVE.
+# Under the tenant's lease: resolves the shard from Tenant.shard, CREATE SCHEMA on that
+# shard, runs the migrations with lock_timeout=5s, flips NEW -> PENDING -> ACTIVE.
 python manage.py migrate_schemas --schema_name=acme
 ```
 
-Expected:
+Expected (last lines):
 ```
-=== Shard 'tenant_1': 1 tenant(s) eligible ===
-  -> Created schema 'acme' on 'tenant_1'
-OK   acme -> active
+ok          acme                     tenant_1       12.40s  provisioned
+=== migrate_schemas summary ===
+...
+ok=1  noop=0  failed=0  skipped=0  not_run=0  interrupted=0
 ```
+
+The console's **Provision** button does the same through the Celery task
+`provision_tenant`, which calls the same migrator core.
 
 What the router/`allow_migrate` guarantees during this run:
 
@@ -308,10 +312,13 @@ What the router/`allow_migrate` guarantees during this run:
 So `acme`'s `orders_order`, `cars_car`, … are created **only** in
 `tenant_1.acme`, never in `public`.
 
-The status transition is an **atomic claim**: `migrate_schemas` does
-`UPDATE … WHERE status IN (NEW, ACTIVE, DEACTIVATED) → PENDING` so two
-concurrent runs can't migrate the same tenant; on success it finalizes to
-`ACTIVE` (or the previous status), on error to `FAILED` with `last_error`.
+Concurrency is guarded by a per-tenant **lease** (a row in
+`tenants_migrationlease`): a second run that finds the tenant leased skips it as
+`locked` at once. Every status write is a compare-and-swap fenced by that lease.
+Provisioning goes NEW → PENDING → ACTIVE (FAILED with `last_error` on error).
+**Upgrades of ACTIVE/DEACTIVATED tenants do not touch the status** — the tenant keeps
+serving traffic while it is migrated. Full rules, deploy order and runbook:
+`deploy/migrations_zero_downtime.md`.
 
 The first `company_admin` for the tenant is created either via the admin UI
 ("Create admin" button → `POST /api/tenants/<id>/create-admin/`) or in a shell
@@ -360,21 +367,56 @@ with threads.
 Don't compute a "safe" number on paper and assume it holds — **measure** with
 the Aurora `DatabaseConnections` CloudWatch metric under load and keep it
 comfortably below `max_connections`. If you approach the ceiling, lower
-`CONN_MAX_AGE` or front Aurora with a pooler.
+`CONN_MAX_AGE`.
 
-> Pooler caveat: we deliberately skipped RDS Proxy for this stack. A
-> transaction-pooling pooler like **PgBouncer** would additionally require
-> `DISABLE_SERVER_SIDE_CURSORS = True` in `DATABASES` (server-side cursors
-> break when a connection isn't bound for the whole transaction). Revisit only
-> if metrics demand it.
+A `migrate_schemas` run adds to that: per shard up to `--jobs-per-shard`
+migration connections plus short checks, and up to `--jobs` short connections to
+`default` (closed after every access). See `deploy/migrations_zero_downtime.md` §10.
+
+### Pooler: RDS Proxy is mandatory, and it must keep session semantics
+
+All traffic — web, Celery and the migrator — goes through **RDS Proxy** (decided
+2026-10-10). Each `DATABASES` entry points `HOST` at the cluster's proxy endpoint
+(`*.proxy-*.rds.amazonaws.com`) and uses **`_proxy_db_options()`** instead of
+`_aurora_db_options()`: the proxy presents an ACM certificate that chains to the public
+Amazon roots, not to the RDS CA bundle (§4), so verify-full checks it against the OS
+trust store (`PROXY_CA_BUNDLE`, default `/etc/ssl/certs/ca-certificates.crt`).
+
+**Session semantics are required.** django-tenants switches schemas with a session-level
+`SET search_path`, and the migrator arms its shard connection with
+`set_config('lock_timeout', …, false)` and `application_name = tm:<tenant pk>`. RDS Proxy
+pins the session on such statements, which is exactly what is needed. Consequences:
+
+- **PgBouncer is acceptable only in session mode.** Transaction pooling would hand the
+  `search_path` / `lock_timeout` of one client to another.
+- A migrator connection must not sit idle longer than the proxy's idle client timeout: a
+  migration that computes in Python for a long time without queries is an anti-pattern
+  (backfills go separately, in batches).
+- A single tenant's migration longer than the proxy's maximum client-connection lifetime
+  (24 h) is not supported.
+- **TCP keepalives** are part of both `_proxy_db_options()` and `_aurora_db_options()`
+  (`keepalives=1`, idle 30 s, interval 10 s, 3 probes). A connection that died silently
+  (proxy or node gone without a RST) is detected in ~60 s and raises a connection error
+  instead of hanging a request, a Celery task or a `migrate_schemas` run for ever. Healthy
+  connections are never closed by them, and RDS Proxy does not count probes as requests.
+- The migrator does not depend on proxy specifics (pinning details, backend behaviour after
+  a client SIGKILL, cancel forwarding): its lease and fencing are plain `INSERT`/`UPDATE`.
+
+Details: `deploy/migrations_plan_rev7.md` §17.
 
 ---
 
 ## 10. Verification & recovery
 
 ```bash
-# Status of every tenant vs. its real migration state (read-only).
-python manage.py reconcile_tenants --report
+# Deploy gate: public and every ACTIVE tenant up to date? (exit 0/1, read-only)
+python manage.py reconcile_tenants --check
+
+# Status of every tenant vs. its real migration state, with the next command to run.
+python manage.py reconcile_tenants --report        # -s acme --plan for one tenant
+
+# Who is migrating what right now.
+python manage.py migration_lease --list
 
 # Confirm a schema physically exists on its shard.
 python manage.py dbshell --database=tenant_1 <<'SQL'
@@ -384,10 +426,13 @@ SQL
 
 | Symptom | Action |
 |---|---|
-| Tenant stuck in `PENDING` | `reconcile_tenants --only-pending` |
-| `FAILED` tenant after fixing the cause | set `status=NEW` in admin, then `migrate_schemas --schema_name=<name>` |
-| Schema missing for an `ACTIVE`/`DEACTIVATED` tenant | **data-loss territory** — `migrate_schemas` refuses and marks `FAILED`; restore from backup, then `create_tenant_schema <name>` before migrating |
+| Tenant stuck in `PENDING` (`WARN` in `--check`) | `migrate_schemas --schema_name=<name>` resumes it (or wait for the Celery retry); a leftover lease → `migration_lease --release <name>` |
+| `FAILED` tenant after fixing the cause | admin: FAILED → NEW **with the `confirm_schema` tick**, then `migrate_schemas --schema_name=<name>` |
+| Schema missing for an `ACTIVE`/`DEACTIVATED` tenant | **data-loss territory** — `migrate_schemas` marks it `FAILED schema_missing`; restore from backup via MAINTENANCE (below) |
 | Need a schema without migrations (restore workflow) | `create_tenant_schema <name>` (DBA-only; guards against `public` and default-shard) |
+
+The full runbook (lock timeouts, leases after a crash, INVALID indexes, quarantine, the
+legacy fallback) is in `deploy/migrations_zero_downtime.md` §13.
 
 ---
 
@@ -400,10 +445,13 @@ pg_dump -h "$TENANT_1_DB_HOST" -U tenants_app_tenant1 -d tenants_back \
         -n acme -Fc -f acme.dump          # single tenant schema
 ```
 
-To restore a schema into a fresh cluster: create the schema shell with
-`create_tenant_schema <name>` (or `pg_restore` the dump's schema), ensure the
-`Tenant` row points at the right shard, then run `migrate_schemas
---schema_name=<name>` to bring it up to the current migration head.
+To restore a tenant: admin → **MAINTENANCE** (refused while a migrator holds its
+lease; the web answers 503 `tenant_maintenance`, the tenant's own `/admin/` stays
+reachable) → `migration_lease --list` shows no lease or active session for it → DBA
+drops/creates the schema and `pg_restore`s the dump → `migrate_schemas
+--schema_name=<name> --maintenance` brings it to the current migration head →
+`reconcile_tenants --report -s <name>` → admin → ACTIVE (the reactivation stopper
+refuses while the schema is behind). Ensure the `Tenant` row points at the right shard.
 
 ---
 

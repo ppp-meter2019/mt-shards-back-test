@@ -145,11 +145,15 @@ sudo tail -f /var/log/supervisor/tenants_back.log
 cd /home/ubuntu/tenants_back
 sudo -u ubuntu git pull
 sudo -u ubuntu venv/bin/pip install -r requirements.txt
-sudo -u ubuntu venv/bin/python manage.py migrate_schemas --shared --database=default
-sudo -u ubuntu venv/bin/python manage.py migrate_schemas --tenant
+# міграції ДО перезапуску коду: --shared, потім --tenant; код 1 → зупинитись
+sudo -u ubuntu venv/bin/python manage.py migrate_schemas
+sudo -u ubuntu venv/bin/python manage.py reconcile_tenants --check
 sudo -u ubuntu venv/bin/python manage.py collectstatic --noinput
 sudo supervisorctl restart tenants_back
 ```
+
+Порядок, правила для міграцій (expand-only, `CONCURRENTLY`), розбір коду 1 і runbook —
+`deploy/migrations_zero_downtime.md`.
 
 ---
 

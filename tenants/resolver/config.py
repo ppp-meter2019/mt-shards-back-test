@@ -18,6 +18,8 @@ RESOLVE_DEFAULTS = {
     "HOLD_SECONDS": 5,                  # invalidation hold (tombstone) TTL
     "WARM_TTL_BY_STATUS": {             # positive TTL by tenant status, used ONLY under WARM
         "active": None, "deactivated": 3600, "failed": 1800, "new": 120, "pending": 120,
+        # operator-owned like FAILED; leaving it is an admin CAS that forgets the tenant
+        "maintenance": 1800,
     },
     "FILLCAP_PER_SEC": 20,              # global cap on flag-absent DB resolves
     "FILLCAP_LOCAL_PER_SEC": 5,         # per-pod fallback when the global counter is down

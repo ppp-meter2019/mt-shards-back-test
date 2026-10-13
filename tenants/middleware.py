@@ -98,6 +98,8 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
         #     so an operator can log in and inspect (best-effort; a too-broken schema may
         #     still 500). Not a security downgrade: same auth as ACTIVE; unlike
         #     DEACTIVATED, FAILED is an operational (not closed) state.
+        #   - MAINTENANCE -> 503 `tenant_maintenance` + Retry-After; /admin/ reachable, as
+        #     for FAILED (operator-owned repair, e.g. a restore; migrations_plan_rev7 §14.4).
         tenant = getattr(request, "tenant", None)
         if tenant is not None and tenant.schema_name != get_public_schema_name():
             st = tenant.status
@@ -111,13 +113,22 @@ class ShardAwareTenantMiddleware(TenantMainMiddleware):
                 # `/admin` (no slash) counts too — APPEND_SLASH would redirect it to
                 # `/admin/`, but CommonMiddleware runs after us, so match it here.
                 is_admin = request.path == "/admin" or request.path.startswith("/admin/")
-                if not (st == Tenant.Status.FAILED and is_admin):
+                operator_owned = st in (Tenant.Status.FAILED, Tenant.Status.MAINTENANCE)
+                if operator_owned and is_admin:
+                    return None
+                if st == Tenant.Status.MAINTENANCE:
                     return error_response(
-                        request, status=503, code="tenant_not_ready",
-                        detail="This tenant is not ready.",
-                        template="tenants/errors/not_ready.html",
-                        retry_after=300, extra={"status": st},
+                        request, status=503, code="tenant_maintenance",
+                        detail="This workspace is under maintenance.",
+                        template="tenants/errors/maintenance.html",
+                        retry_after=600,
                     )
+                return error_response(
+                    request, status=503, code="tenant_not_ready",
+                    detail="This tenant is not ready.",
+                    template="tenants/errors/not_ready.html",
+                    retry_after=300, extra={"status": st},
+                )
         return None
 
     def get_tenant(self, domain_model: type[Domain], hostname: str) -> TenantSnapshot:

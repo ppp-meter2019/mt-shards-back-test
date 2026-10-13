@@ -9,6 +9,7 @@ Grouped by concern:
   * gate.py       — E001: resolve-gate flag invariants (GATE requires WARM)
   * beat.py       — E002/E003/E005/E006: Celery beat schedule + fanout-dispatch contract
   * middleware.py — E004: MT middleware presence & relative order
+  * migrate.py    — E020/W021/E022/E024/E029: migrator settings (deploy/migrations_plan_rev7.md §13)
 
 Convention: every cross-layer / cross-module contract that would otherwise fail silently — or
 only at runtime — earns an E00x check here. All are MT-only (via the base.mt_check decorator);
@@ -24,6 +25,7 @@ from .beat import (
     fanout_task_registered,
 )
 from .middleware import mt_middleware_order
+from .migrate import migrator_settings
 
 __all__ = [
     "mt_check",
@@ -33,4 +35,5 @@ __all__ = [
     "fanout_task_registered",
     "fanout_entries_are_unique",
     "mt_middleware_order",
+    "migrator_settings",
 ]

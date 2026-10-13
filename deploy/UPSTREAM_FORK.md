@@ -1,13 +1,13 @@
 # Точки форку django-tenants
 
-Цей проєкт **не використовує django-tenants як є**. Він перевизначає вісім місць upstream,
+Цей проєкт **не використовує django-tenants як є**. Він перевизначає дев'ять місць upstream,
 копіює два фрагменти дослівно і спирається на кілька приватних/недокументованих API.
 Рішення свідоме — воно було передбачене ще в RGKB Decision Log («team acknowledges
 django-tenants may need to be forked»), бо upstream підтримує **одну** БД, а нам треба
 schema-per-tenant × shard-per-cluster.
 
 Ціна цього рішення — **бамп `django-tenants` не є бампом версії в `requirements.txt`**. Це
-ручна звірка по восьми файлах. Документ існує, щоб ту звірку можна було зробити за годину,
+ручна звірка по дев'яти файлах. Документ існує, щоб ту звірку можна було зробити за годину,
 а не за день, і щоб жодна точка не загубилась.
 
 > **Коли читати:** перед підняттям `django-tenants`, `celery` або `Django`.
@@ -34,10 +34,11 @@ schema-per-tenant × shard-per-cluster.
 | 2 | `tenants/middleware.py` | успадковуємо `TenantMainMiddleware`; перевизначаємо `process_request` (з `super()`) і `get_tenant` | `hostname_from_request` (зрізає `www.`!), `no_tenant_found` → `Http404`, `setup_url_routing`, `TENANT_NOT_FOUND_EXCEPTION` |
 | 3 | `tenants/context.py` | **заміна** `schema_context` / `tenant_context` на shard-aware версії | `connection.tenant`, `.set_tenant()`, `.set_schema()`, `.set_schema_to_public()` |
 | 4 | `tenants/apps.py:18-23` | monkeypatch `django_tenants.utils.schema_context/tenant_context` | атрибути модуля `django_tenants.utils` |
-| 5 | `tenants/management/commands/migrate_schemas.py` | успадковуємо `MigrateSchemasCommand`, переписуємо `handle` | `SyncCommon.handle` (виклик **напряму**), `GET_EXECUTOR_FUNCTION`, `self.options/args/executor/sync_public/sync_tenant/schema_name`, `_notice()`, `parser._actions` |
+| 5 | `tenants/management/commands/migrate_schemas.py` | успадковуємо `MigrateSchemasCommand` **лише заради парсера аргументів**; `handle` — власний мігратор (`tenants/migrator.py`, `deploy/migrations_plan_rev7.md` §9). Виконавці upstream (`GET_EXECUTOR_FUNCTION`, `--executor`) не використовуються | `SyncCommon.handle` (виклик **напряму**, лише розбір прапорців), `self.options/args/executor/sync_public/sync_tenant/schema_name`, `_notice()`, `parser._actions`; `run_migrations` (§4a) |
 | 6 | `tenants/management/commands/tenant_command.py` | успадковуємо upstream `Command`, **дзеркалимо** `run_from_argv` | `InteractiveTenantOption.get_tenant_from_options_or_interactive`, розкладка `argv` |
 | 7 | `tenants_back/settings_multitenant.py:32-38` (`SHARED_APPS`) | `tenants` **перед** `django_tenants` у `SHARED_APPS` | Django резолвить management-команди за порядком застосунків |
 | 8 | `tenants_back/settings_multitenant.py:66-76` (`DATABASE_ROUTERS`) | обхід літеральної перевірки роутера | `django_tenants/apps.py:41-44` |
+| 9 | `tenants/management/commands/migrate.py` + `tenants/test_runner.py` | upstream `migrate` (= `MigrateSchemasCommand`) **заборонено** в MT; пропускається лише під час створення тестових баз | парсер і `handle` `MigrateSchemasCommand`; Django `create_test_db` викликає `call_command("migrate", …)` |
 
 ---
 
@@ -96,13 +97,28 @@ return db != "default"                     # тенантські схеми —
 
 | Місце | Що чіпаємо | Що станеться, якщо зміниться |
 |---|---|---|
-| `migrate_schemas.py:102` | `SyncCommon.handle(self, ...)` викликається **напряму**, повз MRO | мовчазна зміна поведінки або `TypeError` |
-| `migrate_schemas.py:87-94` | ітерація `parser._actions`, щоб зняти дефолт `--database` | дефолт `'default'` повернеться → повний прогін пропустить усі шарди |
+| `migrate_schemas.py:294` | `SyncCommon.handle(self, ...)` викликається **напряму**, повз MRO | мовчазна зміна поведінки або `TypeError` |
+| `migrate_schemas.py:269-275` | ітерація `parser._actions`, щоб зняти дефолт `--database` | дефолт `'default'` повернеться → `--tenant` відфільтрує тенантів шарду `default` (їх немає) і повний прогін мовчки пропустить усі шарди з кодом 0 |
 | `migrate_schemas.py` | `self.options`, `self.args`, `self.executor`, `self.sync_public`, `self.sync_tenant`, `self.schema_name`, `self.PUBLIC_SCHEMA_NAME` | атрибути, які `SyncCommon` виставляє як побічний ефект |
 | `migrate_schemas.py` | `_notice()` з `SyncCommon` | зникне → `AttributeError` на першому ж виводі |
 | `apps.py:18-23` | monkeypatch модуля `django_tenants.utils` | **частковий за природою**: модуль, що імпортував helper ДО `ready()`, лишиться зі старою версією. Тому проєктний код зобов'язаний імпортувати з `tenants.context` — це статично стереже `scripts/ci_guard_context_import.sh` |
 | `middleware.py` | успадкований `hostname_from_request` зрізає префікс `www.` і порт | тихо змінить ключ кешу резолву й членство в `treg:hosts` |
 | `commons/platform/cache_keys.py` (standalone-гілка) | `django_redis.util.default_reverse_key` — аліасимо як `reverse_key` замість дублювати тіло (`key.split(":", 2)[2]`). Це **django-redis**, не django-tenants; пакет є в обох режимах (базовий `CACHES` backend). Неукрашений, і django_redis сам підставляє його dotted-path'ом як дефолт (`client/default.py`) — але це чужий внутрішній API | `ImportError` на імпорті `cache_keys` у **standalone**. Радіус: у standalone `KEY_FUNCTION` не підключений, тож сам кеш працює; впаде будь-який імпортер модуля. У MT ця гілка не виконується взагалі |
+
+### 4a. На що спирається мігратор (`tenants/migrator.py`, `migrate_schemas`)
+
+Не точки форку, а поведінка upstream, стандартної бібліотеки й Django, яку мігратор
+**компенсує або використовує**. Деталі — `deploy/migrations_plan_rev7.md` §7, §9.6–§9.9, §14.2.
+
+| Залежність | Де upstream | Що робить мігратор | Канарка |
+|---|---|---|---|
+| `run_migrations` закриває з'єднання **лише після успіху** | `django_tenants/migration_executors/base.py:62-71` | `_close_shard()` у `finally` завжди закриває з'єднання шарду, інакше на ньому лишився б `lock_timeout` | `test_run_migrations_closes_the_connection_only_on_success` |
+| пастка `include_public` | `base.py:45-49` | `pending_plan()` читає `django_migrations` тенанта з `set_schema(…, include_public=False)` і спершу перевіряє, що схема існує (B1) | `test_set_schema_takes_include_public` |
+| префікс рядків `[standard:acme] ` (`[1/9 (11%) …]` з прогресом), кольоровий на терміналі | `base.py:21-39` | tee в лог-файл тенанта зрізає префікс і ANSI (`_UPSTREAM_PREFIX_RE`) | `test_run_migrations_line_prefix_is_what_the_log_tee_strips` (ганяє справжній `run_migrations`) |
+| psycopg на `KeyboardInterrupt` скасовує запит і чекає його кінця; `transaction_status` | `psycopg/connection.py`, `Connection.wait` | після Ctrl-C оренда звільняється, лише якщо бекенд уже не ACTIVE (§6.5 плану) | `test_psycopg_cancels_and_waits_on_keyboard_interrupt` |
+| `multiprocessing.active_children()` | stdlib | жорстка зупинка вбиває воркерів пулу (не приватний `ex._processes`) | `test_multiprocessing_and_prctl` |
+| `prctl(PR_SET_PDEATHSIG)` через `ctypes` | libc, **лише Linux** | воркер пулу гине разом з батьком | `test_multiprocessing_and_prctl` |
+| `ModelAdmin.changeform_view` під `transaction.atomic` | `django/contrib/admin/options.py` | `TenantAdmin.save_model` відкочує програний CAS статусу через `set_rollback(True)` | `test_admin_changeform_view_runs_in_a_transaction` |
 
 ---
 
@@ -177,9 +193,10 @@ DATABASE_ROUTERS   = ["tenants.routers.TenantDatabaseRouter"]
 ## 7. Чекліст бампу `django-tenants`
 
 1. `pip download django-tenants==<нова>` і розпакувати поруч зі старою.
-2. `diff` по чотирьох файлах upstream:
+2. `diff` по шести файлах upstream:
    `routers.py`, `middleware/main.py`, `management/commands/__init__.py` (`SyncCommon`),
-   `management/commands/migrate_schemas.py`, `management/commands/tenant_command.py`.
+   `management/commands/migrate_schemas.py`, `management/commands/tenant_command.py`,
+   `migration_executors/base.py` (`run_migrations`, §4a).
 3. Звірити скопійовані блоки §3.1 і §3.2.
 4. Перевірити, що приватні атрибути з §4 на місці (насамперед `_notice`, `parser._actions`,
    сигнатура `SyncCommon.handle`).
@@ -220,8 +237,8 @@ DATABASE_ROUTERS   = ["tenants.routers.TenantDatabaseRouter"]
 
 ### Є: канарки на upstream-контракт
 
-`tenants/tests/test_upstream_contract.py` — 6 DB-free тестів, які падають, якщо upstream
-прибере те, на що ми спираємось:
+`tenants/tests/test_upstream_contract.py` — 12 DB-free тестів, які падають, якщо upstream
+прибере те, на що ми спираємось. Шість — на точки форку:
 
 | Тест | Стереже |
 |---|---|
@@ -234,6 +251,11 @@ DATABASE_ROUTERS   = ["tenants.routers.TenantDatabaseRouter"]
 
 Кожна перевірена ін'єкцією поломки — усі шість реально падають, коли контракт зламано, а не
 проходять «за замовчуванням».
+
+Ще шість (`MigratorUpstreamContractTests`) — на залежності мігратора з §4a. Дві з них
+перевіряють **поведінку**, а не форму: справжній `run_migrations` ганяється з підміненими
+БД-краями (префікс рядків; закриття з'єднання лише після успіху). Канарку префікса перевірено
+ін'єкцією поломки регекса.
 
 ### Немає: звірки семантики скопійованого коду
 

@@ -7,8 +7,8 @@ Models:
 Status transitions are enforced by:
   - Tenant.clean()                  (validation)
   - TenantAdminForm                 (UI)
-  - migrate_schemas command         (atomic claim + state machine)
-  - reconcile_tenants command       (manual recovery)
+  - tenants.migrator                (fenced CAS under the lease; migrate_schemas, Celery)
+  - reconcile_tenants command       (read-only: reports, never writes)
 
 Delete protections:
   - Tenant.shard FK is on_delete=PROTECT  (shard with tenants cannot be removed)
@@ -122,6 +122,9 @@ class Tenant(TenantMixin):
         ACTIVE      = "active",      "Active"
         DEACTIVATED = "deactivated", "Deactivated"
         FAILED      = "failed",      "Failed"
+        # Owned by the operator (admin / recovery script); the migrator never picks it up
+        # except via `migrate_schemas -s X --maintenance`. deploy/migrations_plan_rev7.md §2.3.
+        MAINTENANCE = "maintenance", "Maintenance (operator-owned)"
 
     # Human-readable company label. Unique + required, but NOT an identifier:
     # every lookup/routing uses schema_name. Named `company_name` rather than `name` so the
@@ -140,7 +143,7 @@ class Tenant(TenantMixin):
     # the latter: it fires on every .save() (an admin edit of `description` would shift it)
     # and never on QuerySet.update() (where every status writer lives). The value is now
     # maintained by save() below for .save() paths, and set explicitly by the .update()
-    # callers (migrate_schemas, reconcile_tenants, console.views.TenantViewSet._transition).
+    # callers (tenants.migrator, console.views.TenantViewSet._transition).
     status_changed_at = models.DateTimeField(default=timezone.now)
     last_error        = models.TextField(blank=True)
     created_on        = models.DateField(auto_now_add=True)
@@ -578,6 +581,24 @@ class TaskRun(models.Model):
         )
         cls.objects.filter(task=task, args_sig=args_sig, schema__in=schemas,
                            last_run_at__lt=run_ts).update(last_run_at=run_ts)
+
+
+class MigrationLease(models.Model):
+    """Migration mutex: one row per tenant (key = tenant.pk), key 0 = the `--shared` stage.
+
+    Lives in default.public next to Tenant, so the migrator's fenced status CAS is a single
+    UPDATE. No FK to Tenant on purpose: key 0 is not a tenant, and deleting a tenant must
+    not touch its lease (a leftover row is harmless). owner IS NULL = free. The lease is
+    not a migration journal, not an error marker and not a status — see
+    deploy/migrations_plan_rev7.md §4; all reads/writes go through tenants.migrator.
+    """
+    key   = models.BigIntegerField(primary_key=True)    # tenant.pk; 0 = --shared stage
+    owner = models.TextField(null=True)                 # host:pid:start_utc; NULL = free
+    since = models.DateTimeField(null=True)             # when acquired
+    until = models.DateTimeField(null=True)             # since + LEASE_TTL
+
+    def __str__(self) -> str:
+        return f"lease {self.key}: {self.owner or 'free'}"
 
 
 def sync_tenant_timezone(schema_name: str, tz: str | None) -> int:

@@ -47,8 +47,20 @@ class GateStatusMatrixTests(SimpleTestCase):
         self.assertEqual(self._gate(S.FAILED, "/administrators"), 503)  # not a false prefix match
         self.assertEqual(self._gate(S.FAILED, "/other"), 503)
 
+    def test_maintenance_503_with_retry_after_but_admin_exempt(self) -> None:
+        req = SimpleNamespace(path="/api/v1/x", META={"HTTP_ACCEPT": "application/json"},
+                              tenant=SimpleNamespace(status=S.MAINTENANCE, schema_name="alpha"))
+        with mock.patch.object(mw.TenantMainMiddleware, "process_request", return_value=None):
+            resp = self.mw.process_request(req)
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn(b'"tenant_maintenance"', resp.content)
+        self.assertEqual(resp["Retry-After"], "600")
+        self.assertIsNone(self._gate(S.MAINTENANCE, "/admin/"))
+        self.assertIsNone(self._gate(S.MAINTENANCE, "/admin"))
+        self.assertEqual(self._gate(S.MAINTENANCE, "/administrators"), 503)
+
     def test_public_tenant_exempt_regardless_of_status(self) -> None:
-        for st in (S.NEW, S.PENDING, S.FAILED, S.DEACTIVATED):
+        for st in (S.NEW, S.PENDING, S.FAILED, S.DEACTIVATED, S.MAINTENANCE):
             self.assertIsNone(self._gate(st, "/admin/", schema="public"))
 
     def test_health_path_short_circuits_before_gate(self) -> None:

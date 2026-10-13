@@ -277,16 +277,33 @@ AWS_RDS_CA = os.environ.get(
 )
 
 
+# TCP keepalives (libpq keywords) for every production connection. A connection that died
+# SILENTLY (a proxy or node gone without a RST, a network break in the middle) is otherwise
+# never noticed: a client waiting for a reply waits for ever — a migrate_schemas run hangs
+# on one tenant, a request or a Celery task on one query. With these a dead peer is found
+# in ~60 s (30 s idle + 3 × 10 s probes) and surfaces as a connection error, which the
+# migrator already handles. Probes are TCP-level only: a healthy connection — however long
+# its query runs — is never closed, and RDS Proxy does not count them as requests
+# (IdleClientTimeout is unaffected). deploy/migrations_plan_rev7.md §17.
+_TCP_KEEPALIVES = {
+    "keepalives":          1,
+    "keepalives_idle":     30,
+    "keepalives_interval": 10,
+    "keepalives_count":    3,
+}
+
+
 def _aurora_db_options(connect_timeout=5):
     """Build the OPTIONS dict for an Aurora database entry.
 
     Used in settings_local_multitenant.py when defining production DATABASES entries.
-    Returns connect_timeout + verify-full TLS using the vendored AWS RDS CA.
+    Returns connect_timeout + verify-full TLS using the vendored AWS RDS CA + TCP keepalives.
     """
     return {
         "connect_timeout": connect_timeout,
         "sslmode":         "verify-full",
         "sslrootcert":     AWS_RDS_CA,
+        **_TCP_KEEPALIVES,
     }
 
 
@@ -311,6 +328,7 @@ def _proxy_db_options(connect_timeout=5):
         "sslmode":         "verify-full",
         "sslrootcert":     os.environ.get(
             "PROXY_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt"),
+        **_TCP_KEEPALIVES,
     }
 
 # Platform base domains, for reference / future base-scoped rules. NOT read on the request
@@ -557,6 +575,23 @@ SESSION_CACHE_ALIAS = "sessions"
 # ---------------------------------------------------------------------------
 TENANT_RESOLVE = {}
 TENANT_REGISTRY = {}
+
+
+# ---------------------------------------------------------------------------
+# Tenant migrator (tenants/migrator.py, deploy/migrations_plan_rev7.md §3). Set per tenant
+# by the migrator on its own shard connection only (set_config) — never on web/Celery
+# connections or DB roles. Override in settings_local_multitenant.py.
+# ---------------------------------------------------------------------------
+TENANT_MIGRATE_DDL_LOCK_TIMEOUT = "5s"
+# Defaults for `migrate_schemas --jobs / --jobs-per-shard` (§9.6). 1/1 = sequential.
+TENANT_MIGRATE_JOBS = 1
+TENANT_MIGRATE_JOBS_PER_SHARD = 1
+# Per-run folders of per-tenant migration logs, written only by a CLI `migrate_schemas`
+# (§9.9). In an ephemeral container this MUST be a mounted volume, or the logs vanish.
+TENANT_MIGRATE_LOG_DIR = BASE_DIR / "logs" / "migrations"
+# `manage.py migrate` is disabled in MT (tenants/management/commands/migrate.py); this
+# runner lets Django's test-database creation through (§12). `testserver` is unsupported.
+TEST_RUNNER = "tenants.test_runner.TenantsTestRunner"
 
 
 # ---------------------------------------------------------------------------

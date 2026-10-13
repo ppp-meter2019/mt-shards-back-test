@@ -25,7 +25,7 @@ case "$MODE" in
     export USE_MULTITENANT=0
     # `tenants` is not installed here; its tests import tenants.models and would
     # fail at collection. Run explicit labels that exist in standalone instead.
-    labels=(users customers drivers cars products orders)
+    labels=(commons users customers drivers cars products orders)
     ;;
   *)
     echo "unknown mode: $MODE (expected mt|standalone)" >&2

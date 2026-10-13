@@ -8,14 +8,30 @@ falls back to the host's default queue there:
       on the availability path, and the cost is bounded by the treg:warming lock rather
       than by the queue. Full rationale at its decorator.
 
-provision_tenant is the async equivalent of
-`migrate_schemas --tenant --schema_name=<schema>`: create the schema on the tenant's
-shard, migrate it, flip NEW->ACTIVE/FAILED.
+provision_tenant calls the migrator core DIRECTLY (tenants.migrator.migrate_tenant, no
+call_command; deploy/migrations_plan_rev7.md §15.1): under the tenant's lease it creates
+the schema on its shard, migrates it and moves NEW/PENDING -> ACTIVE (or FAILED). No log
+files (those are a CLI feature). Only NEW/PENDING are taken; anything else is skipped.
 
-Re-provisioning guard: provisioning only runs on a NEW tenant. Any other status
-(PENDING in progress, ACTIVE/DEACTIVATED already provisioned, FAILED needs a reset via
-reconcile_tenants) is skipped. The real concurrency guard is migrate_schemas' atomic
-NEW->PENDING claim (UPDATE ... WHERE status='new'); this status check is a cheap early-out.
+  skipped `locked` / `code_older_than_db` -> retry in 5 min, up to 15 times: another run
+      holds the lease (or its backend is still working), or this worker is the OLD code
+      during a rollout — a new worker picks it up. While THIS task keeps retrying, it also
+      resumes a PENDING left by another run that died.
+  failed -> ERROR in the log, no retry.
+
+NO automatic recovery — the tenant stays PENDING (503) until an operator acts — when:
+  * the run fails with a lost connection AFTER the claim (`failed conn_error`): the status
+    is left PENDING on purpose (resumable), but nothing re-runs the task;
+  * this task's worker process dies mid-run (SIGKILL, OOM): with acks_late and the default
+    task_reject_on_worker_lost=False the message is acked, never redelivered;
+  * the 15 retries run out (MaxRetriesExceededError).
+The console cannot help: `provision` accepts only NEW, the admin does not let PENDING be
+changed. `reconcile_tenants --check` reports it as `WARN stuck PENDING`; the fix is
+`migrate_schemas -s <schema>` on a backend host (it resumes PENDING), after
+`migration_lease --release <schema>` if a dead run left its lease (`--force` while it has
+not expired, only once that process is certainly dead)
+(deploy/migrations_zero_downtime.md §13). Connection hygiene (no migrator lock_timeout
+left on this long-lived worker's connections) is the migrator's job: §7.
 
 The generic fan-out scheduler infrastructure (fanout_dispatch / sub_dispatch / the tz
 due-check) lives in tenants/celery/dispatch.py — imported at the bottom of THIS module so
@@ -29,31 +45,39 @@ from django.core.management import call_command
 
 from commons.platform.beat import task_queue
 
+from . import migrator
 from .models import Tenant
 
 logger = get_task_logger(__name__)
 
 
-@shared_task(bind=True, queue=task_queue("service"), acks_late=True, max_retries=0)
+PROVISION_RETRY_COUNTDOWN = 300
+PROVISION_MAX_RETRIES = 15
+_RETRY_REASONS = (migrator.Reason.LOCKED, migrator.Reason.CODE_OLDER_THAN_DB)
+
+
+@shared_task(bind=True, queue=task_queue("service"), acks_late=True,
+             max_retries=PROVISION_MAX_RETRIES)
 def provision_tenant(self, tenant_id: int) -> dict[str, Any]:
-    tenant = Tenant.objects.select_related("shard").get(pk=tenant_id)
+    tenant = Tenant.objects.filter(pk=tenant_id).first()
+    if tenant is None or tenant.status not in migrator.PROVISIONABLE:
+        status = tenant.status if tenant is not None else "deleted"
+        logger.warning("provision_tenant: skipping tenant %s — status %s is not NEW/PENDING.",
+                       tenant_id, status)
+        return {"tenant_id": tenant_id, "kind": "skipped", "reason": "not_provisionable",
+                "status": status}
 
-    if tenant.status != Tenant.Status.NEW:
-        logger.warning(
-            "provision_tenant: skipping %s — status is %s, not NEW (already "
-            "provisioned / in progress / failed).",
-            tenant.schema_name, tenant.status,
-        )
-        return {"schema": tenant.schema_name, "status": tenant.status, "skipped": True}
-
-    logger.info("Provisioning %s on shard %s", tenant.schema_name, tenant.shard.alias)
-    # migrate_schemas owns the status machine: NEW->PENDING claim, CREATE SCHEMA,
-    # migrate, finalize NEW->ACTIVE (or FAILED + last_error).
-    call_command("migrate_schemas", tenant=True, schema_name=tenant.schema_name)
-
-    tenant.refresh_from_db()
-    logger.info("Provision finished: %s -> %s", tenant.schema_name, tenant.status)
-    return {"schema": tenant.schema_name, "status": tenant.status, "skipped": False}
+    res = migrator.migrate_tenant(tenant_id, migrator.RunOptions())
+    out = {"tenant_id": tenant_id, "schema": res.schema, "kind": res.kind,
+           "reason": res.reason, "msg": res.msg}
+    if res.kind == "skipped" and res.reason in _RETRY_REASONS:
+        logger.info("provision_tenant: %s %s (%s); retry %d/%d in %ds", res.schema, res.reason,
+                    res.msg, self.request.retries + 1, PROVISION_MAX_RETRIES,
+                    PROVISION_RETRY_COUNTDOWN)
+        raise self.retry(countdown=PROVISION_RETRY_COUNTDOWN, max_retries=PROVISION_MAX_RETRIES)
+    if res.kind == "failed":
+        logger.error("provision_tenant: %s failed (%s): %s", res.schema, res.reason, res.msg)
+    return out
 
 
 @shared_task(queue=task_queue("service"), acks_late=True, max_retries=0)

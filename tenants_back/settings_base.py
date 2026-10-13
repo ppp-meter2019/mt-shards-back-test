@@ -396,3 +396,10 @@ CELERY_BEAT_SCHEDULE = {}
 AWS_S3_COORDINATES_BUCKET = os.environ.get("AWS_S3_COORDINATES_BUCKET", "")
 AWS_S3_REGION = os.environ.get("AWS_S3_REGION", "") or None
 
+
+# ---------------------------------------------------------------------------
+# lock_timeout for DDL in migrations. None here: business migrations also run in
+# standalone, where commons.platform.migration_ops resets lock_timeout TO DEFAULT.
+# Multi-tenant sets a value (settings_multitenant.py). deploy/migrations_plan_rev7.md §3, §8.
+# ---------------------------------------------------------------------------
+TENANT_MIGRATE_DDL_LOCK_TIMEOUT = None

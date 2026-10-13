@@ -17,6 +17,15 @@ class Migration(migrations.Migration):
 
     operations = [
         migrations.CreateModel(
+            name='MigrationLease',
+            fields=[
+                ('key', models.BigIntegerField(primary_key=True, serialize=False)),
+                ('owner', models.TextField(null=True)),
+                ('since', models.DateTimeField(null=True)),
+                ('until', models.DateTimeField(null=True)),
+            ],
+        ),
+        migrations.CreateModel(
             name='ReservedHostRule',
             fields=[
                 ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
@@ -69,8 +78,8 @@ class Migration(migrations.Migration):
                 ('schema_name', models.CharField(db_index=True, max_length=63, unique=True, validators=[django_tenants.postgresql_backend.base._check_schema_name])),
                 ('company_name', models.CharField(max_length=120, unique=True)),
                 ('description', models.TextField(blank=True)),
-                ('status', models.CharField(choices=[('new', 'New (not yet migrated)'), ('pending', 'Pending migration'), ('active', 'Active'), ('deactivated', 'Deactivated'), ('failed', 'Failed')], default='new', max_length=16)),
-                ('previous_status', models.CharField(choices=[('new', 'New (not yet migrated)'), ('pending', 'Pending migration'), ('active', 'Active'), ('deactivated', 'Deactivated'), ('failed', 'Failed')], default='new', max_length=16)),
+                ('status', models.CharField(choices=[('new', 'New (not yet migrated)'), ('pending', 'Pending migration'), ('active', 'Active'), ('deactivated', 'Deactivated'), ('failed', 'Failed'), ('maintenance', 'Maintenance (operator-owned)')], default='new', max_length=16)),
+                ('previous_status', models.CharField(choices=[('new', 'New (not yet migrated)'), ('pending', 'Pending migration'), ('active', 'Active'), ('deactivated', 'Deactivated'), ('failed', 'Failed'), ('maintenance', 'Maintenance (operator-owned)')], default='new', max_length=16)),
                 ('status_changed_at', models.DateTimeField(default=django.utils.timezone.now)),
                 ('last_error', models.TextField(blank=True)),
                 ('created_on', models.DateField(auto_now_add=True)),

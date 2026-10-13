@@ -25,7 +25,7 @@ whether a step is *manual*, runs one of *our scripts*, a single *command*, or a
 | 3 | Generate the tenants migration (one-time) | command | `python manage.py makemigrations tenants` | `tenants/migrations/0001_initial.py` created (commit it) | [Step 3](#step-3---backend-host-bootstrap) |
 | 4 | Bootstrap the platform | **script** | `APP_DOMAIN=example.com BOOTSTRAP_ADMIN_PASSWORD=… bash deploy/bootstrap.sh` | script auto-runs: PostGIS → `migrate_schemas --shared` → `sync_shards --activate` → public `Tenant`+`Domain` → `admin` user. Ends with `Bootstrap complete.` | [Step 3](#step-3---backend-host-bootstrap) |
 | 5 | Smoke-test the host, then DNS/TLS | verify | `curl -s http://localhost/api/health/` then `curl -I https://example.com/api/health/` | `ok`, then `200 OK`; admin login loads over HTTPS | [Step 4](#step-4---dns-and-tls-verification) |
-| 6 | Provision the first tenant | script + manual | add `Tenant`+`Domain` in admin, then `python manage.py migrate_schemas --schema_name=acme` | `OK   acme -> active` (schema auto-created + migrated, `NEW`→`ACTIVE`) | [Step 5](#step-5---first-business-tenant) |
+| 6 | Provision the first tenant | script + manual | add `Tenant`+`Domain` in admin, then `python manage.py migrate_schemas --schema_name=acme` | `ok  acme  tenant_1 … provisioned` (schema auto-created + migrated, `NEW`→`ACTIVE`) | [Step 5](#step-5---first-business-tenant) |
 | 7 | Create + verify the tenant admin | verify | `curl -X POST https://acme.example.com/api/auth/login/ -d '{"username":"acme_admin","password":"…"}'` | JWT `{access, refresh, role:"company_admin", schema:"acme"}` | [Step 5](#step-5---first-business-tenant) |
 
 So the only hands-on work is **#1 (check the DBs)** and **#2 (edit
@@ -34,8 +34,10 @@ rest.
 
 > **What happens under the hood:** for the mechanics behind each DB step —
 > cluster topology, per-shard roles, the migration order and why it matters, the
-> router/`allow_migrate` guarantees, the atomic status claim, connection
-> sizing — see **[deploy/DATABASE_SETUP.md](deploy/DATABASE_SETUP.md)**.
+> router/`allow_migrate` guarantees, the RDS Proxy requirements, connection
+> sizing — see **[deploy/DATABASE_SETUP.md](deploy/DATABASE_SETUP.md)**. How tenant
+> migrations run without downtime, and the operator runbook:
+> **[deploy/migrations_zero_downtime.md](deploy/migrations_zero_downtime.md)**.
 
 **Ongoing operations:** code deploys → [Step 7](#step-7---application-deploy-procedure-for-code-updates) · add a shard → [Step 8](#step-8---adding-a-new-shard) · post-deploy checks → [Step 9](#step-9---operational-verification-post-deploy) · disaster recovery → [Step 10](#step-10---disaster-recovery-quick-reference).
 
@@ -92,10 +94,11 @@ ALB routing:
 |---|---|
 | Each business tenant assigned to a `Shard` (FK on Tenant) | Routes ORM queries to the correct Aurora cluster |
 | `default` database hosts only the public schema | Prevented at multiple layers: form, model.clean, router, commands |
-| Status state machine on Tenant (new/pending/active/deactivated/failed) | Visibility of provisioning and migration state |
-| Atomic claim via `UPDATE ... WHERE status IN (...)` | Prevents concurrent migration on same tenant |
-| Manual reconcile only (no watchdog, no retry) | Admin decides recovery, no false positives |
-| `tenants` app listed BEFORE `django_tenants` in SHARED_APPS | Our `migrate_schemas` overrides the upstream version |
+| Status state machine on Tenant (new/pending/active/deactivated/failed/maintenance) | Visibility of provisioning state; MAINTENANCE for operator repairs |
+| Per-tenant migration lease (`MigrationLease`) + status writes as fenced CAS | One migrator per tenant; upgrades never change the status, so tenants keep serving while migrated (`deploy/migrations_zero_downtime.md`) |
+| `lock_timeout=5s` on the migrator's DDL only | A migration that cannot get its lock fails and is retried instead of queueing the app's traffic behind it |
+| Read-only reconcile (`reconcile_tenants --check/--report`) | Statuses change only through the migrator, the admin and the console |
+| `tenants` app listed BEFORE `django_tenants` in SHARED_APPS | Our `migrate_schemas` and `migrate` (disabled in MT) override the upstream versions |
 | Two AdminSite instances | `public_admin_site` on apex (manage tenants), `admin.site` on subdomains (business data) |
 | Two sync middlewares for routing (`ShardAwareTenantMiddleware` + `TenantShardRoutingMiddleware`) | Wires BOTH axes: `current_db` (which shard DB the router uses) AND the tenant schema on that shard connection, with per-request reset. Sync because the schema must be set on the same connection/thread the ORM uses |
 | Sync `sync` (prefork) workers, not ASGI | Simplest correct model for sync code + django-tenants; async gives no win with the required sync middleware (see Architecture trade-offs) |
@@ -105,47 +108,56 @@ ALB routing:
 ## Status state machine
 
 ```
-                  Tenant created (admin)
+              Tenant created (admin / console)
                           |
                           v
-                       [NEW]
-                          |
-                          | migrate_schemas (claim)
-                          v
-                      [PENDING]
-                       /      \
-                      /        \
-               (success)    (failure)
-                    /            \
-                   v              v
-              [ACTIVE]         [FAILED]
-                |   ^               |
-   admin action |   | migrate_      | admin sets to NEW for retry
-                v   | schemas       |
-          [DEACTIVATED]              v
-                ^                  [NEW]
-                |
-                | reconcile_tenants only
-                | flips PENDING <-> ACTIVE/DEACTIVATED based on real state
+                       [NEW] <------------------------------------+
+                          |                                       |
+                          | migrate_schemas / Celery provision    | admin: FAILED -> NEW
+                          | (under the tenant's lease)            | (with "confirm_schema")
+                          v                                       |
+                      [PENDING] ----- failure -----------> [FAILED]
+                          |                                   ^
+                       success                                | upgrade: schema missing
+                          v                                   |
+   +-----------------> [ACTIVE] ------------------------------+
+   | admin / console     |   ^
+   | (reactivation       |   | admin / console activate
+   |  stopper: schema    v   | (stopper)
+   |  must be current) [DEACTIVATED]
+   |
+   +-- admin only --- [MAINTENANCE] <-- admin only, from ACTIVE / DEACTIVATED / FAILED
 ```
 
-Migratable statuses: `NEW`, `ACTIVE`, `DEACTIVATED`. Each migration run claims
-status -> `PENDING` (atomic), runs migrations, then sets back to previous (or
-`ACTIVE` if was `NEW`) on success, or `FAILED` on error.
+- **Provisioning** (NEW/PENDING) moves the status: NEW -> PENDING -> ACTIVE, or FAILED.
+  A PENDING left by a crashed run is resumed by the next run.
+- **Upgrades** of ACTIVE/DEACTIVATED tenants do **not** change the status: the tenant keeps
+  serving while migrated; a failure leaves it as it was (the next run retries). The only
+  exception is a schema that vanished: ACTIVE/DEACTIVATED -> FAILED `schema_missing`.
+- **FAILED** and **MAINTENANCE** are operator-owned: `migrate_schemas --tenant` and Celery
+  never take them. MAINTENANCE is migrated only explicitly (`-s X --maintenance`).
+- Back to **ACTIVE** goes through the reactivation stopper: refused while the schema is
+  missing or behind, or while a newer release is being deployed.
+
+Full rules: `deploy/migrations_zero_downtime.md` §8; design: `deploy/migrations_plan_rev7.md` §2.
 
 ## Management commands
 
 | Command | Purpose |
 |---|---|
-| `migrate_schemas --shared --database=default` | Apply SHARED_APPS migrations to default.public |
-| `migrate_schemas --schema_name=acme` | Provision/migrate a single tenant; auto-creates schema for NEW |
-| `migrate_schemas --tenant [--database=X]` | Iterate all tenants (optionally restricted to one shard) |
-| `migrate_schemas` (no flags) | Both SHARED and TENANT migrations end-to-end |
-| `migrate_schemas --schema_name=acme orders 0010` | Roll forward/back specific app migrations for one tenant |
+| `migrate_schemas` (no flags) | `--shared`, then `--tenant`; summary, `Stop:` line, exit 0/1, per-tenant log files |
+| `migrate_schemas --shared` | Apply migrations to default.public (under lease 0; busy → fails at once) |
+| `migrate_schemas --tenant [--database=X]` | All NEW/PENDING/ACTIVE/DEACTIVATED tenants on active shards (optionally one shard). `--jobs`, `--jobs-per-shard`, `--keep-going`, `--max-failures`, `--summary-json` |
+| `migrate_schemas --schema_name=acme [--maintenance]` | Provision/migrate one tenant; auto-creates the schema for NEW |
+| `migrate_schemas --schema_name=acme orders 0010` | Targeted: roll one tenant's app forward/back (status untouched) |
+| `migration_lease --list` / `--release <schema\|shared\|key=N> [--force]` | Who is migrating what; free a lease left by a dead run |
+| `reconcile_tenants --check` | Deploy gate (read-only): exit 1 unless public and every ACTIVE tenant are up to date |
+| `reconcile_tenants --report [-s X] [--only-pending] [--plan]` | Read-only per-tenant table with the next command to run |
+| `migrate_schemas_legacy` | **Temporary manual fallback** (old command, no lease, 503 while upgrading) — see `deploy/migrations_zero_downtime.md` §11.1 |
 | `sync_shards [--activate]` | Create Shard records for aliases declared in `settings.DATABASES` |
 | `create_tenant_schema <name>` | Explicit `CREATE SCHEMA` without migrations (DBA / restore use) |
-| `reconcile_tenants` | Reconcile `Tenant.status` with actual migration state (manual recovery) |
-| `reconcile_tenants --report` | Read-only status table for all tenants |
+
+`manage.py migrate` is **disabled** in multi-tenant mode (use `migrate_schemas`).
 
 ## Two-site admin
 
@@ -548,12 +560,9 @@ pyenv is only needed to **build and create** the venv.
        python manage.py migrate_schemas --schema_name=acme
    "
    ```
-   Expected output:
-   ```
-   === Shard 'tenant_1': 1 tenant(s) eligible ===
-     -> Created schema 'acme' on 'tenant_1'
-   OK   acme -> active
-   ```
+   Expected: a line `ok  acme  tenant_1 …  provisioned` and a summary ending in
+   `ok=1  noop=0  failed=0 …`; exit code 0. (The console's **Provision** button does the
+   same through Celery.)
 
 3. Create the first `company_admin` for this tenant:
    ```bash
@@ -601,9 +610,26 @@ pyenv is only needed to **build and create** the venv.
 
 ### Step 7 - Application deploy procedure (for code updates)
 
-For each subsequent code release:
+Migrations go **before** the code: they must be expand-only, so the running old code
+does not notice them. Full procedure, rules for writing migrations and the runbook:
+[deploy/migrations_zero_downtime.md](deploy/migrations_zero_downtime.md).
 
-1. Pull and install dependencies on each backend host:
+1. Migrate with the NEW release — from ONE place only (the CI migrations job with a
+   concurrency group, or one backend host), using the new code but **without** restarting
+   the web yet:
+   ```bash
+   ssh backend-1 'sudo -u ubuntu bash -c "
+       cd /home/ubuntu/tenants_back && source venv/bin/activate &&
+       git pull origin main && pip install -q -r requirements.txt &&
+       python manage.py migrate_schemas --summary-json=/tmp/migrate-summary.json &&
+       python manage.py reconcile_tenants --check
+   "'
+   ```
+   `migrate_schemas` runs `--shared`, then `--tenant`, and exits 1 on any problem (read the
+   `Stop:` line and the per-tenant log under `Logs:`). Do not continue on exit 1.
+   Caveat: gunicorn workers recycled during this window on backend-1 load the new code
+   early; if that matters, run step 1 from a separate checkout or the CI runner.
+2. Roll the code out to every backend host (web and Celery):
    ```bash
    for host in backend-1 backend-2; do
        ssh $host 'sudo -u ubuntu bash -c "
@@ -612,28 +638,12 @@ For each subsequent code release:
            venv/bin/pip install -q -r requirements.txt &&
            venv/bin/python manage.py collectstatic --noinput
        "'
-       ssh $host 'sudo supervisorctl restart gunicorn'
+       ssh $host 'sudo supervisorctl restart gunicorn celery_fast celery_slow celery_slow_service celery_fanout celery_beat'
    done
    ```
-2. Apply migrations - run from ONE backend host:
-   ```bash
-   ssh backend-1 'sudo -u ubuntu bash -c "
-       cd /home/ubuntu/tenants_back && source venv/bin/activate &&
-       python manage.py migrate_schemas --shared --database=default &&
-       python manage.py migrate_schemas --tenant
-   "'
-   ```
-   Order matters: SHARED first (in case tenant migrations reference new
-   public-side models), then TENANT.
-3. Verify state:
-   ```bash
-   ssh backend-1 'sudo -u ubuntu bash -c "
-       cd /home/ubuntu/tenants_back && source venv/bin/activate &&
-       python manage.py reconcile_tenants --report
-   "'
-   ```
-   Expected: all tenants `up to date`. Any `behind` means a migration failed -
-   inspect with `--schema_name=<X>`.
+   Old Celery workers that try to provision a tenant during the rollout skip it as
+   `code_older_than_db` and retry in 5 minutes on a new worker.
+3. Verify: `reconcile_tenants --report` — every tenant's BEHIND is `0`.
 
 ### Step 8 - Adding a new shard
 
@@ -672,7 +682,7 @@ When you need a fourth Aurora cluster (`tenant_3`):
 
 ### Step 9 - Operational verification (post-deploy)
 
-1. `reconcile_tenants --report` after every deploy - confirm no `behind` / `failed`.
+1. `reconcile_tenants --check` after every deploy (exit 0), `--report` for details.
 2. CloudWatch:
    - Target group health (must be `healthy` for both backends).
    - `DatabaseConnections` on each Aurora cluster (should stay well below
@@ -686,12 +696,15 @@ When you need a fourth Aurora cluster (`tenant_3`):
 
 | Symptom | Command |
 |---|---|
-| Tenant stuck in PENDING | `reconcile_tenants --only-pending` |
+| Tenant stuck in PENDING | `migrate_schemas --schema_name=<name>` resumes it; a leftover lease → `migration_lease --release <name>` |
 | Want to see current state of every tenant | `reconcile_tenants --report` |
-| FAILED tenant after fix | Set `status=NEW` via admin, then `migrate_schemas --schema_name=<name>` |
-| Forgot to run migrations after deploy | `migrate_schemas --shared --database=default && migrate_schemas --tenant` |
-| Rollback a single tenant | `migrate_schemas --schema_name=<X> --plan <app> <number>` (preview), then drop `--plan` |
-| Aurora failover happened | Connections re-establish automatically; check `reconcile_tenants --report` is clean |
+| FAILED tenant after fix | admin: FAILED → NEW with the `confirm_schema` tick, then `migrate_schemas --schema_name=<name>` |
+| Forgot to run migrations after deploy | `migrate_schemas` (both stages), then `reconcile_tenants --check` |
+| Rollback a single tenant's app | `tenant_command showmigrations --schema=<X> <app>` (look), then `migrate_schemas --schema_name=<X> <app> <number>` |
+| Restore a tenant from backup | admin → MAINTENANCE → … → `migrate_schemas --schema_name=<X> --maintenance` → admin → ACTIVE (`deploy/migrations_zero_downtime.md` §13) |
+| Run interrupted / lease left after a crash | `migration_lease --list`, then `--release <schema>` once its backend is gone |
+| Aurora failover happened | Connections re-establish automatically; check `reconcile_tenants --check` is clean |
+| Everything else | Runbook: `deploy/migrations_zero_downtime.md` §13 |
 
 ## Component summary
 
@@ -713,7 +726,7 @@ When you need a fourth Aurora cluster (`tenant_3`):
 | Middleware | `tenants/middleware.py` | `ShardAwareTenantMiddleware` + `TenantShardRoutingMiddleware` (sync; tenant + shard routing) |
 | Views (runtime) | `tenants/views.py` | `health` only — imported by BOTH URLconfs |
 | Console | `tenants/console/` | Operator UI/API: Tenant/Shard/ReservedHostRule viewsets, serializers, admin, physical-state `probes.py`. Subpackage, not an app (no models); one-way boundary guarded by `scripts/ci_guard_console_boundary.sh` |
-| Commands | `tenants/management/commands/` | `sync_shards`, `create_tenant_schema`, `migrate_schemas`, `reconcile_tenants` |
+| Commands | `tenants/management/commands/` | `sync_shards`, `create_tenant_schema`, `migrate_schemas` (+ `tenants/migrator.py`), `migration_lease`, `reconcile_tenants`, `migrate` (disabled in MT), `migrate_schemas_legacy` (temporary fallback) |
 | Gunicorn | `bin/gunicorn_start.sh` | sync (prefork) workers on unix socket |
 | Nginx | `deploy/nginx_backend.conf` | static + `/api/`, `/admin/` via unix socket |
 | Supervisor | `deploy/supervisor_gunicorn.conf` | Process management |
