@@ -272,11 +272,6 @@ CACHES = {
     },
 }
 
-# API path prefixes — request-handling code that treats API traffic as stateless/JSON:
-# the session guard (tenants.auth.session) and error content negotiation (tenants.errors).
-# Single source of truth so the two stay in sync.
-API_PATH_PREFIXES = ("/api/v1/", "/open_api/api/v1/")
-
 SESSION_ENGINE = "django.contrib.sessions.backends.cached_db"
 # Standalone: sessions ride the one cache there is. Multi-tenant moves them to a dedicated
 # unscoped alias, because there `default` carries a per-tenant KEY_FUNCTION while the session

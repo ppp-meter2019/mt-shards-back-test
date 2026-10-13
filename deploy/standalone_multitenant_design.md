@@ -169,11 +169,11 @@ The base vs MT mapping (each was previously an inline `if USE_MULTITENANT: … e
 | DRF auth | `SchemaBoundJWTAuthentication` | `rest_framework_simplejwt…JWTAuthentication` |
 | `CACHES` `tenant_resolve` / `beat_lock` | defined | omitted (only `default`) |
 | `TENANT_RESOLVE` / `TENANT_REGISTRY` / `TENANT_BASE_DOMAINS` | defined | omitted |
+| `API_PATH_PREFIXES` | defined (read by `SchemaBoundSessionMiddleware`, `tenants.errors`) | omitted — no reader |
 | `CELERY_BEAT_SCHEDULER` | `redbeat.RedBeatScheduler` (+ `CELERY_REDBEAT_*`) | unset — Celery's default `PersistentScheduler` (or the host project's own) |
 
 Shared (above the branch): `SECRET_KEY`, `AUTH_USER_MODEL`, DRF permissions,
 `SIMPLE_JWT`, `CACHES["default"]`, i18n/static, TLS helpers, generic Celery.
-`API_PATH_PREFIXES` is a harmless plain value and stays shared (no tenant reference).
 
 ## 3.1 Configuration tiers (which knob lives where, and why)
 

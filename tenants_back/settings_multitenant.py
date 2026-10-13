@@ -386,6 +386,13 @@ REST_FRAMEWORK = {**REST_FRAMEWORK, "DEFAULT_AUTHENTICATION_CLASSES": (
     "tenants.auth.jwt.SchemaBoundJWTAuthentication",
 )}
 
+# API path prefixes — request-handling code that treats API traffic as stateless/JSON: the
+# session guard (tenants.auth.session) and error content negotiation (tenants.errors). Single
+# source of truth so the two stay in sync. MULTITENANT-ONLY: both readers live in the
+# `tenants` app, which standalone does not install. The values mirror the host's API routes
+# (/api/v1/, /open_api/api/v1/ in its urls.py) — keep them in step when those move.
+API_PATH_PREFIXES = ("/api/v1/", "/open_api/api/v1/")
+
 
 # ---------------------------------------------------------------------------
 # Caches — BUILT FROM SCRATCH, deliberately not merged into the base dict, for the same
@@ -592,6 +599,17 @@ TENANT_MIGRATE_LOG_DIR = BASE_DIR / "logs" / "migrations"
 # `manage.py migrate` is disabled in MT (tenants/management/commands/migrate.py); this
 # runner lets Django's test-database creation through (§12). `testserver` is unsupported.
 TEST_RUNNER = "tenants.test_runner.TenantsTestRunner"
+
+
+# ---------------------------------------------------------------------------
+# Time — PINNED to UTC here, not inherited. The base is the standalone host project's config
+# and may carry a local TIME_ZONE; multi-tenant serves tenants in many zones, so stored and
+# scheduled time is UTC and per-tenant local time comes from Tenant.timezone. CELERY_TIMEZONE
+# is pinned too rather than left derived from the base, so the beat clock cannot drift from it.
+# ---------------------------------------------------------------------------
+USE_TZ = True
+TIME_ZONE = "UTC"
+CELERY_TIMEZONE = "UTC"
 
 
 # ---------------------------------------------------------------------------
